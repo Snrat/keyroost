@@ -8,11 +8,8 @@ decision to "Standing decisions" at the bottom so it is not re-litigated.
 Deliberately unversioned: the previous `TODO-v0.7.5.md` / `TODO-hardening.md`
 pair rotted because version-named files accumulate layers nobody rereads.
 
-Current work: v0.13.0 CLI consistency. Part 1, key selection (one finder,
-picker or refusal instead of "first found", y/N confirmations, `list --json`,
-`--device` completion, #51 identity matching), is on draft PR #165. Parts 2–4
-(secret input, output and exit codes, naming and help) are still to be
-designed.
+Current work: the v0.13.0 release. Next: the Learn site's "Command line"
+page, then the GUI design pass (v0.14.0).
 
 ---
 
@@ -35,6 +32,25 @@ Being worked on right now — check with whoever holds it before starting.
   flatpak broke at release time because a source was pruned). Full sequence:
   `packaging/RELEASING.md`, which is the playbook for the whole release.
 
+**Next, after v0.13.0:**
+
+- **Learn page "Command line" (`docs/cli.html`).** One task-first page for
+  `keyroostctl`: each section is a job ("Choosing a key", "PINs and
+  passwords", "Importing codes from an app", "Resetting", "Scripts", ...),
+  a sentence of what and why, 2–5 copy-paste commands and what you'll see;
+  a reference of every command generated from `--help` at the bottom. Plain
+  enough for non-technical readers and for tools that learn from the docs.
+  The existing docs check validates every command it shows. Outline agreed
+  2026-10-10 (14 sections). (M)
+
+- **Token2 PIN+ OTP list unreachable over HID ([#155](https://github.com/framefilter/keyroost/issues/155)).**
+  On firmware 2.1.0 (`349e:0022`) the OTP applet doesn't answer keyroost's
+  interrupt-OUT frames; the reporter reached it with feature reports, and
+  Token2 recommends CTAPHID vendor command `0x41` on the FIDO interface
+  (works on Windows too). A commenter sees it on a contact card over PC/SC
+  as well. Waiting on diagnostics from the reporters; also: the GUI's OTP
+  tab shows an empty list instead of the error. (S–M)
+
 **Later:**
 
 - **AppImage-only republish.** Add an `appimage_only` input to
@@ -51,7 +67,7 @@ Being worked on right now — check with whoever holds it before starting.
   AppImageHub-style failures (AppImage/appimage.github.io#9258) show up on
   the packaging probe, not after a release. (S–M)
 
-- **v0.13.0 goal: a holistic GUI design pass.** The interface has grown
+- **v0.14.0 goal: a holistic GUI design pass.** The interface has grown
   enough features that the deliberately flat layout no longer fits. Seen in
   AppImageHub's catalog screenshot (AppImage/appimage.github.io#9258): at an
   ~800px-wide screen, below the 900px minimum, the top bar's left group
@@ -73,40 +89,7 @@ Being worked on right now — check with whoever holds it before starting.
     show the new design after the next release.
   (M–L)
 
-- **v0.13.0: sign the AppImage.** Today it has a `.sha256` sidecar and a
-  build attestation, but its embedded signature sections are empty. The
-  linuxdeploy plugin already in use signs when `LDAI_SIGN` /
-  `LDAI_SIGN_KEY` are set; the signature covers the update information and
-  the `.zsync` is generated from the signed file. Plan: a dedicated AppImage
-  key (not the Flatpak key), kept only as `release-publish` environment
-  secrets; `cargo build` in its own step before the key is imported; fail
-  the job if the key is missing or the signature sections are empty; commit
-  the public key and put its fingerprint in SECURITY.md and the README. Test
-  locally with `appimageupdatetool` before release: unsigned v0.12.0 →
-  signed (unknown: updaters may refuse, in which case release notes say to
-  download that release by hand once), signed → signed, and a changed key
-  (must be refused). Research notes: kept locally by the maintainer. (M)
-
-- **v0.13.0: one word per action across the whole CLI.** Walk every
-  command group and confirm that paired and opposing actions use the same
-  words everywhere: what creates and what removes (`add`/`delete`,
-  `generate`/`delete`, `import`/`export`), what gives a value and what takes
-  it away (`set`/`clear`), what turns something on and off
-  (`enable`/`disable`), and status words (`info`, `list`, `status`). The
-  same function must not have a different word in a different group. Every
-  mismatch found is either renamed (with a retired-name error, as in
-  v0.13.0) or noted with the reason it differs. (S–M)
-
-- **Investigate a CLI style guide for contributors.** A short page on how
-  new keyroostctl commands and flags should look (command words, flags,
-  secret input, confirmations, output, help text), so contributions match
-  the existing CLI without a review round to align them. Link it from
-  CLAUDE.md too, so AI coding agents reuse the established words and flags
-  instead of inventing new ones. Decide first
-  whether it belongs in CONTRIBUTING, the Learn site, or a doc of its own,
-  and what it covers; the maintainer settles the content. (S)
-
-- **Duplicate keys on Windows/macOS with two identical keys ([#51](https://github.com/framefilter/keyroost/issues/51), reopened) — identity matching on PR #165, awaiting a Windows community test.**
+- **Duplicate keys on Windows/macOS with two identical keys ([#51](https://github.com/framefilter/keyroost/issues/51), reopened) — identity matching shipped in v0.13.0, awaiting a Windows community test.**
   Where the OS reports no USB position, keyroost now asks each side of a key
   for the identity it reports (YubiKey serial, Solo 2 UUID, Token2 §6.10
   serial) and joins the two halves when they match; a key that doesn't answer

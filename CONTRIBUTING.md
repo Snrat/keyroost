@@ -54,6 +54,27 @@ project manages security keys, and "reproduced and verified on my device"
 carries real weight (see [#96](https://github.com/framefilter/keyroost/pull/96)
 for a model example).
 
+## Adding a command or flag
+
+Look at the nearest existing command first and reuse its words.
+
+- **Shape:** group, topic, action — `piv pin change`, `fido config always-uv enable`.
+- **Action words:** reuse the existing pairs — `add`/`delete`, `set`/`clear`,
+  `enable`/`disable`, `import`/`export`. A new word is fine when none fits;
+  say why in the PR.
+- **Reading:** `info` for an overview, `list` for several items, `show` for
+  one item, `status` for one topic's state.
+- **Short flags:** only `-d` (device), `-y` (yes), `-i` (in), `-o` (out),
+  `-s` (slot).
+- **Secrets:** never on the command line. Accept `env:NAME` or `stdin`; with
+  neither, ask at a hidden prompt.
+- **Changing a key:** ask first; `-y` skips the question.
+- **Output:** the result on stdout; progress, warnings and questions on stderr.
+- **Help:** one plain sentence for every flag.
+- **Renaming:** keep the old name as a retired name that points to the new one.
+
+`cargo test -p keyroostctl` catches most of these.
+
 ## Where to find work
 
 `TODO.md` is the live task list. Items under "Ready to pick up" are

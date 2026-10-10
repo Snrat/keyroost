@@ -120,6 +120,8 @@ workflow during bring-up is:
   references, the bring-up runbook, the device-research record, and the
   published Learn site (`docs/*.html`, deployed by `pages.yml`); don't add more
   without asking.
+- **New CLI commands and flags** follow "Adding a command or flag" in
+  `CONTRIBUTING.md` — reuse the existing words before inventing new ones.
 - **Tests first when changing the protocol layer.** The known-answer suite in
   `crates/keyroost-proto/tests/known_answer_vs_python.rs` locks in byte-level
   agreement with an independent third-party SM4 implementation. Any change to
