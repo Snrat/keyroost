@@ -98,8 +98,8 @@
         certs. Note that PIV's reset instruction is a <strong>vendor extension</strong> —
         SP&nbsp;800-73-4 defines none — so a standards-only card that never implemented it
         cannot be recovered by keyroost at all once both counters are spent. keyroost's
-        whole-device factory reset detects that case up front and refuses rather than
-        blocking the PIN and PUK on a card it could not then wipe.
+        whole-device factory reset detects that case up front and leaves PIV out of the
+        sweep, rather than blocking the PIN and PUK on a card it could not then wipe.
         <a href="reset.html">See resetting →</a></p>
     </div>
     <div class="kr-callout note">
@@ -220,7 +220,7 @@ keyroostctl piv key move --from 82 --to 9d   # bring it back</code></pre>
       card then runs every private-key operation the key's algorithm supports and keyroost
       verifies each result against that same public key. The operations depend on the key
       type — <strong>decrypt</strong> for RSA, <strong>key-agree</strong> (ECDH) for
-      P-256&nbsp;/&nbsp;P-384&nbsp;/&nbsp;X25519, and <strong>sign</strong> for
+      P-256&nbsp;/&nbsp;P-384&nbsp;/&nbsp;P-521&nbsp;/&nbsp;X25519, and <strong>sign</strong> for
       RSA&nbsp;/&nbsp;ECDSA&nbsp;/&nbsp;Ed25519 — and an operation the key can't do is
       reported as <em>skipped</em>, not failed. It needs the PIN unless the slot's PIN
       policy is <code>never</code> (typically <code>9E</code>), in which case leave the PIN

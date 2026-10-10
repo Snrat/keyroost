@@ -913,7 +913,7 @@ keyroostctl piv pin change --pin env:OLD_PIN --new-pin env:NEW_PIN   # in a scri
           current <code>CurrentMgmtAuth</code>; only HID Crescendo uses it);
           <code>import_certificate(slot, der, CertCompression)</code> returns a
           <code>CertImport</code> (<code>CertCompression::Never</code> is the
-          old behaviour); <code>self_signed_certificate(.., pin, compression)</code>
+          old behavior); <code>self_signed_certificate(.., pin, compression)</code>
           returns <code>(Vec&lt;u8&gt;, CertImport)</code>;
           <code>reset(None)</code>; <code>force_reset(None)</code> returns a
           <code>FactoryResetOutcome</code>. Prefer
@@ -958,7 +958,7 @@ keyroostctl piv pin change --pin env:OLD_PIN --new-pin env:NEW_PIN   # in a scri
       one-way commands stricter. <code>piv status --json</code> also gains a
       <code>cert_unreadable</code> field, present only for a slot whose
       compressed certificate cannot be read. For library consumers: one
-      removal, and two behaviour changes when reading and importing
+      removal, and two behavior changes when reading and importing
       certificates.</p>
     <h3>CLI</h3>
     <div class="kr-table-wrap">
@@ -1070,7 +1070,7 @@ keyroostctl piv pin change --pin env:OLD_PIN --new-pin env:NEW_PIN   # in a scri
       <tr><td><code>keyroost-transport</code></td>
         <td><code>OpenPgpSession::generate_key(crt, alg)</code> takes an
           <code>Option&lt;KeyAlg&gt;</code> &mdash; pass <code>None</code> for the
-          old behaviour. <code>OpenPgpStatus</code> gained
+          old behavior. <code>OpenPgpStatus</code> gained
           <code>sig_attrs</code> / <code>dec_attrs</code> / <code>aut_attrs</code>
           (struct literals must set them). <code>TransportError</code> gained
           <code>OpenPgpSlotMismatch</code> and <code>OpenPgpSlotNotRsa</code>;
@@ -1121,7 +1121,7 @@ keyroostctl piv pin change --pin env:OLD_PIN --new-pin env:NEW_PIN   # in a scri
     <p class="kr-muted">Bug-fix release &mdash; no breaking changes for scripts or library
       consumers. One addition: <code>keyroostctl fido reset --reader &lt;substring&gt;</code>
       resets a FIDO2 card in a smart-card reader in place (no replug, no touch). Also
-      restores behaviour v0.7.7 narrowed: every Token2 key is offered the on-device OTP
+      restores behavior v0.7.7 narrowed: every Token2 key is offered the on-device OTP
       surface again, regardless of USB product id.</p>
   </section>
 
@@ -1137,7 +1137,7 @@ keyroostctl piv pin change --pin env:OLD_PIN --new-pin env:NEW_PIN   # in a scri
         <code>keyroostctl piv key move</code>) — new; the 20 retired PIV slots (82–95) are
         now accepted anywhere <code>--slot</code> is.</li>
       <li><code>fido ssh-cert list</code> / <code>extract</code> (today
-        <code>keyroostctl fido ssh list</code> / <code>extract</code>) — new; read-only.</li>
+        <code>keyroostctl fido ssh list</code> / <code>export</code>) — new; read-only.</li>
     </ul>
   </section>
 
@@ -1244,7 +1244,7 @@ keyroostctl --device mykey fido info    # 0.7.5+</code></pre>
       <div class="kr-callout-title danger">Danger: <code>factory-reset</code> was reused</div>
       <p>Since v0.7.7 <code>keyroostctl factory-reset</code> exists again as a top-level
         command — but it is <strong>not</strong> the old Molto2 reset. It wipes
-        <em>every resettable applet</em> on the selected key: OATH, OpenPGP, PIV, Token2 OTP,
+        <em>every resettable applet</em> on the selected key: OATH, OpenPGP, Token2 OTP, PIV,
         then FIDO2. Both the old flat command and the new one are confirmed with
         <code>--yes</code>, so a stale <code>keyroostctl factory-reset --yes</code> will
         <strong>not</strong> fail with "unknown subcommand" — it will run and destroy far more

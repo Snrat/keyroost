@@ -129,17 +129,20 @@
       <span class="kr-mark mono">k</span>
       <p>Enumerate authenticators and read <code>authenticatorGetInfo</code>; check PIN
         retries; <strong>set / change the PIN</strong> and unlock with it; list, inspect, and
-        delete resident credentials; enrol, rename and delete fingerprints; set CTAP 2.1
-        policy (always-require-UV, minimum PIN length, forced PIN change, enterprise
+        delete resident credentials; enroll, rename and delete fingerprints; set CTAP 2.1
+        policy (<strong>Always require user verification</strong>, CLI
+        <code>fido config always-uv</code>; minimum PIN length, forced PIN change, enterprise
         attestation); read and manage the key's <strong>largeBlob store</strong> and extract
         a stored OpenSSH certificate; and <strong>reset</strong> a key. Read-only inspection
         needs no PIN.</p>
     </div>
-    <p class="kr-muted">keyroost reaches FIDO2 keys over <strong>USB-HID</strong> and over
-      <strong>NFC / PC-SC readers</strong> — tap an NFC key to a contactless reader and the
-      same operations work, so a key with no USB plug (or one you'd rather not insert) can
-      still be inspected and managed.</p>
-    <p>In the app, the <strong>FIDO2</strong> tab gates everything behind one unlock. Once
+    <p class="kr-muted">In the desktop app, keyroost reaches FIDO2 keys over
+      <strong>USB-HID</strong> and over <strong>NFC / PC-SC readers</strong>. Tap an NFC key
+      to a contactless reader and the same operations work, so a key with no USB plug (or
+      one you'd rather not insert) can still be inspected and managed. On the command line,
+      FIDO2 commands use USB-HID; only <code>fido reset --reader</code> works with a card
+      in a reader.</p>
+    <p>In the app, the <strong>FIDO2</strong> tab's management views sit behind one unlock. Once
       you enter the PIN, capability-gated sub-view tabs appear for whatever the key
       advertises: <strong>Passkeys</strong> (resident credentials),
       <strong>Fingerprints</strong> on biometric keys
@@ -148,9 +151,11 @@
       doesn't advertise one of those simply gets no tab for it.
       <strong>Settings</strong> is always present on a CTAP2 key: it carries the FIDO2
       reset (a baseline CTAP2 command) as well as the security-policy controls such as
-      always-require-UV and minimum PIN length, which do gate on the key advertising
-      <code>authnrCfg</code> (<a href="settings.html">see Settings</a>). Locking returns to
-      the gate and clears the session for all of them.</p>
+      Always require user verification and minimum PIN length, which do gate on the key
+      advertising <code>authnrCfg</code> (<a href="settings.html">see Settings</a>). Locking
+      returns to the gate and clears the session for all of them. Until the key is unlocked
+      (for example when the PIN is forgotten or blocked), the reset is shown on its own, so
+      a key can always be reset without its PIN.</p>
 <pre><code>keyroostctl fido info
 keyroostctl fido pin status
 keyroostctl fido credential list               # asks for the PIN (hidden)

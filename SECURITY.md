@@ -40,8 +40,10 @@ What keyroost defends against:
 - **Accidental secret disclosure by the tool itself.** keyroost persists no
   secrets of its own accord — the only files it writes unprompted are the
   friendly-name registry (`keys.json`, which holds salted fingerprints, not
-  serials, and its salt file `keys.salt`) and the GUI's `settings.json`, all
-  created owner-only (`0600`) and none holding key material. Secret
+  serials, and its salt file `keys.salt`) and the GUI's `settings.json`
+  (while an older `keys.json` is converted, a short-lived owner-only backup
+  of it, `keys.json.v1-backup`, holds its old serials and is removed once
+  the conversion succeeds), all created owner-only (`0600`) and none holding key material. Secret
   output reaches disk only when you name a destination for it (e.g.
   `openpgp decrypt --out`), and those writes go through an owner-only
   temp file that is fsynced and atomically renamed, refusing to follow a
@@ -100,11 +102,12 @@ What keyroost does **not** defend against:
   annotated in the `Cargo.toml` that declares it: the device and OS
   boundary (`pcsc`; `hidapi` off Linux, where sysfs and `hidraw` are used
   directly; `windows-sys` on Windows), the interface boundary (`clap` and
-  `clap_complete`/`clap_mangen`; `eframe`/`egui` with `arboard`, `rfd`,
+  `clap_complete`/`clap_mangen`; `rpassword` for the hidden terminal
+  prompt; `eframe`/`egui` with `arboard`, `rfd`,
   `pollster`, `png` and Linux's `x11rb`/`ashpd`; `serde`/`serde_json` and
   `base64`), and cryptography that would be irresponsible to hand-roll
   under `forbid(unsafe_code)` — RustCrypto (`sha2`, `hmac`, `aes`, `des`,
-  `cbc`, `cipher`, `p256`, `aes-gcm`), `getrandom`, `zeroize`, `scrypt`
+  `cbc`, `cipher`, `p256`, `aes-gcm`), `getrandom`, `rand_core`, `zeroize`, `scrypt`
   (Aegis vaults), `rsa`/`rand` (host RSA keygen, confined to
   `keyroost-rsakey`), `p384`/`p521`/`ed25519-dalek`/`x25519-dalek`
   (host-side verification of the PIV slot self-test, confined to
@@ -124,8 +127,8 @@ What keyroost does **not** defend against:
   neither fetches nor runs it. No build script in this workspace generates
   code, downloads anything, or reads outside its own package.
 - **Continuously fuzzed and dependency-audited.** The parsers named in the
-  threat model are covered by seventeen `cargo-fuzz` targets
-  (`fuzz/fuzz_targets/`), all of which run on a weekly schedule; a RUSTSEC scan
+  threat model are covered by eighteen `cargo-fuzz` targets
+  (`fuzz/fuzz_targets/`), seventeen of which run on a weekly schedule; a RUSTSEC scan
   (`cargo audit`) runs weekly and on every change to a manifest or the
   lockfile, and Dependabot proposes monthly updates for the cargo,
   GitHub-Actions and Nix flake dependency sets. The fuzz harness is its own workspace

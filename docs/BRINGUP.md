@@ -12,7 +12,8 @@ and we'll diff it against the expected format in `docs/PROTOCOL.md`.
 
 > **Safe slots.** Step 3 onwards writes to the device. Steps 3 and 5 target
 > **slot #99** (Token2 calls slots profiles); step 6 bulk-imports starting at **#95** and fills consecutive
-> slots from there — one per entry in your export, so a 3-entry file writes
+> slots from there, one per entry the Molto2 can store (entries it can't, such
+> as SHA-512 codes, are skipped and use no slot), so a 3-entry file writes
 > #95, #96 and #97. If you've already programmed anything in #95–#99 for real,
 > pick a range you're willing to overwrite and substitute it in every
 > `--slot 99` (step 6: `--slot 95`) below.
@@ -166,7 +167,7 @@ keyroost scans for devices on its own. Select the Molto2 in the device list →
 enter the customer key (or leave blank for the default) → click Authenticate →
 select a slot → fill in a title and base32 secret → click Write to slot.
 
-The log panel at the bottom should show green "ok" lines for each step.
+Open "Activity log" in the top bar: each step should appear as a green line.
 
 ## FIDO security-key bring-up
 
@@ -310,8 +311,8 @@ Running F1–F5 successfully exercises, end to end against real silicon:
   `enumerateRPsBegin/Next`, `enumerateCredentialsBegin/Next`,
   `deleteCredential`
 
-First successful run: 2026-05-27, SoloKeys Solo 2 firmware 2.3.196, on
-Linux 6.12 / OpenSSH 10.0p2 / libfido2 1.15.0.
+First successful run: 2026-05-27, SoloKeys Solo 2 firmware 2.3.196, with
+OpenSSH's `ecdsa-sk` support.
 
 ## What to send back if anything goes wrong
 

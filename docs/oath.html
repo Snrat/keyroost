@@ -125,8 +125,9 @@ keyroostctl oath import -i export.json  # add every code in an authenticator exp
 
   <section class="kr-section" id="import">
     <h2>Importing codes from an authenticator app</h2>
-    <p>keyroost can add every code in an authenticator export to a YubiKey, Solo&nbsp;2 or
-      Nitrokey&nbsp;3 in one step. It reads Aegis exports (plain or encrypted), 2FAS
+    <p>keyroost can add every code in an authenticator export to a key's OATH storage in
+      one step (YubiKey, Solo&nbsp;2, Nitrokey&nbsp;3, and other keys with an OATH
+      applet). It reads Aegis exports (plain or encrypted), 2FAS
       exports, a text file with one <code>otpauth://</code> URI per line, and QR
       screenshots, including a Google Authenticator export.</p>
     <p>In the desktop app, drop the file on the window, or click <strong>Import
@@ -170,6 +171,8 @@ keyroostctl oath import -i export.json --file-password env:EXPORT_PW   # encrypt
         from Nitrokey's published secrets-app source; reports from people using one are
         welcome in the <a href="https://github.com/framefilter/keyroost/issues">issue
         tracker</a>.</li>
+      <li><strong>Other keys:</strong> keyroost knows no limits up front; the key's own
+        refusal is reported.</li>
     </ul>
     <h3>Codes with a period other than 30 seconds</h3>
     <p>A YubiKey or Solo&nbsp;2 doesn't store a TOTP code's period. Instead, the name

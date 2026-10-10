@@ -104,14 +104,16 @@ untested because an earlier row already answered the question.
 
 ## Thread A outcome — CLOSED (shipped)
 
-Resolved in favour of **USB iSerial first, CCID-read serial as fallback**, local
-and opt-in. Shipped as `keyroost-keyring` (serial-keyed friendly names, with an
-`IdSource` field recording how the serial was obtained; nothing is written to
-disk unless the user names a key) and `keyroost-resolve` (`effective_serials` /
+Resolved in favor of **USB iSerial first, CCID-read serial as fallback**, local
+and opt-in. Shipped as `keyroost-keyring` (friendly names keyed by a salted fingerprint
+of the serial, never the serial itself, with an `IdSource` field recording how
+the serial was obtained; a record is written only when the user names a key or
+a key carrying its own name is first seen) and `keyroost-resolve` (`effective_serials` /
 `read_effective_serial`, with `ccid_serial_for` / `ccid_serials_for` covering
 keys that expose no USB serial — experiment E4, built after all, despite the
 "do not build a reader during research" note above). Surfaced as
-`keyroostctl key-name` plus a global `--device <NAME>` on every subcommand. E3
+`keyroostctl name` (`set`, `clear`, `list`) plus the global `-d`/`--device
+<NAME>`. E3
 resolved as predicted: AAGUID is model-level, which is why
 `crates/keyroost/src/ui/aaguid.rs` can be a static model table.
 
@@ -129,7 +131,7 @@ Two constraints the implementation had to add that this plan did not anticipate:
 
 The HID-only resolver (`read_effective_serial`, `connected_keys`) was removed in
 v0.13.0; the GUI and CLI now share the device model (`keyroost_resolve::enumerate`),
-and the CLI picks a row with `select::resolve_target`.
+and the CLI picks a row with `select::resolve_target_reading`.
 
 ## Identity matching across interfaces (#51, v0.13.0)
 

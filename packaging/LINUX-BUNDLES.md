@@ -222,13 +222,15 @@ Flatpak and AppStream and is the first decision below.
 
 ---
 
-## Target 1 — Flatpak (self-hosted repo, NOT Flathub)
+## Target 1 — Flatpak (self-hosted repo; Flathub deferred)
 
-### Why self-host, not Flathub
+### Why self-host for now
 
-Flathub has a stated stance against AI-generated submissions, and keyroost is
-openly AI-authored. So a Flathub submission is **off the table by design** — but
-Flatpak the *technology* is not. Flatpak's value (distro-agnostic install,
+Flathub allows AI-generated app code with disclosure, but requires the
+manifest and the submission to be written by the maintainer, so a Flathub
+submission is **deferred**: a later TODO the maintainer submits himself (see
+`TODO.md`). Until then, distribution is the self-hosted repo below, and
+Flatpak the *technology* is fully in use. Flatpak's value (distro-agnostic install,
 sandbox, delta auto-updates, GPG-verified) is fully available from a
 **self-hosted OSTree repo** you publish yourself; Flathub is just *one* remote.
 Yubico Authenticator and KeePassXC prove the PC/SC-over-Flatpak pattern works.
@@ -398,7 +400,8 @@ flatpak build-update-repo --update-appstream --gpg-sign=<KEYID> ../repo
 - The sandbox cannot run `pcscd`; if the host has no pcscd running, the
   smart-card applets fail (FIDO HID still works). Document this for users.
 - Verified in production since v0.7.3 — both bundles ship on every release and
-  the mandatory pre-release probe rebuilds them from main before any tag.
+  the mandatory pre-release probe (`gh workflow run linux-bundles.yml --ref
+  <branch>`) rebuilds them before any tag.
 
 ---
 
@@ -410,9 +413,9 @@ An AppImage is a self-mounting SquashFS image: a single executable file that,
 when run, mounts itself via FUSE and launches the bundled app. It bundles the
 GUI binary plus the shared libraries it needs, so it runs across glibc-based
 distros without installation. We bundle the **GUI (`keyroost`)** — the AppImage
-format is GUI-app-oriented (desktop file + icon are mandatory). The CLI is
-better served by the musl static binary (Target 3) or the existing release
-tarballs.
+format is GUI-app-oriented (desktop file + icon are mandatory). CLI users get
+the release archives, the Flatpak, a package manager, or `cargo install
+keyroostctl`.
 
 ### Tooling
 
@@ -500,7 +503,8 @@ is proven for this app.
   update is a manual download. (Verified with AppImageUpdate: unsigned to
   signed refused, same-key updates accepted, key change refused.)
   Gear Lever compares the `.zsync` SHA-1 and does not check signatures.
-- GUI-only by design; CLI users get the musl binary or `cargo install`.
+- GUI-only by design; CLI users get the release archives, the Flatpak, a
+  package manager, or `cargo install keyroostctl`.
 
 ---
 
@@ -613,8 +617,8 @@ musl cross toolchain, then build libpcsclite there. See
 2. **Where to host the Flatpak repo.** **DECIDED:** self-hosted **OSTree repo in a
    dedicated repo `framefilter/keyroost-flatpak`** served by its own GitHub Pages
    (`framefilter.github.io/keyroost-flatpak/`, auto-update) **PLUS** a single-file
-   `.flatpak` bundle attached to each release (offline fallback). **NOT Flathub**;
-   not flat-manager. (A separate repo because this repo's `main` takes changes
+   `.flatpak` bundle attached to each release (offline fallback). Not Flathub for
+   now (deferred; the maintainer submits it himself later); not flat-manager. (A separate repo because this repo's `main` takes changes
    only through reviewed pull requests, so a CI bot can't push to it — see
    setup step 3.)
 3. **AppImage.** **DECIDED:** build the GUI AppImage and attach it to each release.
@@ -656,8 +660,8 @@ musl cross toolchain, then build libpcsclite there. See
   Target-3 PC/SC path is an unverified spike.
 - **`pcsc-sys` env-var names** (`PCSC_LIB_DIR`/`PCSC_LIB_NAME`) — conventional
   but version-specific; verify against the locked `pcsc-sys`.
-- **pcsc-lite client-only `./configure` flags** — flag names drift across
-  pcsc-lite versions; pin a version and verify.
+- **pcsc-lite client-only meson options** (`-Dlibsystemd=false` …) — option
+  names can drift across major series; re-check when bumping.
 - **AppImage FUSE2-vs-FUSE3 story** — changed recently; verify against the exact
   appimagetool/runtime version you ship.
 - **Whether `--filesystem=/run/udev:ro` is actually needed** for keyroost-hid in

@@ -144,7 +144,7 @@ Being worked on right now — check with whoever holds it before starting.
 
 ## Hardware verification
 
-Not yet run. Everything here is behaviour that automated tests cannot reach;
+Not yet run. Everything here is behavior that automated tests cannot reach;
 items marked *(no hardware)* need a device the maintainer does not have.
 
 **Device binding and targeting** (deferred from the v0.7.5 security work — the
@@ -179,9 +179,9 @@ plan's two-key manual steps were never executed):
 - **OATH password carry:** on a password-protected key, unlock + list, then
   "Read code" on an HOTP credential — must succeed without retyping; switch
   devices and confirm the retained password is dropped.
-- **SSH-cert extract, interop proof:** on a YubiKey 5.7, store a cert with
-  `fido2-token -S -b -n ssh:… cert.pub`, extract it with `keyroostctl fido
-  ssh-cert extract` (and via the GUI), and confirm the output `-cert.pub` is
+- **SSH-cert export, interop proof:** on a YubiKey 5.7, store a cert with
+  `fido2-token -S -b -n ssh:… cert.pub`, export it with `keyroostctl fido
+  ssh export --rp <rp-id>` (and via the GUI), and confirm the output `-cert.pub` is
   byte-identical to the original — the cross-implementation check a round-trip
   KAT cannot provide. Also try a cert written by an OLDER libfido2 (pre-~2021),
   which wrote ZLIB-wrapped (RFC 1950) largeBlob data rather than raw DEFLATE:
@@ -207,7 +207,8 @@ plan's two-key manual steps were never executed):
 
 ## Deferred to a later release
 
-- **Submit keyroost to Flathub** — not in v0.13.0. Flathub's generative-AI
+- **Submit keyroost to Flathub** — deferred, not ruled out; not in v0.13.0.
+  The maintainer submits it himself. Flathub's generative-AI
   policy allows AI-generated app code with full disclosure (parts and extent),
   but the Flathub manifest itself and the submission PR, its description and
   replies must be written by the maintainer. Claude may explain requirements
@@ -300,19 +301,19 @@ Not tasks. Kept so they are not re-litigated or re-researched.
   This settles the v0.7.7 `Caps::OTP` question: the product-id gate is **not**
   coming back, not narrowed, not with a corrected table. Nothing here is blocked
   on a vendor answer.
-  What a product id is still good for: **labelling** ("Bio3 Dual (FIDO + PGP)")
-  and colouring an error message. Never for granting or withholding a surface.
+  What a product id is still good for: **labeling** ("Bio3 Dual (FIDO + PGP)")
+  and coloring an error message. Never for granting or withholding a surface.
   `TOKEN2_PRODUCTS` says as much in its own docs — "nothing here may be treated
   as proof that an applet is present" — and the inverse is no safer.
   Scope: the PIV support list (`keyroost-piv/src/compat.rs`, #128) is keyed on
   what the applet itself reports, not a USB product id, and it never hides a
-  control: an unknown applet keeps everything, and anything it greys out comes
+  control: an unknown applet keeps everything, and anything it grays out comes
   back with "Enable Anyway" (GUI) or `--force` (CLI).
 
 - **Windows signing: keep signing with Token2; winget always waits for the
   signed zip.** No own signing identity for now — Azure Artifact Signing /
   Certum would put the maintainer's legal name in the cert CN, and SignPath's
-  OSS programme rejected the project as too new (re-apply 6–12 months from
+  OSS program rejected the project as too new (re-apply 6–12 months from
   2026-07). Signed bytes carry SmartScreen reputation across releases and move
   the submission off the release-day critical path. Submitting unsigned-first-
   then-refreshing was rejected: two PRs per release doubles validation exposure.
@@ -331,9 +332,10 @@ Not tasks. Kept so they are not re-litigated or re-researched.
   included; it cleared on a moderator re-run. Don't re-derive this.
 - **Do NOT host Token2's signed v0.7.4** — it predates the v0.7.5 security
   fixes. Always ask them to sign whatever is current.
-- **Flathub is intentionally skipped** (its stance against AI-authored code);
-  distribution is the self-hosted signed OSTree remote plus the offline
-  `.flatpak` bundle.
+- **Flathub submission is deferred, not ruled out** — see "Submit keyroost to
+  Flathub" under "Deferred to a later release"; the maintainer submits it
+  himself. Until then, distribution is the self-hosted signed OSTree remote
+  plus the offline `.flatpak` bundle.
 - **crates.io first publishes are manual and ordered.** The OIDC job cannot
   create a brand-new crate, so any crate added since the last release needs a
   one-time `cargo publish` plus a Trusted Publishing entry first. The publish

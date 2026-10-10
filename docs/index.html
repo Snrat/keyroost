@@ -302,7 +302,8 @@ flatpak install --user keyroost io.github.framefilter.keyroost</code></pre>
       <code>keyroost-x86_64.AppImage</code> from the latest release, make it executable, and
       run it. (It uses the host's pcsc-lite when installed and falls back to a bundled copy
       otherwise, so it always starts; the smart-card features still need the host's pcscd —
-      see the note below.)</p>
+      see the note below.) From v0.13.0 on, the AppImage is GPG-signed; the signing key's
+      fingerprint is in <a href="https://github.com/framefilter/keyroost/blob/main/SECURITY.md#verifying-the-appimage">SECURITY.md</a>.</p>
     <div class="kr-callout note">
       <div class="kr-callout-title note">Linux prerequisites</div>
       <p>The smart-card features (OATH, OpenPGP, PIV, Molto2) need the host's
@@ -399,7 +400,7 @@ cargo install keyroostctl keyroost</code></pre>
     <p class="kr-small">Free and open source under the
       <a href="https://github.com/framefilter/keyroost/blob/main/LICENSE-MIT">MIT</a> or
       <a href="https://github.com/framefilter/keyroost/blob/main/LICENSE-APACHE">Apache-2.0</a>
-      licence, at your option. Not affiliated with or endorsed by any vendor named here; product
+      license, at your option. Not affiliated with or endorsed by any vendor named here; product
       names are used descriptively and remain their owners' trademarks. This guide is
       general information, not security advice for any specific threat model.</p>
   </div>

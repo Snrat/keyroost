@@ -133,7 +133,7 @@ keyroostctl otp import -i export.json             # asks once, then adds the cod
     <p>Once a seed is provisioned you can change the typing options without re-entering the
       secret: reopen the form, <strong>leave the secret field blank</strong>, and press
       <strong>Save</strong>. The seed slot is left untouched (digit length can only change
-      as part of a seed write, so it is greyed out until you type a new secret). To replace
+      as part of a seed write, so it is grayed out until you type a new secret). To replace
       the seed, enter a new secret and Save; to remove it, use <strong>Clear slot</strong>.</p>
   </section>
 
@@ -165,13 +165,13 @@ keyroostctl otp pin change --pin stdin --new-pin stdin   # in a script: current 
     <p>On a Bio3 key with at least one fingerprint enrolled, a fingerprint touch can
       release the protected codes as an alternative to entering the PIN. Fingerprint
       enrollment itself is done through the key's FIDO2 fingerprint setup, not here;
-      keyroost turns the OTP-side option on or off and unlocks with it. Enabling it
-      needs the current PIN and an enrolled fingerprint.</p>
+      keyroost turns the OTP-side option on or off and unlocks with it. Turning it on
+      or off needs the current PIN; turning it on also needs an enrolled fingerprint.</p>
 <pre><code>keyroostctl otp fingerprint status        # is fingerprint unlock available, and is it on
 keyroostctl otp fingerprint enable        # turn it on (asks for the current PIN)
-keyroostctl otp fingerprint disable       # turn it off
+keyroostctl otp fingerprint disable       # turn it off (asks for the current PIN)
 keyroostctl otp list --unlock fingerprint # touch the sensor to unlock, then list
-keyroostctl otp list --unlock auto        # try the fingerprint, fall back to the PIN</code></pre>
+keyroostctl otp list --unlock auto --pin env:OTP_PIN   # try the fingerprint, fall back to that PIN</code></pre>
     <p class="kr-muted">When fingerprint unlock is on, the GUI's unlock prompt shows a
       fingerprint-touch button alongside the PIN field, and either one opens the read
       window.</p>

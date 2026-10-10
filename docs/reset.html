@@ -72,8 +72,8 @@
       failed, and the key still needing attention. Read the report; don't assume a clean
       slate because the command finished.</p>
     <ul>
-      <li><strong>FIDO2</strong> — erases all resident credentials/passkeys and clears the
-        PIN. Any account relying solely on this key for sign-in is locked out until you
+      <li><strong>FIDO2</strong> — erases all resident credentials/passkeys, clears the
+        PIN, and wipes the large-blob storage, including a name stored on the key. Any account relying solely on this key for sign-in is locked out until you
         register a replacement. <a href="fido2.html">FIDO2 →</a></li>
       <li><strong>OATH</strong> — removes all stored TOTP/HOTP seeds and clears the applet
         password. It needs no password to run, which makes it the only way back from a

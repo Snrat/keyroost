@@ -109,8 +109,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   delete`, `molto seed set` and `molto import` on used slots, `molto
   customer-key change`, `prog seed set` and `prog config set`, and on PIV
   `retries set`
-  (which also resets the PIN and PUK to their factory defaults) and, when
-  the slot is in use, `key generate`, `cert import`, `cert generate` and
+  (which also resets the PIN and PUK to their factory defaults) and,
+  unless the slot is known to be empty, `key generate`, `cert import`, `cert generate` and
   `--generate-key`. If the question was shown, keyroost checks it is
   still the same key before acting. `factory-reset` asks you to type
   `reset`, and `otp interface` reads its phrase from the terminal only.
@@ -125,8 +125,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--time-step` (same values). `piv cert import` and `molto import` read
   `--in FILE` (`-i`), and `piv cert export`, `cert request`, `cert
   generate` and `key generate` write `--out FILE` (`-o`), in place of
-  `--file` and `--save-pubkey`; with `--generate-key`, `--save-pubkey` and
-  `--load-pubkey` are `--pubkey-out` and `--pubkey-in`. `piv mgmt-key
+  `--file` and `--save-pubkey`; `--load-pubkey` is `--pubkey-in`, and
+  with `--generate-key`, `--save-pubkey` is `--pubkey-out`. `piv mgmt-key
   change` takes `--algorithm` (was `--new-algorithm`). The item a command
   acts on is an argument: `fido credential delete ID`, `fido fingerprint
   rename ID NAME`, `fido fingerprint delete ID` and `fido fingerprint add
@@ -183,8 +183,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the capability check, and a value that matches no detected key is used
   as typed. ([#165])
 - **One message style.** Messages are sentences (`Seed written to slot
-  #5.`), warnings and notes start with `warning:` / `note:` on stderr,
-  `fido info`, `molto info` and `prog info` each line their fields up
+  #5.`), warnings and notes start with `warning:` / `note:` on stderr (the
+  import preview keeps its own `Note:` lines), `fido info`, `molto info` and `prog info` each line their fields up
   block by block, and Molto2 messages say "slot" where they said "profile".
   ([#165])
 - **One word per action, and every command ends in one.** The same job
@@ -250,8 +250,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   line, not all of stdin. ([#165])
 - **The screen output is split: result on stdout, the rest on stderr.**
   Prompts, progress, "Authenticated.", the Molto2 serial and clock lines
-  (except in `molto info`, where they are the result) and "Wrote …" lines
-  now go to stderr. So `keyroostctl molto list > slots.txt` saves just the
+  (except in `molto info`, where they are the result) and the "Wrote FILE"
+  lines for saved files now go to stderr. So `keyroostctl molto list > slots.txt` saves just the
   table, and you still see the rest. ([#165])
 - The Flatpak build's hash-pinned Python tools move to multidict 6.9.1
   (every artifact hash listed, as before). ([#166])

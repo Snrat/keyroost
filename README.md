@@ -33,8 +33,8 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
 ## What it does
 
 - **FIDO2 / CTAP2** — enumerate authenticators, read `authenticatorGetInfo`,
-  manage resident credentials (list / metadata / delete), set / change / verify
-  the PIN, reset a key (USB replug ceremony, or in place for a card in a
+  manage resident credentials (list / metadata / delete), set / change the PIN
+  and show how many attempts are left, reset a key (USB replug ceremony, or in place for a card in a
   reader). Fingerprint (bio) enrollment — list / enroll / rename / delete — and
   FIDO Metadata Service (MDS) authenticator identification in the GUI. PIN
   protocols v1 and v2. CTAP 2.1 security policy over
@@ -132,9 +132,12 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   Keep the name on this computer (`keys.json`, which stores a salted
   fingerprint of the key, never its serial) or on the key itself, where every
   computer running keyroost sees it (see [Naming a key](#naming-a-key)).
-  Destructive operations always resolve to an explicit target, never a
-  default. `keys.json` lives under `%APPDATA%` on Windows (the platform config
-  dir elsewhere), and names are validated with anti-spoofing checks while
+  Destructive operations act on one specific key, never "the first key
+  found": a lone key is used, and with several, a terminal asks you to pick
+  and a script is refused. The confirmation question names the key.
+  `keys.json` lives in `%APPDATA%\keyroost` on Windows and in
+  `$XDG_CONFIG_HOME/keyroost` (else `~/.config/keyroost`) elsewhere, macOS
+  included, and names are validated with anti-spoofing checks while
   allowing a relaxed, readable character set.
   On Windows and macOS the OS reports no USB position, so keyroost asks each
   side of a key for the identity it reports (a YubiKey's serial, a Solo 2's
@@ -614,9 +617,8 @@ installing them.
 
 ### Shell completions
 
-The Homebrew package installs `keyroostctl`'s completions for bash, zsh and
-fish, plus man pages; the AUR package installs bash and fish the same way,
-plus man pages, but add the zsh line below to `~/.zshrc` either way.
+The Homebrew and AUR packages install `keyroostctl`'s bash and fish
+completions, plus man pages; for zsh, add the line below to `~/.zshrc`.
 Otherwise, set completions up once for your shell:
 
 ```bash

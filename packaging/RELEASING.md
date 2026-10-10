@@ -162,6 +162,12 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       size and 100% zoom.
 - [ ] Full gates: clippy `-D warnings`, fmt, workspace tests, and
       `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked`.
+- [ ] **Second packaging probe, on the prep branch** (mandatory, one command):
+      `gh workflow run linux-bundles.yml --ref <prep-branch>`
+      The `cargo update` above changed `Cargo.lock`, which feeds the Flatpak's
+      cargo sources, so the tree being tagged is not the one the §1 probe
+      built. Same rules as §1: build-only, check the branch before approving
+      the gate, and both bundle jobs green before landing.
 - [ ] Land on main: push the prep branch directly —
       `git push origin <branch>:main` (the require-PR rule's admin bypass
       covers the maintainer; no rebase, no commit signing — the release is

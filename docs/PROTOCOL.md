@@ -3,7 +3,7 @@
 This document describes the wire protocol the Molto2 device speaks, as observed
 from the running hardware. It is provided so that contributors can work on
 keyroost without reading any third-party source code. All facts here describe
-behaviour of the Token2 device itself; none of it is copyrighted by anyone.
+behavior of the Token2 device itself; none of it is copyrighted by anyone.
 
 > **Status:** the algorithm and APDU layouts below are confirmed by byte-for-byte
 > agreement between keyroost's protocol layer and an independent third-party SM4
