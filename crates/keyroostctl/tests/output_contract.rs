@@ -382,7 +382,7 @@ fn molto_import_points_binary_key_material_elsewhere() {
     let der = dir.join("cert.der");
     std::fs::write(
         &der,
-        include_bytes!("../../keyroost-piv/tests/fixtures/rsa_piv.der"),
+        include_bytes!("fixtures/rsa_piv.der"),
     )
     .unwrap();
     let (code, _, err) = run(&[

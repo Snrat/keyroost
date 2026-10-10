@@ -21891,7 +21891,7 @@ mod cli_tests {
             .unwrap();
             std::fs::write(
                 &f.encrypted,
-                include_str!("../../keyroost-qr/tests/fixtures/aegis-encrypted.json"),
+                include_str!("../tests/fixtures/aegis-encrypted.json"),
             )
             .unwrap();
             f

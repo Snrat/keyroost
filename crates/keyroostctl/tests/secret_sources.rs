@@ -236,7 +236,7 @@ fn fixture_dir() -> std::path::PathBuf {
         ),
         (
             "cert.der",
-            include_bytes!("../../keyroost-piv/tests/fixtures/rsa_piv.der"),
+            include_bytes!("fixtures/rsa_piv.der"),
         ),
     ] {
         std::fs::write(dir.join(name), body).unwrap();
