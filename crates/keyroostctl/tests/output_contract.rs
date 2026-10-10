@@ -380,11 +380,7 @@ fn molto_import_help_names_file_password() {
 fn molto_import_points_binary_key_material_elsewhere() {
     let dir = input_dir("molto");
     let der = dir.join("cert.der");
-    std::fs::write(
-        &der,
-        include_bytes!("fixtures/rsa_piv.der"),
-    )
-    .unwrap();
+    std::fs::write(&der, include_bytes!("fixtures/rsa_piv.der")).unwrap();
     let (code, _, err) = run(&[
         "molto",
         "import",
