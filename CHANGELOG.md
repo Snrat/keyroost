@@ -6,6 +6,386 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-10
+
+### Added
+- **Swissbit iShield serial, name and firmware.** keyroost reads the serial,
+  device name and firmware version of Swissbit iShield Key 1 and 2 cards from
+  their own management applications, and shows them in `piv info` and the
+  GUI. Contributed by @episource. ([#163])
+- **X.509 key usage for PIV certificates and requests.** Self-signed
+  certificates and CSRs carry a keyUsage extension, in the GUI and with
+  `piv cert generate` / `piv cert request --key-usage`. By default it is
+  the slot's standard PIV usage, marked critical; `--key-usage undefined`
+  (or "Undefined" in the GUI) writes none. Contributed by @episource.
+  ([#164])
+- **Shell completion for saved key names.** `keyroostctl completions
+  <shell>` now prints a short script that asks keyroostctl for
+  suggestions, so `--device` completes the names you saved. The AUR and
+  Homebrew packages install completions and man pages. ([#165])
+- **`--encoding` for seeds and Molto2 customer keys.** Seeds are base32
+  unless `--encoding hex` (`oath add`, `otp add`, `otp button set`,
+  `molto seed set`, `prog seed set`). A new Molto2 customer key is hex unless
+  `--encoding ascii`; the current key's encoding is
+  `--customer-key-encoding`. ([#165])
+- **Numbered `list` and `list --json`.** `list` numbers each key (sorted by
+  serial, so a number can change when keys are added or removed), and
+  `--json list` prints `{"keys": [...]}`, one row per key with the exact
+  `--device` value that selects it. `list --device` shows just that key.
+  ([#165])
+- **Five short flags.** `-d` (`--device`), `-y` (`--yes`), `-o`
+  (`--out`), `-i` (`--in`) and `-s` (`--slot`), with the same meaning on
+  every command. ([#165])
+- **`fido blob clear --keep-name`** clears the large-blob storage but keeps
+  the key's name ("Keep the key's name" in the app). Without it, the
+  warning names the name that goes. `fido blob list` shows the name entry
+  as `key name`, and `fido blob edit` points to `name set` instead of
+  changing it. ([#166])
+- **A key can carry its own name.** `keyroostctl name set NAME --store key`
+  (or "On this key" in the app's naming dialog) writes the name into the
+  key's FIDO2 large-blob storage, and every computer running keyroost shows
+  it, without a PIN. Saving it needs the FIDO PIN; the name is visible to
+  anyone who has the key. `name set` also renames, `name clear` removes a
+  name wherever it is stored, and `name list` shows where each name lives.
+  The entry's format is published with test vectors in
+  `docs/PROTOCOL-device-label.md` so other tools can use it. If a key loses
+  its name, `name list` and the app offer to write it back. Proposed by
+  @token2. ([#166])
+- **Two keys with the same name stay apart.** The first key this computer
+  saw with a name keeps it, and `--device NAME` always means that key.
+  Another key carrying the same name shows as "Name (1234)", the last four
+  characters of its serial, for display only; select it by its `list`
+  number or `serial:…`. ([#166])
+- **Import authenticator codes into any key that stores them.** `oath
+  import` adds every code in an Aegis (plain or encrypted), 2FAS,
+  `otpauth://` list or QR export to a YubiKey, Solo 2 or Nitrokey 3, and
+  `otp import` to a Token2 key's OTP storage. In the GUI, drop the file on
+  the window or click "Import file…" in the Authenticator, On-device OTP or
+  Molto2 view; the "Import authenticator codes" dialog works for every key
+  that stores codes. keyroost reads the key first and previews each entry:
+  a code whose name is already on the key is skipped (`--replace`
+  replaces it), and one the key can't store is listed with the reason.
+  `--dry-run` writes nothing. It asks once, writes one code at a time, and
+  stops at the first error with a report of what was added. ([#170])
+- **Solo 2 names are capped at 127 bytes.** `oath add`, `oath import` and
+  the GUI refuse a longer Solo 2 name before sending it: a 128-byte name
+  made the key stop responding until it was unplugged. ([#170])
+- **YubiKey 4 prefix names.** On YubiKey 4 firmware 4.0 to 4.3.4, `oath
+  add`, `oath import` and the GUI refuse a name that is the start of
+  another name already on the key, following the same rule as Yubico's
+  `ykman`. ([#170])
+- **The AppImage is GPG-signed.** Each release's AppImage carries an
+  embedded signature from a dedicated signing key; its fingerprint is in
+  SECURITY.md and the README, which also explain how to check it.
+  AppImageUpdate-based updaters (appimageupdatetool, AppImageLauncher)
+  now refuse an update signed by a different key. Users updating an
+  unsigned AppImage (v0.12.x or earlier) with these tools download this
+  release by hand once. ([#171])
+
+### Changed
+- **Always-UV is set, not toggled.** `fido config always-uv enable` and
+  `fido config always-uv disable` replace the `fido always-uv` toggle, so
+  a script always knows the state it leaves. Each one does nothing, and
+  says so, when the key is already in that state. ([#165])
+- **Commands are grouped by what they act on, in separate words.**
+  `piv pin change`, `piv key generate`, `piv cert import`, `openpgp pin
+  change --admin`, `openpgp key show`, `oath password set`, `otp pin set`,
+  `otp button set`, `fido credential list`, `fido fingerprint add`, `fido
+  config always-uv enable`, `fido pin min-length set`, `fido blob …` (was
+  `large-blob`), `fido ssh …` (was `ssh-cert`), `molto sync`, `molto
+  import --in`, and `name set|list|clear` (was `key-name`). `piv info`,
+  `openpgp info` and `otp info` replace `piv status`, `openpgp status` and
+  `otp config`; `otp get` is `otp code`, `otp erase-all` is `otp reset`,
+  and `otp fp-list` / `otp unlock-list` are `otp list --unlock
+  fingerprint` / `--unlock auto` (`--pin-only` is `--unlock pin`, the
+  default). An old name is refused with an error naming the new one. The
+  migration page lists every change. ([#165])
+- **Destructive commands ask first.** In a terminal they show a y/N question
+  naming the key; in a script they need `--yes` (`-y`). A command whose
+  PIN or seed is piped in on stdin also needs `--yes`. This now also
+  covers replacing or deleting what the computer can't restore: `oath
+  delete`, `otp delete`, `otp button set` (when a seed is already set) and
+  `otp button clear`, `fido credential delete` and `fido fingerprint
+  delete`, `molto seed set` and `molto import` on used slots, `molto
+  customer-key change`, `prog seed set` and `prog config set`, and on PIV
+  `retries set`
+  (which also resets the PIN and PUK to their factory defaults) and, when
+  the slot is in use, `key generate`, `cert import`, `cert generate` and
+  `--generate-key`. If the question was shown, keyroost checks it is
+  still the same key before acting. `factory-reset` asks you to type
+  `reset`, and `otp interface` reads its phrase from the terminal only.
+  ([#165])
+- **`piv cert export` writes PEM by default.** `piv cert export --slot 9a`
+  at a terminal now prints the certificate instead of refusing. Add
+  `--format der` for the raw DER bytes `piv export-cert` wrote before.
+  ([#165])
+- **Flags renamed to match.** `molto` commands take `--slot` (`-s`) in
+  place of `-p` / `--profile` (Token2 calls slots profiles), and `molto
+  config set` and `prog config set` take `--period` in place of
+  `--time-step` (same values). `piv cert import` and `molto import` read
+  `--in FILE` (`-i`), and `piv cert export`, `cert request`, `cert
+  generate` and `key generate` write `--out FILE` (`-o`), in place of
+  `--file` and `--save-pubkey`; with `--generate-key`, `--save-pubkey` and
+  `--load-pubkey` are `--pubkey-out` and `--pubkey-in`. `piv mgmt-key
+  change` takes `--algorithm` (was `--new-algorithm`). The item a command
+  acts on is an argument: `fido credential delete ID`, `fido fingerprint
+  rename ID NAME`, `fido fingerprint delete ID` and `fido fingerprint add
+  NAME` (were `--cred-id`, `--template-id` and `--name`). `fido ssh
+  export` takes the SSH credential's RP ID as `--rp` (was
+  `--credential`). `fido blob export` takes the output file as `--out
+  FILE` instead of a second argument: `keyroostctl fido blob export 1 -o
+  entry.bin`. An old flag is refused with an error naming the new one.
+  ([#165])
+- **Clearer `--help`.** Every flag and argument has a description.
+  Commands that erase or replace something end their first line with one
+  marker, such as "Irreversible: asks first (`--yes` to skip)", and that
+  now includes commands that replace a key or seed (`piv key generate`,
+  `molto seed set`, `otp button set` and others), `piv retries set`
+  (which says it also resets the PIN and PUK) and `otp interface`. `piv
+  cert request --generate-key` replaces the slot's key and asks first.
+  The top-level description covers every command group, and `--debug`,
+  `--device` and `--json` are listed under "Global options" after a
+  command's own flags. Two messages now say "canceled" (was
+  "cancelled"). ([#165])
+- **A hidden prompt for PINs, passwords, keys and seeds.** Every secret
+  comes from `env:NAME`, from `stdin` (one line), or, with no flag and a
+  terminal present, from a prompt that doesn't show what you type, like
+  `sudo` or `ssh`. `stdin` typed at a terminal is hidden too. The Molto2
+  and `prog` seeds and the new Molto2 customer key now prompt as well
+  (`--encoding` says how they are written). New PINs, passwords and keys
+  typed at the prompt are asked twice and must match; seeds and URIs are
+  asked once. A script with no source is refused with an error naming
+  the flag. Hex and base32 values lose surrounding spaces; PINs and
+  passwords are kept exactly. After you type a secret at the prompt,
+  keyroost checks it is still the same key before acting. In Git Bash
+  (mintty) on Windows the prompt needs a real console: run `winpty
+  keyroostctl …` or use `env:NAME`. The prompt uses the new `rpassword`
+  dependency. ([#165])
+- **One JSON shape.** `--json` output is always one object. Lists sit under
+  a named key: `keys` for the overview and `list`, `accounts` for `oath
+  list` and `otp list`. Every field is present, `null` when unknown. Each
+  idea has one name and type: `serial` is a string, PIV `slot` is the
+  `--slot` value (`"9a"`) with `slot_name` beside it, `molto info` reports
+  `utc_time`, `molto list` reports `algorithm` (`"sha1"`), `period` and
+  `digits`, `oath list` and `otp list` spell `algorithm` the same way
+  (`"sha1"`), PIN retries are `user_pin_retries`, `pin_retries` and so on,
+  accounts have a `type`, and the overview says `capabilities`. The
+  migration page lists every field. ([#165])
+- **Every command finds its key the same way.** A lone key is used
+  automatically. With several, a terminal shows a numbered list to pick
+  from (now on every platform); a script gets a refusal that lists the
+  `--device` value for each key. No command takes "the first key found"
+  any more. `--device` takes a name, a serial or a `list` number
+  (`name:`, `serial:` or `list:` forces which); a Molto2 answers to either
+  serial keyroost shows for it, the one in `list` or the one `molto info`
+  prints. `--device` with `--reader` or `--path` is refused, and so is
+  `--device` on commands that touch no key. `--reader` and `--path` skip
+  the capability check, and a value that matches no detected key is used
+  as typed. ([#165])
+- **One message style.** Messages are sentences (`Seed written to slot
+  #5.`), warnings and notes start with `warning:` / `note:` on stderr,
+  `fido info`, `molto info` and `prog info` each line their fields up
+  block by block, and Molto2 messages say "slot" where they said "profile".
+  ([#165])
+- **One word per action, and every command ends in one.** The same job
+  has the same word in every group: `fido pin status` (was `pin-retries`)
+  and `fido credential status` (was `creds-metadata`) show state like
+  `otp pin status`; `fido blob show` (was `large-blob get`) prints one
+  entry; `fido ssh export` (was `ssh-cert extract`) saves a file like the
+  other `export` commands; `otp button clear` (was `delete-button-hotp`)
+  is the opposite of `set`; `molto list` (was `molto slots`) lists like
+  every other group. Writes end in an action word: `molto seed set`,
+  `molto title set`, `molto config set`, `prog seed set`, `prog config
+  set`, `fido pin min-length set` (was `set-min-pin`) and `molto
+  customer-key change`. `molto title --slot N` without `set` only shows
+  the slot's title. An old name is refused with an error naming the new
+  one, and nothing typed after it is repeated. ([#165])
+- **An existing output file is never replaced silently.** `piv cert
+  export`, `cert request`, `cert generate` and `key generate --out`,
+  `openpgp sign`, `decrypt` and `authenticate`, and `fido blob export`
+  and `fido ssh export` ask "overwrite? [y/N]" at a terminal when the
+  output file exists, and refuse in a script unless `--overwrite` is
+  given. A directory as the output is refused before the key is touched,
+  and so is a symlink for the `openpgp` outputs. `--overwrite` only
+  covers the local file; `--yes` still confirms what happens on the key.
+  ([#165])
+- **Out-of-range values exit 2.** A number outside its range (`oath add
+  --digits 9`, Molto2 slot 100, a retry count of 0) is a usage error that
+  exits 2, like any other mistyped argument. Some of them used to exit 1.
+  ([#165])
+- **Reset credentials are read before the reset starts.** `piv reset`
+  and `factory-reset` read their `--mgmt-key` or `--pin` before anything
+  is reset, even on a card that turns out not to need it. An unset
+  `env:NAME` variable is now an error up front, where before it could be
+  ignored. ([#165])
+- **FIDO2 reset waits for the replug.** `fido reset` on a USB key and the
+  FIDO2 step of `factory-reset` now ask you to unplug the key and plug it
+  back in (within 60 seconds), check it is the same key, then ask for a
+  touch. There is no Enter to press. `factory-reset` ends with "N wiped,
+  M skipped, K failed" and exits with an error if any step was skipped
+  or failed. ([#165])
+- **One flag per secret; its value says where the secret comes from.**
+  `--pin env:NAME` reads an environment variable and `--pin stdin` reads
+  one line, replacing `--pin-env NAME` and `--pin-stdin`. The same goes
+  for `--new-pin`, `--puk`, `--new-puk`, `--admin-pin`, `--mgmt-key`
+  (which also takes `default`), `--new-mgmt-key`, `--password`,
+  `--new-password`, `--seed`, `--customer-key`, `--new-customer-key` and
+  `--uri`. The `--old-…` flags are now the plain name: `--pin` is the
+  current PIN and `--new-pin` the new one. `oath add --secret-env` is
+  `--seed env:NAME`, `openpgp verify --pin admin` is `openpgp pin verify
+  --admin`, and `otp change-pin --current-env` / `--new-env` are `otp pin
+  change --pin env:NAME --new-pin env:NAME`. A secret typed as the value
+  itself (`--pin 123456`) is refused with exit 2 and never shown. An old
+  flag is refused with an error naming the new one. ([#165])
+- **`fido ssh export` takes `--overwrite`, not `--force`.** The old
+  `ssh-cert extract --force` is gone. ([#165])
+- **Two secrets on stdin: the current one first.** When two flags read
+  `stdin`, the current secret is the first line and the new one the
+  second, and each flag's help says which line it reads. This changes the
+  order for `oath password set` (current password, then new) and `piv
+  mgmt-key change` (current key, then new); both read the new one first
+  before. `otp add` and `oath add` read the seed first, then the PIN or
+  password. On `molto`, `--customer-key stdin` is always the first line,
+  before the seed, URI or new key. `prog seed set --seed stdin` reads one
+  line, not all of stdin. ([#165])
+- **The screen output is split: result on stdout, the rest on stderr.**
+  Prompts, progress, "Authenticated.", the Molto2 serial and clock lines
+  (except in `molto info`, where they are the result) and "Wrote …" lines
+  now go to stderr. So `keyroostctl molto list > slots.txt` saves just the
+  table, and you still see the rest. ([#165])
+- The Flatpak build's hash-pinned Python tools move to multidict 6.9.1
+  (every artifact hash listed, as before). ([#166])
+- **`keys.json` no longer holds serials.** Each name is stored with a
+  salted fingerprint of its key, the salt kept in `keys.salt` beside it, so
+  the file shows no serial and two computers' files can't be matched. An
+  older `keys.json` converts the first time it is read; a backup of the old
+  file is kept until the conversion succeeds, then removed. v0.12 can't
+  read the converted file and shows keys unnamed; don't rename a key with
+  v0.12 after upgrading, since that replaces the converted file and its
+  names. If `keys.salt` is lost, set the names again; restoring the old
+  salt doesn't bring them back.
+  ([#166])
+- Library API (`keyroost-ctap`): `LargeBlobArray`'s `entries` and
+  `raw_array` fields are methods, `serialize_with_checksum` returns a
+  `Result`, `extract_cert_from_entries` takes the array, and `EntryKind`
+  gains `KeyName`, so an exhaustive `match` needs a new arm. New: the
+  `device_label` module. ([#166])
+- Library API (`keyroost-keyring`): `keys.json` format 2. `KeyEntry` is
+  `KeyRecord` (a `fingerprint` and `stored` instead of `serial`); `add`,
+  `by_name`, `by_serial`, `name_for`, `resolve`, `ConnectedKey`,
+  `ResolveError` and `KeyringError::DuplicateSerial` are removed, and the
+  save methods take `&mut self`. ([#166])
+- Library API (`keyroost-resolve`): `Device` gains the public fields
+  `naming` and `hid_serial`, `EnumerateOptions` gains `skip_key_names`, and
+  `SelectError` gains `NameNotConnected`. New: the `names` module. The
+  migration page lists every change. ([#166])
+- **`molto import --file-password`.** An encrypted Aegis export's password
+  now comes from `--file-password env:NAME` or `--file-password stdin`, the
+  same flag `oath import` and `otp import` use (v0.12's `import-file
+  --password-env` / `--password-stdin` are refused with an error naming
+  it). ([#170])
+- **The Molto2 "Bulk import" dialog is replaced.** "Import file…" in the
+  Molto2 view, or a file dropped on the window, opens the shared "Import
+  authenticator codes" dialog. Every dropped file is identified first: a
+  certificate or key file gets a note saying where to import it, and any
+  other file gets "keyroost can't import this file". ([#170])
+- **`molto import --in` follows the shared import rules.** An entry the
+  Molto2 can't store (for example a SHA-512 code or a 45-second period) is
+  skipped with the reason instead of refusing the whole file, and entries
+  past slot #99 are skipped. An entry with no issuer or account no longer
+  takes a slot. The preview, the one question before writing (`--yes` in
+  a script), the report and `--json` are the same as `oath import`.
+  `--dry-run` shows which slots are in use when a Molto2 is connected
+  (`--device` picks which one). ([#170])
+
+### Fixed
+- **One row per key on Windows and macOS.** Where the system reports no USB
+  position, keyroost now asks each side of a key for the identity it reports
+  (a YubiKey's serial, a Solo 2's ID, a Token2 key's serial) and joins the
+  FIDO and smart-card halves into one row. The GUI sidebar and the CLI share
+  this matching. With two keys of the same make, one that doesn't answer
+  still shows as two rows. On Linux nothing changes. ([#51])
+- **PIV slots say what keyroost can tell about the key.** `piv info` and the
+  GUI used to call every slot without a certificate "empty". A slot without
+  a certificate now reads "empty" when the card says it holds no key, "key
+  present, no certificate" when the card confirms a key, and "no
+  certificate (a key may be present)" when keyroost can't tell. keyroost
+  can't tell on cards where it doesn't use GET METADATA's key type, and on
+  cards whose GET METADATA answer neither names a key nor says there is
+  none: slots on these cards that read "empty" before now read "no
+  certificate (a key may be present)". On
+  a YubiKey, a slot with a key but no certificate now reads "key present,
+  no certificate" in the CLI (it said "empty"). JSON output is
+  unchanged. ([#113])
+- **`openpgp info` shows a Token2 key's full serial.** The OpenPGP card
+  data holds only a shortened serial, so keyroost now reads the full one
+  from the key's OTP applet, the way `piv info` has since 0.12.0 (built on
+  @episource's PIV work). This covers the CLI, its JSON `serial` field and
+  the GUI's OpenPGP view. ([#125])
+- **`--debug` traces FIDO.** FIDO commands over USB now show their messages
+  with `--debug`; before, only `KEYROOST_CTAP_DEBUG` did, and it still
+  works. FIDO through a smart-card reader isn't traced. FIDO PIN exchanges
+  (clientPIN, authenticatorConfig) are hidden except the retry count and
+  key agreement, like PIV and OpenPGP PIN checks. Every group now shares one
+  line format (`> label  bytes`), which is for people and may change.
+  With the GUI's debug capture on, Token2 OTP trace lines (redacted as on
+  stderr) now appear in its activity log. ([#165])
+- **`prog` uses the token you choose.** It used to ignore `--device` and
+  write to whichever reader was alone, programmable token or not. It now
+  only considers programmable tokens and honors `--device` and
+  `--reader`. ([#165])
+- **Large-blob writes keep other tools' entries byte for byte.** Adding,
+  editing or deleting an entry dropped fields keyroost didn't know from
+  every other entry it wrote back. Entries keyroost doesn't change are now
+  written back exactly as read, in order. ([#166])
+- **One malformed large-blob element no longer hides the whole store.** An
+  element not in the standard entry format is skipped and counted in `fido
+  blob list` (and its JSON `skipped`), and kept unchanged by every write.
+  ([#166])
+- **Flatpak updates no longer fail on unsigned metadata.** The published
+  repository's AppStream and `.Debug` refs went out unsigned, so Flatpak
+  clients that verify them refused the metadata refresh. Every ref is now
+  signed, and publishing stops if one isn't. ([#167])
+- **The Molto2 import dialog closes and says why adding is gray.** Close
+  in the import dialog, and Cancel in the "Import to slot" dialog, did
+  nothing; both now close the dialog, and closing either dialog by any
+  route wipes the typed file password or pasted URI and drops the parsed
+  entries (which carry seeds).
+  When adding can't start, one line under the buttons now says why: the
+  file is still loading, or the Molto2 isn't open or unlocked yet (with
+  an Authenticate button right there, and a failed attempt is reported in
+  that line too). ([#170])
+- **Codes for OATH entries named `60/…` use their period.** `oath code`
+  (without `--period`) and the GUI computed them at 30 seconds, so they
+  were wrong. `--period` now defaults to the name's `period/` prefix, and
+  the GUI shows the period next to the code. ([#170])
+- **`oath code --period 0` is a usage error.** It crashed; it is now
+  refused with exit 2. ([#170])
+
+### Removed
+- **`--list-readers` is gone.** `keyroostctl list` shows the smart-card
+  readers along with every other connected key. ([#165])
+- **No secret on the command line.** The flags that took a secret as a
+  plain argument are gone, because the command line ends up in shell
+  history and `ps`: `molto --key` / `--key-ascii` (use `--customer-key
+  env:NAME`, with `--customer-key-encoding ascii` for an ASCII key),
+  `molto seed` and `prog seed` `--hex` / `--base32` (use `molto seed set`
+  or `prog seed set` with `--seed env:NAME` or `--seed stdin`, and
+  `--encoding hex` for hex), and `molto customer-key --hex` / `--ascii`
+  (use `molto customer-key change --new-customer-key`). `molto
+  import` no longer takes the `otpauth://` URI as an argument: use `--uri
+  env:NAME`, `--uri stdin`, `--qr IMAGE`, or the prompt. Each removed flag
+  is refused with an error that names its replacement and doesn't repeat
+  the value. ([#165])
+
+### Security
+- **Errors don't repeat a secret.** A secret typed where its source goes
+  (`--pin 123456`, `--pin123456`, `--seed=JBSWY3DP`), a stray value after
+  a source, a literal `otpauth://` URI or a removed flag's value is
+  refused without being printed, and an error about an `env:NAME` source
+  names the flag, not the variable, in case the secret was typed where the
+  name goes. ([#165])
+
 ## [0.12.0] - 2026-10-04
 
 ### Added
@@ -1203,6 +1583,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
   external dependencies are `pcsc`, `clap`, `eframe`/`egui`, `serde`, and
   (for RSA keygen/parsing) `rsa`/`rand`.
 
+[#51]: https://github.com/framefilter/keyroost/issues/51
 [#80]: https://github.com/framefilter/keyroost/issues/80
 [#81]: https://github.com/framefilter/keyroost/issues/81
 [#82]: https://github.com/framefilter/keyroost/issues/82
@@ -1220,11 +1601,13 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#107]: https://github.com/framefilter/keyroost/issues/107
 [#109]: https://github.com/framefilter/keyroost/issues/109
 [#110]: https://github.com/framefilter/keyroost/pull/110
+[#113]: https://github.com/framefilter/keyroost/issues/113
 [#114]: https://github.com/framefilter/keyroost/pull/114
 [#116]: https://github.com/framefilter/keyroost/pull/116
 [#118]: https://github.com/framefilter/keyroost/pull/118
 [#119]: https://github.com/framefilter/keyroost/pull/119
 [#124]: https://github.com/framefilter/keyroost/issues/124
+[#125]: https://github.com/framefilter/keyroost/issues/125
 [#127]: https://github.com/framefilter/keyroost/issues/127
 [#128]: https://github.com/framefilter/keyroost/issues/128
 [#130]: https://github.com/framefilter/keyroost/issues/130
@@ -1236,7 +1619,15 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#157]: https://github.com/framefilter/keyroost/issues/157
 [#160]: https://github.com/framefilter/keyroost/issues/160
 [#161]: https://github.com/framefilter/keyroost/issues/161
-[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.12.0...HEAD
+[#163]: https://github.com/framefilter/keyroost/issues/163
+[#164]: https://github.com/framefilter/keyroost/issues/164
+[#165]: https://github.com/framefilter/keyroost/issues/165
+[#166]: https://github.com/framefilter/keyroost/issues/166
+[#167]: https://github.com/framefilter/keyroost/issues/167
+[#170]: https://github.com/framefilter/keyroost/issues/170
+[#171]: https://github.com/framefilter/keyroost/issues/171
+[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/framefilter/keyroost/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/framefilter/keyroost/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/framefilter/keyroost/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/framefilter/keyroost/compare/v0.9.0...v0.10.0
