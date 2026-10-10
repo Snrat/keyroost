@@ -57,7 +57,7 @@ pub enum OtpTarget {
 impl OtpTarget {
     /// Open a Token2 OTP session bound to exactly this endpoint (or endpoint
     /// pair — see [`OtpTarget::HidThenReader`]).
-    fn open(&self) -> Result<Token2OtpSession, OtpTransportError> {
+    pub(crate) fn open(&self) -> Result<Token2OtpSession, OtpTransportError> {
         // Honor KEYROOST_OTP_DEBUG so a stuck/empty list can be traced from the
         // GUI (matches the KEYROOST_CTAP_DEBUG convention; the CLI has --debug).
         let debug = std::env::var_os("KEYROOST_OTP_DEBUG").is_some();
@@ -82,7 +82,7 @@ impl OtpTarget {
 /// unsatisfiable — an explicit HID/CCID pick with no matching interface, or an
 /// `Auto` pick on a device that resolved to neither — so the pane surfaces an
 /// error instead of silently opening the first key on the bus. Pure + testable.
-fn otp_target_for(
+pub(crate) fn otp_target_for(
     sel: OtpTransportSel,
     hid_path: Option<&Path>,
     reader: Option<&str>,
@@ -434,7 +434,7 @@ fn unix_now() -> u64 {
 /// This only helps when the config read SUCCEEDS. A key whose config exchange
 /// itself fails never yields a capability byte, and that failure is reported
 /// unchanged.
-fn totp_capability(info: Option<&keyroost_token2otp::DeviceInfo>) -> Option<bool> {
+pub(crate) fn totp_capability(info: Option<&keyroost_token2otp::DeviceInfo>) -> Option<bool> {
     let info = info?;
     // The capability bits live in byte 9. Some firmware answers READ_CONFIG with
     // only the leading interface-state byte(s); the parser zero-fills the rest,
@@ -1657,6 +1657,19 @@ impl App {
                     // A reopened dialog must default to masked, regardless of a
                     // reveal toggle left set from a prior entry.
                     self.secret_reveal.insert("otp-add-secret", false);
+                }
+                ui.add_space(6.0);
+                if self.otp.totp_supported != Some(false)
+                    && theme::button(ui, p, BtnKind::Default, "Import file\u{2026}").clicked()
+                {
+                    if let Some(id) = self.selected_device.clone() {
+                        self.import_pick_file(crate::import_flow::Origin::View(
+                            crate::import_flow::DestKey {
+                                device: id,
+                                store: crate::import_flow::StoreKind::Token2Otp,
+                            },
+                        ));
+                    }
                 }
                 ui.add_space(6.0);
                 if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {

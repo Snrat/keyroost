@@ -14,8 +14,12 @@
 //! entries with the same hygiene as any other seed source and remind users
 //! to delete the screenshot afterwards.
 
+pub mod file;
+
+pub use file::{open_file, OpenError, Opened};
+
 use keyroost_import::migration;
-use keyroost_import::{BulkEntry, OtpAuth};
+use keyroost_import::{BulkEntry, BulkError, Format, ImportFile, ImportItem, OtpAuth, Unusable};
 
 /// Refuse images larger than this many pixels before allocating the
 /// grayscale buffer. 16 MP comfortably covers any screenshot (a 4K display
@@ -37,6 +41,10 @@ pub enum QrError {
     NotOtpauth,
     /// The payload parsed as otpauth/migration but was invalid.
     Payload(String),
+    /// The codes in the image carry more than
+    /// [`MAX_ENTRIES`](keyroost_import::entry::MAX_ENTRIES) accounts (wide
+    /// reading only).
+    TooManyEntries,
 }
 
 impl std::fmt::Display for QrError {
@@ -64,6 +72,7 @@ impl std::fmt::Display for QrError {
                  Google Authenticator export"
             ),
             QrError::Payload(e) => write!(f, "QR payload invalid: {}", e),
+            QrError::TooManyEntries => write!(f, "{}", keyroost_import::BulkError::TooManyEntries),
         }
     }
 }
@@ -212,6 +221,91 @@ pub fn entries_from_image(bytes: &[u8]) -> Result<QrImport, QrError> {
     Ok(import)
 }
 
+/// Decode a QR image into the wide, format-neutral model: every account in
+/// every code, in order — HOTP, any TOTP period and SHA-512 included — each
+/// usable or marked with why not. A damaged Google Authenticator code
+/// becomes an unusable item rather than discarding the other codes. Same
+/// whole-image errors as [`entries_from_image`]: no 2FA code at all is
+/// [`QrError::NotOtpauth`], and only damaged codes is [`QrError::Payload`].
+pub fn entries_from_image_wide(bytes: &[u8]) -> Result<ImportFile, QrError> {
+    let texts = texts_from_image(bytes)?;
+    file_from_texts(&texts)
+}
+
+/// The routing half of [`entries_from_image_wide`], over decoded payloads.
+fn file_from_texts(texts: &[String]) -> Result<ImportFile, QrError> {
+    let mut items: Vec<ImportItem> = Vec::new();
+    let mut batch = None;
+    let mut any_otpauth = false;
+    let mut any_migration = false;
+    let mut any_parsed = false;
+    let mut payload_err: Option<String> = None;
+    for text in texts {
+        // Refuse before building the next item (see `MAX_ENTRIES`).
+        if items.len() >= keyroost_import::entry::MAX_ENTRIES {
+            return Err(QrError::TooManyEntries);
+        }
+        let text = text.trim();
+        if migration::is_migration_uri(text) {
+            any_otpauth = true;
+            any_migration = true;
+            match migration::parse_wide(text) {
+                Err(BulkError::TooManyEntries) => return Err(QrError::TooManyEntries),
+                Ok(file) => {
+                    if items.len() + file.items.len() > keyroost_import::entry::MAX_ENTRIES {
+                        return Err(QrError::TooManyEntries);
+                    }
+                    any_parsed = true;
+                    batch = batch.or(file.batch);
+                    items.extend(file.items);
+                }
+                Err(e) => {
+                    payload_err.get_or_insert(e.to_string());
+                    items.push(ImportItem {
+                        index: 0,
+                        label: "damaged QR code".into(),
+                        entry: Err(Unusable::Malformed("QR payload could not be read")),
+                    });
+                }
+            }
+        } else if text.starts_with("otpauth://") {
+            any_otpauth = true;
+            any_parsed = true;
+            let (label, entry) = keyroost_import::otpauth::parse_entry_labeled(text);
+            items.push(ImportItem {
+                index: 0,
+                label: label.unwrap_or_default(),
+                entry,
+            });
+        }
+    }
+    if !any_otpauth {
+        return Err(QrError::NotOtpauth);
+    }
+    if !any_parsed {
+        if let Some(e) = payload_err {
+            return Err(QrError::Payload(e));
+        }
+    }
+    // One running index across every code in the image; nameless items are
+    // named by their position.
+    for (i, item) in items.iter_mut().enumerate() {
+        item.index = i;
+        if item.label.is_empty() {
+            item.label = format!("entry {}", i + 1);
+        }
+    }
+    Ok(ImportFile {
+        format: if any_migration {
+            Format::GoogleExport
+        } else {
+            Format::QrImage
+        },
+        items,
+        batch,
+    })
+}
+
 /// True when `bytes` starts with a PNG or JPEG signature — lets callers
 /// route files by content rather than extension.
 pub fn looks_like_image(bytes: &[u8]) -> bool {
@@ -311,6 +405,66 @@ fn rgb_luma(p: &[u8]) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn texts(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn wide_damaged_code_is_an_item_not_a_failure() {
+        let f = file_from_texts(&texts(&[
+            "otpauth://hotp/Acme:alice?secret=JBSWY3DPEHPK3PXP&counter=4",
+            "otpauth-migration://offline?data=!!!",
+            "otpauth://steam/Game?secret=JBSWY3DPEHPK3PXP",
+            "https://not.a.code",
+        ]))
+        .unwrap();
+        assert_eq!(f.format, Format::GoogleExport);
+        let shape: Vec<_> = f
+            .items
+            .iter()
+            .map(|i| (i.index, i.label.as_str(), i.entry.as_ref().err().cloned()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (0, "Acme:alice", None),
+                (
+                    1,
+                    "damaged QR code",
+                    Some(Unusable::Malformed("QR payload could not be read"))
+                ),
+                (2, "Game", Some(Unusable::Type("steam".into()))),
+            ]
+        );
+    }
+
+    #[test]
+    fn wide_refuses_more_than_max_entries() {
+        let code = "otpauth://totp/X?secret=JBSWY3DP".to_string();
+        let at_cap = vec![code.clone(); keyroost_import::entry::MAX_ENTRIES];
+        assert_eq!(file_from_texts(&at_cap).unwrap().items.len(), at_cap.len());
+        let over = vec![code; keyroost_import::entry::MAX_ENTRIES + 1];
+        assert!(matches!(
+            file_from_texts(&over),
+            Err(QrError::TooManyEntries)
+        ));
+    }
+
+    #[test]
+    fn wide_whole_image_errors_match_the_narrow_path() {
+        assert!(matches!(
+            file_from_texts(&texts(&["https://example.com"])),
+            Err(QrError::NotOtpauth)
+        ));
+        assert!(matches!(
+            file_from_texts(&texts(&["otpauth-migration://offline?data=!!!"])),
+            Err(QrError::Payload(_))
+        ));
+        let f = file_from_texts(&texts(&["otpauth://totp/X?secret=JBSWY3DP&period=45"])).unwrap();
+        assert_eq!(f.format, Format::QrImage);
+        assert_eq!(f.usable(), 1);
+    }
 
     #[test]
     fn rejects_non_images() {

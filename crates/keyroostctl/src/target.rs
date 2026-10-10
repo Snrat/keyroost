@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use keyroost_resolve::{
-    endpoint, resolve_target, Caps, Device, DeviceKind, EnumerateOptions, Need, Picker,
+    endpoint, resolve_target_reading, Caps, Device, DeviceKind, EnumerateOptions, Need, Picker,
     SelectError, Selector,
 };
 
@@ -112,6 +112,41 @@ fn typed_device(reader: Option<String>, hid_path: Option<PathBuf>, typed: &str) 
     }
 }
 
+/// A Molto2's card serial (what `molto info` shows), read in a short
+/// session of its own; `None` when the token doesn't answer, after a note
+/// saying so (the refusal that follows would otherwise read as if no
+/// Molto2 were there). Selection calls it only when `--device` matched
+/// nothing without it.
+pub(crate) fn molto_card_serial(d: &Device) -> Option<String> {
+    let reader = d.reader.as_deref()?;
+    let read = || -> Result<String, keyroost_transport::TransportError> {
+        let mut session = keyroost_transport::Session::open_named(reader)?;
+        session.set_debug(debug_on());
+        Ok(session.read_info()?.serial)
+    };
+    match read() {
+        Ok(serial) => Some(
+            serial
+                .trim_matches(|c: char| c == '\0' || c.is_whitespace())
+                .to_owned(),
+        ),
+        Err(e) => {
+            crate::output::note(&unanswered_molto(reader, &e.to_string()));
+            None
+        }
+    }
+}
+
+/// The note for a Molto2 whose card serial couldn't be read.
+fn unanswered_molto(reader: &str, err: &str) -> String {
+    format!(
+        "a Molto2 is connected ({}) but didn't answer when its serial was read ({}), \
+         so --device couldn't be compared with it",
+        sanitize_terminal(reader),
+        sanitize_terminal(err)
+    )
+}
+
 /// Pick the row and its announce line. An unmatched `--reader` / `--path`
 /// passes through as typed; every other selection error is returned.
 fn choose(
@@ -120,7 +155,7 @@ fn choose(
     need: Need,
     picker: &mut dyn Picker,
 ) -> Result<(Device, String), SelectError> {
-    match resolve_target(devices, sel, need, picker) {
+    match resolve_target_reading(devices, sel, need, picker, &mut molto_card_serial) {
         Ok(t) => Ok((t.device.clone(), announce_line(t.device, need))),
         Err(SelectError::ReaderNotFound { reader }) => Ok((
             typed_device(Some(reader.clone()), None, &reader),
@@ -632,6 +667,15 @@ mod tests {
                 first
             );
         }
+    }
+
+    #[test]
+    fn unanswered_molto_note_names_the_reader() {
+        assert_eq!(
+            unanswered_molto("TOKEN2 Molto2 (5C7D) 02 00", "timed out"),
+            "a Molto2 is connected (TOKEN2 Molto2 (5C7D) 02 00) but didn't answer when \
+             its serial was read (timed out), so --device couldn't be compared with it"
+        );
     }
 
     #[test]

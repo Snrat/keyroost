@@ -476,6 +476,45 @@ pub(crate) struct ProgInfoJson {
     pub utc_time: u32,
 }
 
+/// `keyroostctl --json oath import` / `otp import`: the plan, plus each
+/// write's outcome after a real run (a dry run has no outcomes). Names
+/// only, never a seed.
+#[derive(Serialize)]
+pub(crate) struct ImportJson {
+    /// "oath", "otp" or "molto2".
+    pub destination: &'static str,
+    pub dry_run: bool,
+    /// How many codes the key holds in all, when known (Molto2: the slots
+    /// from the first one to #99).
+    pub capacity: Option<usize>,
+    /// Codes already on the key (Molto2: slots in use); null when the key
+    /// wasn't read (a Molto2 dry run with no Molto2 connected).
+    pub on_key: Option<usize>,
+    pub entries: Vec<ImportRowJson>,
+    /// Why the run stopped early, if it did.
+    pub stopped: Option<String>,
+}
+
+/// One entry of the file in [`ImportJson`].
+#[derive(Serialize)]
+pub(crate) struct ImportRowJson {
+    /// Position in the file, counting from 0.
+    pub index: usize,
+    /// The entry as the file names it.
+    pub label: String,
+    /// The name it is stored under on the key, when it has one.
+    pub name: Option<String>,
+    /// "add", "replace", "exists" or "skip".
+    pub plan: &'static str,
+    /// Why it is skipped or left as is.
+    pub reason: Option<String>,
+    /// After a run: "added", "replaced", "exists",
+    /// "removed-not-added", "failed", "no-room" or "not-tried".
+    pub outcome: Option<&'static str>,
+    /// The key's error for "failed" and "removed-not-added".
+    pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,6 +617,68 @@ mod tests {
         let v = to_v(&MoltoSlotJson::from_block(7, &block(0, 0, 0, None)));
         assert!(v["algorithm"].is_null() && v["period"].is_null() && v["digits"].is_null());
         assert!(v["title"].is_null());
+    }
+
+    /// `oath import` / `otp import` / `molto import --in --json`: every key
+    /// present, `null` where a dry run or a plain add has no value (and
+    /// `on_key` where a Molto2 dry run had no Molto2 to read).
+    #[test]
+    fn import_shape_with_and_without_outcomes() {
+        let top = [
+            ("destination", "string"),
+            ("dry_run", "bool"),
+            ("capacity", "number|null"),
+            ("on_key", "number|null"),
+            ("entries", "array"),
+            ("stopped", "string|null"),
+        ];
+        let row = [
+            ("index", "number"),
+            ("label", "string"),
+            ("name", "string|null"),
+            ("plan", "string"),
+            ("reason", "string|null"),
+            ("outcome", "string|null"),
+            ("error", "string|null"),
+        ];
+        let bare = ImportRowJson {
+            index: 0,
+            label: "entry 1".into(),
+            name: None,
+            plan: "skip",
+            reason: None,
+            outcome: None,
+            error: None,
+        };
+        let full = ImportRowJson {
+            index: 1,
+            label: "A:a".into(),
+            name: Some("A:a".into()),
+            plan: "add",
+            reason: Some("r".into()),
+            outcome: Some("failed"),
+            error: Some("e".into()),
+        };
+        for (capacity, on_key, stopped, rows) in [
+            (None, None, None, vec![bare]),
+            (
+                Some(32),
+                Some(0),
+                Some("the key is full".to_owned()),
+                vec![full],
+            ),
+        ] {
+            let v = to_v(&ImportJson {
+                destination: "oath",
+                dry_run: capacity.is_none(),
+                capacity,
+                on_key,
+                entries: rows,
+                stopped,
+            });
+            assert_shape(&v, &top);
+            assert_shape(&v["entries"][0], &row);
+        }
     }
 
     #[test]
