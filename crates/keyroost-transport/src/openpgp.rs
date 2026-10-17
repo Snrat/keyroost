@@ -385,6 +385,18 @@ impl OpenPgpSession {
         crt: pgp::KeyCrt,
         key: &pgp::RsaPrivateKeyParts,
     ) -> Result<(), TransportError> {
+        self.import_rsa_tracked(crt, key, &mut false)
+    }
+
+    /// [`import_key`](Self::import_key), setting `sent` once the key
+    /// import is about to be transmitted (from then on the slot's old key
+    /// may be gone, whatever the card answers).
+    fn import_rsa_tracked(
+        &mut self,
+        crt: pgp::KeyCrt,
+        key: &pgp::RsaPrivateKeyParts,
+        sent: &mut bool,
+    ) -> Result<(), TransportError> {
         let attrs = self.rsa_attributes(crt)?;
 
         // The card declares its exponent-field width; the pure builders return
@@ -396,15 +408,36 @@ impl OpenPgpSession {
             return Err(TransportError::OpenPgpExponentTooWide);
         }
 
+        let apdu = Zeroizing::new(
+            pgp::import_rsa_key(crt, key, attrs.format, attrs.e_bits)
+                .map_err(|_| TransportError::OpenPgpExponentTooWide)?,
+        );
+        *sent = true;
+        self.put_key_import(&apdu, || {
+            Ok(
+                pgp::import_rsa_key_chained(crt, key, attrs.format, attrs.e_bits, 254)
+                    .map_err(|_| TransportError::OpenPgpExponentTooWide)?
+                    .into_iter()
+                    .map(Zeroizing::new)
+                    .collect(),
+            )
+        })
+    }
+
+    /// Send a key-import PUT DATA: the single extended-length `apdu` first,
+    /// then — when the card or reader won't take an extended `Lc` — the
+    /// command-chaining form `chained` builds. Shared by the RSA and ECC
+    /// imports.
+    fn put_key_import(
+        &mut self,
+        apdu: &[u8],
+        chained: impl FnOnce() -> Result<Vec<Zeroizing<Vec<u8>>>, TransportError>,
+    ) -> Result<(), TransportError> {
         // Setting KEYROOST_OPENPGP_FORCE_CHAINING forces the command-chaining path
         // (so the fallback can be exercised on a card that also accepts extended
         // length, e.g. for verification). Otherwise: extended length first.
         if std::env::var_os("KEYROOST_OPENPGP_FORCE_CHAINING").is_none() {
-            let apdu = Zeroizing::new(
-                pgp::import_rsa_key(crt, key, attrs.format, attrs.e_bits)
-                    .map_err(|_| TransportError::OpenPgpExponentTooWide)?,
-            );
-            let (_, sw) = self.transmit_full(&apdu)?;
+            let (_, sw) = self.transmit_full(apdu)?;
             if sw == pgp::SW_OK {
                 return Ok(());
             }
@@ -435,14 +468,160 @@ impl OpenPgpSession {
             });
         }
 
-        let chunks: Vec<Zeroizing<Vec<u8>>> =
-            pgp::import_rsa_key_chained(crt, key, attrs.format, attrs.e_bits, 254)
-                .map_err(|_| TransportError::OpenPgpExponentTooWide)?
-                .into_iter()
-                .map(Zeroizing::new)
-                .collect();
+        let chunks = chained()?;
         self.transmit_chain("openpgp import key", &chunks)
             .map(|_| ())
+    }
+
+    /// Import a private key of any kind into `crt`'s slot as `alg`: sets the
+    /// slot's algorithm attributes first when they differ (that write wipes
+    /// the slot, which the import overwrites anyway), then sends the key —
+    /// RSA through [`import_key`](Self::import_key), ECC as the `92` scalar
+    /// (the Ed25519 seed for EdDSA), with the public point only when the
+    /// slot's attributes ask for it (trailing `FF`). **Destructive**; requires
+    /// PW3 verified first.
+    ///
+    /// A card that refuses the algorithm for this slot — the attribute write
+    /// itself answered `6A80`/`6A88` — is
+    /// [`TransportError::OpenPgpAlgorithmRefused`], and the slot is as it
+    /// was. A failure after a write for the slot was sent (the attribute
+    /// change, which wipes the slot, or the key import itself) is
+    /// [`TransportError::OpenPgpKeySetPartial`] with no `done` slots: the
+    /// slot's old key may be gone.
+    pub fn import_any(
+        &mut self,
+        crt: pgp::KeyCrt,
+        alg: pgp::KeyAlg,
+        key: &ImportKey,
+    ) -> Result<(), TransportError> {
+        let mut changed = false;
+        self.import_any_tracked(crt, alg, key, &mut changed)
+            .map_err(|cause| slot_failure(Vec::new(), crt, changed, cause))
+    }
+
+    /// [`import_any`](Self::import_any) without the wrapping, setting
+    /// `changed` once a write for the slot has been sent.
+    fn import_any_tracked(
+        &mut self,
+        crt: pgp::KeyCrt,
+        alg: pgp::KeyAlg,
+        key: &ImportKey,
+        changed: &mut bool,
+    ) -> Result<(), TransportError> {
+        check_import(crt, alg, key)?;
+        let current = self.algorithm_attributes(crt)?;
+        let set = needs_attribute_write(&current, alg);
+        if set {
+            trace::line(self.debug, || {
+                format_line(
+                    Dir::Note,
+                    "openpgp import",
+                    &format!("setting {crt:?} slot algorithm to {}", alg.label()),
+                )
+            });
+            self.set_algorithm(crt, alg)?;
+            *changed = true;
+        }
+        match key {
+            ImportKey::Rsa(parts) => self.import_rsa_tracked(crt, parts, changed),
+            ImportKey::Ecc(parts) => {
+                let attrs = if set {
+                    self.algorithm_attributes(crt)?
+                } else {
+                    current
+                };
+                let with_public = matches!(
+                    pgp::parse_algorithm_attributes(&attrs),
+                    Ok(pgp::AlgorithmAttributes::Ecc {
+                        import_with_public_key: true,
+                        ..
+                    })
+                );
+                let parts = pgp::EccPrivateKeyParts {
+                    scalar: parts.scalar,
+                    public: parts.public.filter(|_| with_public),
+                };
+                let field_len = alg.curve().map_or(0, pgp::Curve::field_len);
+                let not_for = || TransportError::OpenPgpKeyNotForAlgorithm {
+                    slot: crt_label(crt),
+                    label: alg.label(),
+                };
+                let apdu = Zeroizing::new(
+                    pgp::import_ecc_key(crt, &parts, field_len).map_err(|_| not_for())?,
+                );
+                *changed = true;
+                self.put_key_import(&apdu, || {
+                    Ok(pgp::import_ecc_key_chained(crt, &parts, field_len, 254)
+                        .map_err(|_| not_for())?
+                        .into_iter()
+                        .map(Zeroizing::new)
+                        .collect())
+                })
+            }
+        }
+    }
+
+    /// Import a whole key set, one [`KeyImport`] per slot, and register each
+    /// key under the file's own fingerprint and creation time. Requires PW3
+    /// verified first. Returns the fingerprints written, in `keys` order.
+    ///
+    /// Everything that can be checked is checked before the first write:
+    /// each key against its slot and algorithm, and — reading the card —
+    /// each slot's current attributes (the RSA exponent field) and, when the
+    /// card publishes its Algorithm Information (`FA`), that it lists the
+    /// key's algorithm for that slot ([`TransportError::OpenPgpAlgorithmRefused`]
+    /// otherwise). A set that fails these changes nothing on the card.
+    ///
+    /// Each key's public part is read back after its import and compared with
+    /// `expect_public`; a card holding anything else is
+    /// [`TransportError::OpenPgpFingerprintMismatch`] and that key is not
+    /// registered. The fingerprint is the file's, not one recomputed from the
+    /// card: an ECDH key's fingerprint hashes its KDF parameters, which the
+    /// card does not store (GnuPG's P-384 keys carry different ones than
+    /// [`pgp::ecdh_kdf_params`]).
+    ///
+    /// A failure once the card has been changed is
+    /// [`TransportError::OpenPgpKeySetPartial`], naming the slots that now
+    /// hold the new keys and the one that failed, and whether a write for
+    /// that one had been sent (its old key may then be gone). A failure on
+    /// the first key before anything was written to it — the card refusing
+    /// the attribute change, say — is its plain cause: nothing changed.
+    pub fn import_key_set(&mut self, keys: &[KeyImport]) -> Result<Vec<[u8; 20]>, TransportError> {
+        for k in keys {
+            check_import(k.crt, k.alg, &k.key)?;
+        }
+        let fa = self.supported_algorithms()?;
+        for k in keys {
+            let current = self.algorithm_attributes(k.crt)?;
+            preflight(k, &current, fa.as_ref())?;
+        }
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            let mut changed = false;
+            if let Err(cause) = self.import_one(k, &mut changed) {
+                let done = keys[..out.len()].iter().map(|k| crt_label(k.crt)).collect();
+                return Err(slot_failure(done, k.crt, changed, cause));
+            }
+            out.push(k.expect_fpr);
+        }
+        Ok(out)
+    }
+
+    /// One key of [`import_key_set`](Self::import_key_set): import, compare
+    /// the card's public key, register. `changed` as for
+    /// [`import_any_tracked`](Self::import_any_tracked).
+    fn import_one(&mut self, k: &KeyImport, changed: &mut bool) -> Result<(), TransportError> {
+        self.import_any_tracked(k.crt, k.alg, &k.key, changed)?;
+        let got = self.read_public_key(k.crt)?;
+        if !same_public_key(&got, &k.expect_public) {
+            return Err(TransportError::OpenPgpFingerprintMismatch {
+                slot: crt_label(k.crt),
+            });
+        }
+        let (_, sw) = self.transmit_full(&pgp::put_generation_time(k.crt, k.created))?;
+        ok_or_apdu("openpgp put generation time", sw)?;
+        let (_, sw) = self.transmit_full(&pgp::put_fingerprint(k.crt, &k.expect_fpr))?;
+        ok_or_apdu("openpgp put fingerprint", sw)
     }
 
     /// Transmit an ISO 7816 command-chaining sequence: each intermediate chunk
@@ -494,8 +673,10 @@ impl OpenPgpSession {
     /// **Destructive**: cards wipe the slot's key when its algorithm changes.
     /// Requires PW3 verified first. A slot/algorithm combination that doesn't
     /// exist (Ed25519 in the decryption slot, X25519 elsewhere) is
-    /// [`TransportError::OpenPgpSlotMismatch`]; a card that doesn't allow the
-    /// change (or that algorithm) answers with an APDU error, surfaced as-is.
+    /// [`TransportError::OpenPgpSlotMismatch`]; a card that refuses that
+    /// algorithm in this slot (`6A80` / `6A88`) is
+    /// [`TransportError::OpenPgpAlgorithmRefused`], any other status an APDU
+    /// error.
     pub fn set_algorithm(
         &mut self,
         crt: pgp::KeyCrt,
@@ -505,6 +686,12 @@ impl OpenPgpSession {
             .attributes(crt)
             .map_err(TransportError::OpenPgpSlotMismatch)?;
         let (_, sw) = self.transmit_full(&pgp::put_algorithm_attributes(crt, &attr))?;
+        if sw == 0x6A80 || sw == 0x6A88 {
+            return Err(TransportError::OpenPgpAlgorithmRefused {
+                slot: crt_label(crt),
+                label: alg.label(),
+            });
+        }
         ok_or_apdu("openpgp set algorithm attributes", sw)
     }
 
@@ -797,6 +984,209 @@ impl OpenPgpSession {
     }
 }
 
+/// Private key material for [`OpenPgpSession::import_any`]. `Debug` names
+/// the kind only, never the key bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ImportKey<'a> {
+    /// An RSA key (full CRT set; the card picks the parts it wants).
+    Rsa(pgp::RsaPrivateKeyParts<'a>),
+    /// An ECC key: the private scalar (Ed25519: the seed) and its public
+    /// point, which is sent only to cards that ask for it.
+    Ecc(pgp::EccPrivateKeyParts<'a>),
+}
+
+impl std::fmt::Debug for ImportKey<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImportKey::Rsa(_) => f.write_str("ImportKey::Rsa(<redacted>)"),
+            ImportKey::Ecc(_) => f.write_str("ImportKey::Ecc(<redacted>)"),
+        }
+    }
+}
+
+/// One key of a set for [`OpenPgpSession::import_key_set`]; made with
+/// [`KeyImport::new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KeyImport<'a> {
+    /// The slot it goes into.
+    pub crt: pgp::KeyCrt,
+    /// The slot algorithm it needs.
+    pub alg: pgp::KeyAlg,
+    /// The private key.
+    pub key: ImportKey<'a>,
+    /// The key's creation time from the file (Unix seconds), written to the
+    /// slot's generation-time object.
+    pub created: u32,
+    /// The key's fingerprint from the file, written to the slot.
+    pub expect_fpr: [u8; 20],
+    /// The key's public part from the file, compared with what the card
+    /// reports after the import (raw 32 bytes for the 25519 curves).
+    pub expect_public: pgp::PublicKey,
+}
+
+impl<'a> KeyImport<'a> {
+    /// One key for `crt`'s slot as `alg`, with the creation time,
+    /// fingerprint and public part its file gives it.
+    #[must_use]
+    pub fn new(
+        crt: pgp::KeyCrt,
+        alg: pgp::KeyAlg,
+        key: ImportKey<'a>,
+        created: u32,
+        expect_fpr: [u8; 20],
+        expect_public: pgp::PublicKey,
+    ) -> Self {
+        KeyImport {
+            crt,
+            alg,
+            key,
+            created,
+            expect_fpr,
+            expect_public,
+        }
+    }
+}
+
+/// The error for a failed import into `crt`'s slot, after `done` slots of
+/// the same set took their new keys: the plain `cause` when nothing was
+/// written at all (`done` empty, `changed` false), otherwise
+/// [`TransportError::OpenPgpKeySetPartial`].
+fn slot_failure(
+    done: Vec<&'static str>,
+    crt: pgp::KeyCrt,
+    changed: bool,
+    cause: TransportError,
+) -> TransportError {
+    if done.is_empty() && !changed {
+        return cause;
+    }
+    TransportError::OpenPgpKeySetPartial {
+        done,
+        failed: crt_label(crt),
+        slot_changed: changed,
+        cause: Box::new(cause),
+    }
+}
+
+/// Check, without the card, that `key` is the kind and size `alg` takes
+/// and that `alg` can live in `crt`'s slot.
+fn check_import(crt: pgp::KeyCrt, alg: pgp::KeyAlg, key: &ImportKey) -> Result<(), TransportError> {
+    alg.attributes(crt)
+        .map_err(TransportError::OpenPgpSlotMismatch)?;
+    let fits = match (key, alg.curve()) {
+        (ImportKey::Rsa(parts), None) => {
+            let n = parts
+                .n
+                .iter()
+                .position(|&b| b != 0)
+                .map_or(&[][..], |i| &parts.n[i..]);
+            let bits = n
+                .first()
+                .map_or(0, |&top| n.len() * 8 - top.leading_zeros() as usize);
+            alg.rsa_bits().map(usize::from) == Some(bits)
+        }
+        (ImportKey::Ecc(parts), Some(curve)) => {
+            pgp::ecc_scalar_fits(parts.scalar, curve.field_len())
+        }
+        _ => false,
+    };
+    if fits {
+        Ok(())
+    } else {
+        Err(TransportError::OpenPgpKeyNotForAlgorithm {
+            slot: crt_label(crt),
+            label: alg.label(),
+        })
+    }
+}
+
+/// The card-side checks for one key of a set, from what the card reported
+/// before anything is written: `current` is the slot's attributes and `fa`
+/// its Algorithm Information, if published. A slot `fa` lists nothing for
+/// is not judged by it (the card's status word answers later).
+fn preflight(
+    k: &KeyImport,
+    current: &[u8],
+    fa: Option<&pgp::AlgorithmInformation>,
+) -> Result<(), TransportError> {
+    if let Some(fa) = fa {
+        let listed = fa.key_algs(k.crt);
+        if !listed.is_empty() && !listed.contains(&k.alg) {
+            return Err(TransportError::OpenPgpAlgorithmRefused {
+                slot: crt_label(k.crt),
+                label: k.alg.label(),
+            });
+        }
+    }
+    if let ImportKey::Rsa(parts) = &k.key {
+        // The attributes the import will meet: the slot's own, or the ones
+        // `import_any` writes first.
+        let attrs = if needs_attribute_write(current, k.alg) {
+            k.alg
+                .attributes(k.crt)
+                .map_err(TransportError::OpenPgpSlotMismatch)?
+        } else {
+            current.to_vec()
+        };
+        match pgp::parse_algorithm_attributes(&attrs) {
+            Ok(pgp::AlgorithmAttributes::Rsa(r)) => {
+                if !pgp::rsa_exponent_fits(parts.e, r.e_bits) {
+                    return Err(TransportError::OpenPgpExponentTooWide);
+                }
+            }
+            Ok(ecc @ pgp::AlgorithmAttributes::Ecc { .. }) => {
+                return Err(TransportError::OpenPgpSlotNotRsa {
+                    slot: crt_flag_name(k.crt),
+                    label: ecc.label(),
+                })
+            }
+            Err(e) => return Err(TransportError::OpenPgpParse(e)),
+        }
+    }
+    Ok(())
+}
+
+/// Whether the card's public key `got` is `want`. RSA integers compare
+/// without leading zeros (cards may or may not send one); a 25519 point
+/// compares without OpenPGP's `0x40` prefix.
+fn same_public_key(got: &pgp::PublicKey, want: &pgp::PublicKey) -> bool {
+    fn trim(v: &[u8]) -> &[u8] {
+        let i = v.iter().position(|&b| b != 0).unwrap_or(v.len());
+        &v[i..]
+    }
+    fn bare(p: &[u8]) -> &[u8] {
+        match p {
+            [0x40, rest @ ..] if rest.len() == 32 => rest,
+            p => p,
+        }
+    }
+    match (got, want) {
+        (
+            pgp::PublicKey::Rsa {
+                modulus: gn,
+                exponent: ge,
+            },
+            pgp::PublicKey::Rsa {
+                modulus: wn,
+                exponent: we,
+            },
+        ) => trim(gn) == trim(wn) && trim(ge) == trim(we),
+        (pgp::PublicKey::Ecc { point: g }, pgp::PublicKey::Ecc { point: w }) => bare(g) == bare(w),
+        _ => false,
+    }
+}
+
+/// The slot's name in prose ("the signature slot").
+fn crt_label(crt: pgp::KeyCrt) -> &'static str {
+    match crt {
+        pgp::KeyCrt::Sign => "signature",
+        pgp::KeyCrt::Decrypt => "decryption",
+        pgp::KeyCrt::Auth => "authentication",
+    }
+}
+
 /// Whether `status` also reads the full serial through the OTP applet: only
 /// for a card whose AID names Token2 as the manufacturer, so no other card
 /// ever sees the extra SELECT.
@@ -859,6 +1249,293 @@ mod tests {
             pgp::KeyAlg::Ed25519
         ));
         assert!(needs_attribute_write(&[], pgp::KeyAlg::Rsa2048));
+    }
+
+    #[test]
+    fn import_checks_run_before_the_card() {
+        let scalar = [0x11u8; 32];
+        let ecc = ImportKey::Ecc(pgp::EccPrivateKeyParts {
+            scalar: &scalar,
+            public: None,
+        });
+        let e = [1u8, 0, 1];
+        let mut n = vec![0x00u8, 0xC0];
+        n.extend_from_slice(&[0x11u8; 383]); // 3072 bits, one leading zero
+        let rsa = ImportKey::Rsa(pgp::RsaPrivateKeyParts {
+            e: &e,
+            p: &e,
+            q: &e,
+            u: &e,
+            dp: &e,
+            dq: &e,
+            n: &n,
+        });
+        assert!(check_import(pgp::KeyCrt::Sign, pgp::KeyAlg::NistP256, &ecc).is_ok());
+        assert!(check_import(pgp::KeyCrt::Decrypt, pgp::KeyAlg::X25519, &ecc).is_ok());
+        assert!(check_import(pgp::KeyCrt::Sign, pgp::KeyAlg::Rsa3072, &rsa).is_ok());
+        // An RSA key of another size than the slot algorithm.
+        assert!(check_import(pgp::KeyCrt::Sign, pgp::KeyAlg::Rsa2048, &rsa).is_err());
+        assert!(check_import(pgp::KeyCrt::Sign, pgp::KeyAlg::Rsa4096, &rsa).is_err());
+        // Ed25519 cannot decrypt.
+        assert!(matches!(
+            check_import(pgp::KeyCrt::Decrypt, pgp::KeyAlg::Ed25519, &ecc),
+            Err(TransportError::OpenPgpSlotMismatch(_))
+        ));
+        // Wrong kind of key for the algorithm.
+        assert!(matches!(
+            check_import(pgp::KeyCrt::Sign, pgp::KeyAlg::Rsa2048, &ecc),
+            Err(TransportError::OpenPgpKeyNotForAlgorithm {
+                slot: "signature",
+                ..
+            })
+        ));
+        assert!(check_import(pgp::KeyCrt::Sign, pgp::KeyAlg::NistP256, &rsa).is_err());
+        // A P-384 scalar does not fit P-256.
+        let wide = [0x11u8; 48];
+        let wide = ImportKey::Ecc(pgp::EccPrivateKeyParts {
+            scalar: &wide,
+            public: None,
+        });
+        assert!(check_import(pgp::KeyCrt::Auth, pgp::KeyAlg::NistP256, &wide).is_err());
+        assert!(check_import(pgp::KeyCrt::Auth, pgp::KeyAlg::NistP384, &wide).is_ok());
+    }
+
+    #[test]
+    fn public_keys_compare_without_encoding_noise() {
+        let rsa = |n: &[u8], e: &[u8]| pgp::PublicKey::Rsa {
+            modulus: n.to_vec(),
+            exponent: e.to_vec(),
+        };
+        let ecc = |p: &[u8]| pgp::PublicKey::Ecc { point: p.to_vec() };
+        assert!(same_public_key(
+            &rsa(&[0x00, 0xC1, 0x02], &[0x01, 0x00, 0x01]),
+            &rsa(&[0xC1, 0x02], &[0x00, 0x01, 0x00, 0x01])
+        ));
+        assert!(!same_public_key(
+            &rsa(&[0xC1, 0x03], &[0x01, 0x00, 0x01]),
+            &rsa(&[0xC1, 0x02], &[0x01, 0x00, 0x01])
+        ));
+        let raw = [0x09u8; 32];
+        let mut prefixed = vec![0x40];
+        prefixed.extend_from_slice(&raw);
+        assert!(same_public_key(&ecc(&raw), &ecc(&prefixed)));
+        assert!(!same_public_key(&ecc(&raw), &ecc(&[0x08u8; 32])));
+        assert!(!same_public_key(&ecc(&raw), &rsa(&raw, &[1, 0, 1])));
+    }
+
+    fn fa_listing(sig: &[pgp::KeyAlg], dec: &[pgp::KeyAlg]) -> pgp::AlgorithmInformation {
+        let mut v = Vec::new();
+        for (tag, algs, crt) in [
+            (0xC1u8, sig, pgp::KeyCrt::Sign),
+            (0xC2, dec, pgp::KeyCrt::Decrypt),
+        ] {
+            for a in algs {
+                let attr = a.attributes(crt).unwrap();
+                v.push(tag);
+                v.push(attr.len() as u8);
+                v.extend_from_slice(&attr);
+            }
+        }
+        let mut fa = vec![0xFA, v.len() as u8];
+        fa.extend_from_slice(&v);
+        pgp::parse_algorithm_information(&fa).unwrap()
+    }
+
+    #[test]
+    fn preflight_refuses_what_the_card_does_not_list() {
+        let scalar = [0x11u8; 32];
+        let k = KeyImport {
+            crt: pgp::KeyCrt::Decrypt,
+            alg: pgp::KeyAlg::X25519,
+            key: ImportKey::Ecc(pgp::EccPrivateKeyParts {
+                scalar: &scalar,
+                public: None,
+            }),
+            created: 0,
+            expect_fpr: [0; 20],
+            expect_public: pgp::PublicKey::Ecc { point: vec![] },
+        };
+        let rsa_slot = [0x01, 0x08, 0x00, 0x00, 0x20, 0x00];
+        let fa = fa_listing(
+            &[pgp::KeyAlg::Rsa2048, pgp::KeyAlg::NistP256],
+            &[pgp::KeyAlg::Rsa2048, pgp::KeyAlg::NistP256],
+        );
+        assert!(matches!(
+            preflight(&k, &rsa_slot, Some(&fa)),
+            Err(TransportError::OpenPgpAlgorithmRefused {
+                slot: "decryption",
+                label: "X25519"
+            })
+        ));
+        let fa = fa_listing(&[pgp::KeyAlg::Ed25519], &[pgp::KeyAlg::X25519]);
+        assert!(preflight(&k, &rsa_slot, Some(&fa)).is_ok());
+        // No FA object, or none for this slot: left to the card.
+        assert!(preflight(&k, &rsa_slot, None).is_ok());
+        let fa = fa_listing(&[pgp::KeyAlg::Ed25519], &[]);
+        assert!(preflight(&k, &rsa_slot, Some(&fa)).is_ok());
+    }
+
+    #[test]
+    fn preflight_checks_the_rsa_exponent_field() {
+        let e = [0x01u8, 0x00, 0x00, 0x00, 0x01]; // 5 bytes, wider than 32 bits
+        let k = KeyImport {
+            crt: pgp::KeyCrt::Sign,
+            alg: pgp::KeyAlg::Rsa2048,
+            key: ImportKey::Rsa(pgp::RsaPrivateKeyParts {
+                e: &e,
+                p: &e,
+                q: &e,
+                u: &e,
+                dp: &e,
+                dq: &e,
+                n: &e,
+            }),
+            created: 0,
+            expect_fpr: [0; 20],
+            expect_public: pgp::PublicKey::Ecc { point: vec![] },
+        };
+        // Slot already RSA-2048 with a 32-bit exponent field.
+        let cur = [0x01, 0x08, 0x00, 0x00, 0x20, 0x02];
+        assert!(matches!(
+            preflight(&k, &cur, None),
+            Err(TransportError::OpenPgpExponentTooWide)
+        ));
+        // An ECC slot gets the attributes import_any would write: also 32 bits.
+        let cur = pgp::KeyAlg::NistP256.attributes(pgp::KeyCrt::Sign).unwrap();
+        assert!(matches!(
+            preflight(&k, &cur, None),
+            Err(TransportError::OpenPgpExponentTooWide)
+        ));
+        let e3 = [0x01u8, 0x00, 0x01];
+        let k = KeyImport {
+            key: ImportKey::Rsa(pgp::RsaPrivateKeyParts {
+                e: &e3,
+                p: &e3,
+                q: &e3,
+                u: &e3,
+                dp: &e3,
+                dq: &e3,
+                n: &e3,
+            }),
+            ..k
+        };
+        assert!(preflight(&k, &cur, None).is_ok());
+    }
+
+    #[test]
+    fn partial_set_errors_name_the_slots() {
+        let cause = || TransportError::OpenPgpAlgorithmRefused {
+            slot: "decryption",
+            label: "X25519",
+        };
+        assert_eq!(
+            slot_failure(vec!["signature"], pgp::KeyCrt::Decrypt, true, cause()).to_string(),
+            "loaded the signature key; the decryption key failed (that slot's old key \
+             may be gone): this card doesn't accept X25519 keys in the decryption slot"
+        );
+        assert_eq!(
+            slot_failure(vec!["signature"], pgp::KeyCrt::Decrypt, false, cause()).to_string(),
+            "loaded the signature key; the decryption key failed (that slot was not \
+             changed): this card doesn't accept X25519 keys in the decryption slot"
+        );
+        let two = slot_failure(
+            vec!["signature", "decryption"],
+            pgp::KeyCrt::Auth,
+            true,
+            cause(),
+        );
+        assert!(two.to_string().starts_with(
+            "loaded the signature and decryption keys; the authentication key failed"
+        ));
+        assert!(std::error::Error::source(&two).is_some());
+    }
+
+    #[test]
+    fn a_first_key_failure_says_whether_the_slot_was_touched() {
+        // Refused before any write (the attribute write itself said no):
+        // the plain cause, nothing changed.
+        let refused = slot_failure(
+            Vec::new(),
+            pgp::KeyCrt::Sign,
+            false,
+            TransportError::OpenPgpAlgorithmRefused {
+                slot: "signature",
+                label: "Ed25519",
+            },
+        );
+        assert!(matches!(
+            refused,
+            TransportError::OpenPgpAlgorithmRefused { .. }
+        ));
+        // Failed after the attribute change or the key went out: the old
+        // key may be gone, and the message says so.
+        let after = slot_failure(
+            Vec::new(),
+            pgp::KeyCrt::Sign,
+            true,
+            TransportError::Apdu {
+                label: "openpgp import key",
+                sw1: 0x6A,
+                sw2: 0x80,
+            },
+        );
+        let msg = after.to_string();
+        assert!(
+            matches!(
+                after,
+                TransportError::OpenPgpKeySetPartial {
+                    slot_changed: true,
+                    ..
+                }
+            ),
+            "{msg}"
+        );
+        assert!(
+            msg.starts_with(
+                "the signature key failed after the card began replacing it (that slot's \
+                 old key may be gone): "
+            ),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn import_key_debug_never_shows_key_bytes() {
+        let secret = [0x5Au8; 32];
+        let k = ImportKey::Ecc(pgp::EccPrivateKeyParts {
+            scalar: &secret,
+            public: Some(&secret),
+        });
+        let shown = format!("{k:?}");
+        assert!(!shown.contains("90") && !shown.contains("5A"), "{shown}");
+        let e = [1u8, 0, 1];
+        let r = ImportKey::Rsa(pgp::RsaPrivateKeyParts {
+            e: &e,
+            p: &secret,
+            q: &secret,
+            u: &secret,
+            dp: &secret,
+            dq: &secret,
+            n: &secret,
+        });
+        let shown = format!("{r:?}");
+        assert!(!shown.contains("90") && !shown.contains("5A"), "{shown}");
+    }
+
+    #[test]
+    fn import_errors_read_plainly() {
+        assert_eq!(
+            TransportError::OpenPgpAlgorithmRefused {
+                slot: "decryption",
+                label: "X25519"
+            }
+            .to_string(),
+            "this card doesn't accept X25519 keys in the decryption slot"
+        );
+        assert_eq!(
+            TransportError::OpenPgpFingerprintMismatch { slot: "signature" }.to_string(),
+            "the card holds a different signature key than the file has; it was not registered"
+        );
     }
 
     #[test]

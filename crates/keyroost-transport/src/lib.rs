@@ -40,7 +40,7 @@ mod token2prog;
 pub use token2prog::Token2ProgSession;
 
 mod openpgp;
-pub use openpgp::{OpenPgpSession, OpenPgpStatus};
+pub use openpgp::{ImportKey, KeyImport, OpenPgpSession, OpenPgpStatus};
 
 mod gzip;
 
@@ -99,7 +99,7 @@ pub mod identity;
 /// `keyroost-openpgp` directly (which would duplicate the crate in their graph).
 pub use keyroost_openpgp::{
     describe_algorithm_attributes, parse_algorithm_attributes, AlgorithmAttributes,
-    AlgorithmInformation, Curve, EccKind, KeyAlg as OpenPgpKeyAlg, KeyCrt,
+    AlgorithmInformation, Curve, EccKind, EccPrivateKeyParts, KeyAlg as OpenPgpKeyAlg, KeyCrt,
     PublicKey as OpenPgpPublicKey, RsaPrivateKeyParts, SlotMismatch,
 };
 
@@ -331,6 +331,39 @@ pub enum TransportError {
     /// ECC key instead. `slot` is the CLI's `--slot` value (`sign` / `decrypt`
     /// / `auth`); `label` is the ECC algorithm's display label.
     OpenPgpSlotNotRsa { slot: &'static str, label: String },
+    /// The card refused to set `slot` to the `label` algorithm (or, right
+    /// after setting it, refused the key's data): it doesn't hold that key
+    /// type there. `slot` is the slot's prose name (`signature` /
+    /// `decryption` / `authentication`).
+    OpenPgpAlgorithmRefused {
+        slot: &'static str,
+        label: &'static str,
+    },
+    /// After an import, the card's public key in `slot` is not the one the
+    /// file has, so the slot was not registered.
+    OpenPgpFingerprintMismatch { slot: &'static str },
+    /// A key import failed after the card was already changed: `done` are
+    /// the slots of the same set that now hold their new keys (empty for a
+    /// single key, or when the first key of a set failed), `failed` is the
+    /// slot whose import went wrong and `cause` why. `slot_changed`: a
+    /// write for `failed` had already been sent (an attribute change, which
+    /// wipes the slot, or the key itself), so its old key may be gone;
+    /// otherwise that slot is as it was. Never built with `done` empty and
+    /// `slot_changed` false — that failure changed nothing and is returned
+    /// as its plain cause. Slots are prose names.
+    OpenPgpKeySetPartial {
+        done: Vec<&'static str>,
+        failed: &'static str,
+        slot_changed: bool,
+        cause: Box<TransportError>,
+    },
+    /// The private key handed to an import is not a `label` key (an RSA key
+    /// for an ECC slot, a scalar wider than the curve's field, or an RSA
+    /// size no card holds).
+    OpenPgpKeyNotForAlgorithm {
+        slot: &'static str,
+        label: &'static str,
+    },
 }
 
 impl fmt::Display for TransportError {
@@ -613,6 +646,44 @@ impl fmt::Display for TransportError {
                 "the {slot} slot holds an ECC key ({label}); RSA import needs an RSA \
                  slot — run `openpgp key generate --slot {slot} --algorithm rsa2048` first"
             ),
+            TransportError::OpenPgpAlgorithmRefused { slot, label } => write!(
+                f,
+                "this card doesn't accept {label} keys in the {slot} slot"
+            ),
+            TransportError::OpenPgpFingerprintMismatch { slot } => write!(
+                f,
+                "the card holds a different {slot} key than the file has; it was not registered"
+            ),
+            TransportError::OpenPgpKeySetPartial {
+                done,
+                failed,
+                slot_changed,
+                cause,
+            } => {
+                let state = if *slot_changed {
+                    "that slot's old key may be gone"
+                } else {
+                    "that slot was not changed"
+                };
+                let list = match done.split_last() {
+                    None => {
+                        return write!(
+                            f,
+                            "the {failed} key failed after the card began replacing it \
+                             ({state}): {cause}"
+                        )
+                    }
+                    Some((one, [])) => format!("the {one} key"),
+                    Some((last, rest)) => format!("the {} and {last} keys", rest.join(", ")),
+                };
+                write!(
+                    f,
+                    "loaded {list}; the {failed} key failed ({state}): {cause}"
+                )
+            }
+            TransportError::OpenPgpKeyNotForAlgorithm { slot, label } => {
+                write!(f, "the {slot} key can't be imported as {label}")
+            }
             TransportError::PivImportCertificateKeyMismatch(slot) => write!(
                 f,
                 "certificate not imported: its public key does not match the key \
@@ -647,6 +718,7 @@ impl std::error::Error for TransportError {
             TransportError::OathParse(e) => Some(e),
             TransportError::OpenPgpParse(e) => Some(e),
             TransportError::OpenPgpSlotMismatch(e) => Some(e),
+            TransportError::OpenPgpKeySetPartial { cause, .. } => Some(cause.as_ref()),
             TransportError::PivParse(e) => Some(e),
             TransportError::PivResetUnverifiedFailed(e)
             | TransportError::PivResetForcedFailed(e)

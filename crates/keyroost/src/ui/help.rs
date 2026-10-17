@@ -22,7 +22,8 @@ pub struct Help {
 }
 
 /// Look up help content by topic id. Topic ids (use these as the `?` keys):
-///   device, fido2, pin, passkeys, oath, pgp, pgp-keys, pgp-card-details, piv,
+///   device, fido2, pin, passkeys, oath, pgp, pgp-keys, pgp-backup, pgp-restore,
+///   pgp-expiry, pgp-card-details, piv,
 ///   molto, custkey, reset, piv-generate, piv-certificate,
 ///   piv-import-export, piv-delete, piv-test, piv-admin, piv-move, piv-retired
 pub fn help(topic: &str) -> Option<&'static Help> {
@@ -79,13 +80,28 @@ pub fn help(topic: &str) -> Option<&'static Help> {
         },
         "pgp" => &Help {
             title: "OpenPGP",
-            body: "Turns the key into a smart card for encrypting & signing email and files (and for SSH). The private keys live on the card and never touch your computer's disk.",
+            body: "Turns the key into a smart card for encrypting & signing email and files (and for SSH). The card signs and decrypts itself, so the keys can't be read out of it. A key generated on the card never leaves it; keys made with a backup, or imported from a file, also exist in that file.",
             slug: "/openpgp",
         },
         "pgp-keys" => &Help {
             title: "Generate or import a key",
-            body: "Each of the three keys \u{2014} signature, decryption, authentication \u{2014} can be created right on the card, or imported from an RSA-2048 file you already have. Either way OVERWRITES whatever was in that key, and the only way to clear it again is a full reset. You'll need the admin PIN, and the key may ask for a touch.",
+            body: "There are three ways to put keys on the card. Generate on-card: the key is made inside the card and no copy exists, so if the card is lost or reset the key is gone (that matters most for the decryption key, which reads your old messages). Create keys with a backup: all three keys are saved to a passphrase-protected file first. Import from a file: load a key you made elsewhere, such as an RSA file (PEM or DER, 2048 to 4096 bits) or the matching key from an OpenPGP file. Any of them REPLACES what was in that slot, and needs the admin PIN; the card may ask for a touch.",
             slug: "/openpgp#keys",
+        },
+        "pgp-backup" => &Help {
+            title: "Keys with a backup",
+            body: "Makes the signature, decryption and authentication keys together, saves them to a backup file that opens only with a passphrase you choose, and loads them onto the card. You also get a public key file to share and a revocation certificate to keep offline (publish it only if the key is lost or stolen). Keep the backup offline, such as on a USB stick in a drawer; if the card is lost, Restore a backup puts the same keys on a new one. Existing files are never overwritten.",
+            slug: "/openpgp#backup",
+        },
+        "pgp-restore" => &Help {
+            title: "Restore a backup",
+            body: "Loads keys from a backup file onto this card: one keyroost saved, or one exported from GnuPG. You choose which of the keys to load; each REPLACES the key in its slot. You'll need the backup's passphrase and the card's admin PIN. A wrong passphrase, an unreadable file or a key type the card doesn't list is caught before anything is written, so the card stays as it was. If loading fails after the card began replacing a key, keyroost names that slot: its old key may be gone.",
+            slug: "/openpgp#backup",
+        },
+        "pgp-expiry" => &Help {
+            title: "Change expiry date",
+            body: "Moves the expiry date of your public key. Choose Never, 1, 2, 3 or 5 years, or a date; a date expires at midday (UTC) on that day, as in GnuPG. Sign the change with this card (user PIN) or with the backup (its passphrase), then share the updated public key file again so others see the new date. The keys themselves stay the same.",
+            slug: "/openpgp#expiry",
         },
         "pgp-card-details" => &Help {
             title: "Cardholder name & URL",

@@ -2170,6 +2170,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "k256"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6e3919bbaa2945715f0bb6d3934a173d1e9a59ac23767fbaaef277265a7411b"
+dependencies = [
+ "cfg-if",
+ "ecdsa 0.16.9",
+ "elliptic-curve 0.13.8",
+ "once_cell",
+ "sha2 0.10.9",
+ "signature 2.2.0",
+]
+
+[[package]]
 name = "keyroost"
 version = "0.13.0"
 dependencies = [
@@ -2183,6 +2197,7 @@ dependencies = [
  "keyroost-import",
  "keyroost-keyring",
  "keyroost-oath",
+ "keyroost-pgpkey",
  "keyroost-piv",
  "keyroost-pivtest",
  "keyroost-proto",
@@ -2267,6 +2282,26 @@ name = "keyroost-openpgp"
 version = "0.13.0"
 dependencies = [
  "keyroost-proto",
+ "zeroize",
+]
+
+[[package]]
+name = "keyroost-pgpkey"
+version = "0.13.0"
+dependencies = [
+ "aes",
+ "ed25519-dalek",
+ "k256",
+ "keyroost-openpgp",
+ "keyroost-proto",
+ "keyroost-transport",
+ "p256",
+ "p384",
+ "p521",
+ "rand_core 0.6.4",
+ "rsa",
+ "sha2 0.10.9",
+ "x25519-dalek",
  "zeroize",
 ]
 
@@ -2401,6 +2436,7 @@ dependencies = [
  "keyroost-keyring",
  "keyroost-oath",
  "keyroost-openpgp",
+ "keyroost-pgpkey",
  "keyroost-piv",
  "keyroost-pivtest",
  "keyroost-proto",
@@ -3698,6 +3734,7 @@ dependencies = [
  "pkcs1",
  "pkcs8 0.10.2",
  "rand_core 0.6.4",
+ "sha2 0.10.9",
  "signature 2.2.0",
  "spki 0.7.3",
  "subtle",
