@@ -15,12 +15,14 @@ publishing gate. Version placeholder below: `vX.Y.Z`.
       pinned-inputs check).
 - [ ] `cargo audit` green (the audit workflow runs on pushes; check the last
       run) and the deps-outdated report reviewed.
-- [ ] **Semver check against the published crates** — with 17 library crates
-      on crates.io, Cargo treats 0.7.x -> 0.7.y as compatible, so an
+- [ ] **Semver check against the published crates** — with every library
+      crate on crates.io (19 as of 0.14.0), Cargo treats 0.7.x -> 0.7.y as compatible, so an
       accidental API break in a patch release ships silently and breaks
       downstream `cargo update`:
       `cargo semver-checks --workspace --exclude keyroost --exclude keyroostctl`
-      (install once: `cargo install cargo-semver-checks`). A reported break
+      (install once: `cargo install cargo-semver-checks`). A crate that is
+      not on crates.io yet has no baseline: add `--exclude <crate>` for it
+      (for 0.14.0, `--exclude keyroost-pgpkey`). A reported break
       means either fix the API or bump the minor — a decision, not an
       accident. The binaries are excluded (nothing depends on them as
       libraries).

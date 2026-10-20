@@ -14,7 +14,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   backup that GnuPG can read, writes your public key and a revocation
   certificate beside it, and loads the keys onto the card. In the app it is
   **Create keys with a backup…** on the OpenPGP card; on the command line,
-  `keyroostctl openpgp key import --generate --backup FILE`. ([#177])
+  `keyroostctl openpgp key import --generate --backup FILE --name NAME`.
+  ([#177])
 - **Restore a backup** onto a new or reset card, from a keyroost backup or a
   GnuPG export (`keyroostctl openpgp key import --in FILE`).
 - **Change expiry date** on a key set, signed with the card or the backup;

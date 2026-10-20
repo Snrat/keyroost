@@ -100,7 +100,7 @@ In the tables below "Lc" is the length of the entire payload (encrypted body
 | `0xE6` | `00` | profile (0..99) | — (Le=`00`) | — (sw=`9000`/`6A83`) | Delete one profile's seed (keyless) |
 | `0x4B` | `08` | `00` | — (Le=`00`) | 8-byte challenge | Start auth handshake |
 | `0xCE` | `00` | `00` | 16-byte SM4(challenge \|\| zeros) | — | Finish auth handshake |
-| `0x56` | `00` | `00` | — (Le=`00`) | — (sw=`9060`, then `9000` once the button is pressed) | Factory reset (physical confirm) |
+| `0x56` | `00` | `00` | — (Le=`00`) | — (sw=`9060`: accepted, waiting for the up-arrow press) | Factory reset (physical confirm) |
 
 #### `0x41` get info response layout
 

@@ -47,7 +47,10 @@ What keyroost defends against:
   output reaches disk only when you name a destination for it (e.g.
   `openpgp decrypt --out`), and those writes go through an owner-only
   temp file that is fsynced and atomically renamed, refusing to follow a
-  symlink or to overwrite a file owned by another user. `--debug` traces
+  symlink or to overwrite a file owned by another user. A new OpenPGP
+  backup and its revocation certificate are instead created as new
+  owner-only files, fsynced, never over an existing file or a symlink, and
+  removed again if the write fails. `--debug` traces
   redact secret-bearing command bodies on every applet — Molto2 secure
   writes, OATH `PUT`/`SET CODE`/`VALIDATE`, OpenPGP key import and decipher,
   PIV `GENERAL AUTHENTICATE`, the Token2 OTP seed writes and code reads, and
@@ -96,9 +99,10 @@ What keyroost does **not** defend against:
   `keyroost-resolve` carry no external dependencies at all, and the OATH,
   OpenPGP, PIV and Token2 single-profile byte layers carry nothing but
   `zeroize`. That does not mean no external hash code is in the tree: where
-  the CTAP and Token2-OTP paths need those primitives inside a larger
-  construction (client-PIN, ECDH, largeBlob), they use RustCrypto's `sha2`
-  and `hmac` rather than a hand-rolled equivalent. What is pulled in is
+  the CTAP, Token2-OTP and OpenPGP key-set paths need those primitives
+  inside a larger construction (client-PIN, ECDH, largeBlob, OpenPGP
+  signatures and backups), they use RustCrypto's `sha2`, `hmac` and `aes`
+  rather than a hand-rolled equivalent. What is pulled in is
   deliberate, confined to the crate that needs it, and
   annotated in the `Cargo.toml` that declares it: the device and OS
   boundary (`pcsc`; `hidapi` off Linux, where sysfs and `hidraw` are used
@@ -132,7 +136,7 @@ What keyroost does **not** defend against:
   neither fetches nor runs it. No build script in this workspace generates
   code, downloads anything, or reads outside its own package.
 - **Continuously fuzzed and dependency-audited.** The parsers named in the
-  threat model are covered by eighteen `cargo-fuzz` targets
+  threat model are covered by nineteen `cargo-fuzz` targets
   (`fuzz/fuzz_targets/`), all run on a weekly schedule; a RUSTSEC scan
   (`cargo audit`) runs weekly and on every change to a manifest or the
   lockfile, and Dependabot proposes monthly updates for the cargo,

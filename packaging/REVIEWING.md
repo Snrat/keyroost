@@ -73,8 +73,9 @@ integrity") are the trust boundary for what ships.
 
 - [ ] Merge via squash. The squash commit carries the contributor's
       authorship.
-- [ ] Maintainer-side fixups (fmt, fuzz-target repairs) are separate commits
-      under the maintainer's name, never folded into the contributor's work.
+- [ ] Maintainer-side fixups (fmt, fuzz-target repairs) land as a separate
+      commit or PR under the maintainer's name, not pushed onto the
+      contributor's branch before the squash.
 - [ ] User-facing changes get a `changelog.d/` fragment (or a CHANGELOG
       entry — pre-fragment PRs) crediting the contributor; a first
       contribution adds them to the README Contributors section.

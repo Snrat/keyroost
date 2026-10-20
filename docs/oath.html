@@ -112,8 +112,10 @@
 keyroostctl oath code &lt;name&gt; --device my-yubikey
 keyroostctl oath delete &lt;name&gt;      # asks y/N first; a script adds --yes
 keyroostctl oath import -i export.json  # add every code in an authenticator export</code></pre>
-    <p class="kr-muted">In the desktop app, credentials can be added from an
-      <code>otpauth://</code> URI (the same format behind setup QR codes); on the CLI the
+    <p class="kr-muted">In the desktop app, <strong>+ Add credential</strong> takes the
+      account name and the base32 setup key, or scans the setup QR code, and can require a
+      touch; a file of <code>otpauth://</code> URIs goes through <strong>Import
+      file…</strong>. On the CLI the
       seed is typed at a hidden prompt by <code>oath add</code>, or in a script given as
       <code>--seed env:NAME</code> or <code>--seed stdin</code> (base32 unless
       <code>--encoding hex</code>). This works on any card exposing the OATH applet —

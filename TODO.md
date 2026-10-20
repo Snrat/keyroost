@@ -8,7 +8,7 @@ decision to "Standing decisions" at the bottom so it is not re-litigated.
 Deliberately unversioned: the previous `TODO-v0.7.5.md` / `TODO-hardening.md`
 pair rotted because version-named files accumulate layers nobody rereads.
 
-Next: the GUI design pass and PIV key import from a .p12 file (v0.14.0).
+Next: PIV key import from a .p12 file (#174).
 
 ---
 
@@ -33,8 +33,8 @@ Being worked on right now — check with whoever holds it before starting.
 
 **Next:**
 
-- **PIV: import an existing key and certificate from a .p12 file (v0.14.0,
-  [#174](https://github.com/framefilter/keyroost/issues/174), from discussion
+- **PIV: import an existing key and certificate from a .p12 file
+  ([#174](https://github.com/framefilter/keyroost/issues/174), from discussion
   #172).** Put an RSA or EC private key plus its certificate from a PKCS#12
   (`.p12`) file into a PIV slot, using the import-key command the card already
   supports. Read legacy-encrypted `.p12` files directly (40-bit RC2 / 3DES,
@@ -66,30 +66,14 @@ Being worked on right now — check with whoever holds it before starting.
   AppImageHub-style failures (AppImage/appimage.github.io#9258) show up on
   the packaging probe, not after a release. (S–M)
 
-- **v0.14.0 goal: a holistic GUI design pass.** The interface has grown
-  enough features that the deliberately flat layout no longer fits. Seen in
-  AppImageHub's catalog screenshot (AppImage/appimage.github.io#9258): at an
-  ~800px-wide screen, below the 900px minimum, the top bar's left group
-  (version, "N connected") is drawn under the right group (accent dots,
-  Text size, icons); at ~200% zoom, section-header actions overlap their
-  titles too. Rows never give way, they overlap (`top_bar`,
-  crates/keyroost/src/main.rs). Scope:
-  * decide where a menu or overflow (dropdown) belongs — e.g. appearance
-    settings (accent, text size, colorblind, theme) — while keeping the main
-    flows flat;
-  * every horizontal row degrades gracefully: drop or collapse
-    lower-priority items, truncate long labels, never overlap;
-  * design first (brainstorm the layout before code), keep CLI/GUI parity,
-    and verify with screenshots on the virtual display at 800/900/1180px
-    widths and 100%/200% zoom, plus a real Wayland session;
-  * then refresh the screenshots: the Learn site's `docs/assets/screenshots/`
-    and the AppStream `<screenshots>` in the metainfo (used by software
-    centers and AppImage catalogs; PNG preferred, several views), so they
-    show the new design after the next release.
-  (M–L)
+- **Retake the screenshots after the v0.14.0 GUI pass.** The Learn site's
+  `docs/assets/screenshots/` and the metainfo `<screenshots>` still show the
+  layout from before #176. (S)
 
-- **Duplicate keys on Windows/macOS with two identical keys ([#51](https://github.com/framefilter/keyroost/issues/51), reopened) — identity matching shipped in v0.13.0, awaiting a Windows community test.**
-  Where the OS reports no USB position, keyroost now asks each side of a key
+- **Duplicate keys on Windows with two identical keys ([#51](https://github.com/framefilter/keyroost/issues/51), reopened) — device-tree pairing shipped in v0.14.0; awaiting a Windows run with two Token2 PIN+ keys.**
+  On Windows, keyroost pairs a key's two halves from where both sit in the
+  device tree. Identity matching (v0.13.0) remains the fallback there and
+  the macOS path: where the OS reports no USB position, keyroost asks each side of a key
   for the identity it reports (YubiKey serial, Solo 2 UUID, Token2 §6.10
   serial) and joins the two halves when they match; a key that doesn't answer
   stays two rows. Verified on Linux hardware with USB-position matching
@@ -206,7 +190,7 @@ plan's two-key manual steps were never executed):
 
 ## Deferred to a later release
 
-- **Submit keyroost to Flathub** — deferred, not ruled out; not in v0.13.0.
+- **Submit keyroost to Flathub** — deferred, not ruled out; not in v0.14.0.
   The maintainer submits it himself. Flathub's generative-AI
   policy allows AI-generated app code with full disclosure (parts and extent),
   but the Flathub manifest itself and the submission PR, its description and

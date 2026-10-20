@@ -123,8 +123,9 @@ Two constraints the implementation had to add that this plan did not anticipate:
   automatically a per-unit ID. keyroost detects repeats among connected keys and
   shows an advisory rather than treating identical serials as one key.
 - **Correlation fails closed where the platform reports no USB topology.**
-  Windows and macOS report no USB bus position, so a reader that two HID nodes
-  could each own is no longer guessed at by vendor name; contended sets are shown
+  macOS reports no USB bus position (Windows does since 0.14.0, from the
+  device tree), so a reader that two HID nodes could each own is not guessed
+  at by vendor name; contended sets are shown
   separately. That is privacy-review item 3 ("graceful degradation") answered
   concretely: where identity can't be established, say so rather than fake it.
   ([#51](https://github.com/framefilter/keyroost/issues/51) follow-up below.)
@@ -135,8 +136,8 @@ and the CLI picks a row with `select::resolve_target_reading`.
 
 ## Identity matching across interfaces (#51, v0.13.0)
 
-On Windows and macOS a key's FIDO-HID node and its smart-card reader carry no
-USB position, so the two halves of one key could not be joined when two keys of
+On macOS (and on Windows before 0.14.0) a key's FIDO-HID node and its
+smart-card reader carry no USB position, so the two halves of one key could not be joined when two keys of
 the same make were connected. Matching now runs in three steps: USB position
 (where the OS reports it), then the identity each side reports, then the
 existing vendor fallback. Identities are compared only within one encoding;
@@ -164,8 +165,10 @@ memory for that scan, and never written to disk: `keys.json` holds only a salted
 fingerprint, saved when the user names the key or when a key carrying its own
 name is first seen. Every read is read-only and traced under `--debug`;
 the HID reads give up after 1.5 seconds. Reads are planned only for what USB
-position leaves unmatched, so where USB position settles every key (Linux) no
-identity read is sent. Where several keys of one make are connected, a key
+position leaves unmatched, so where USB position settles every key (Linux, and
+Windows when the device tree resolves both sides) no identity read is sent. A
+Windows device-tree position rules out a guess only when the reader's side
+resolved too. Where several keys of one make are connected, a key
 that doesn't answer is shown as two entries, not guessed at.
 
 ---

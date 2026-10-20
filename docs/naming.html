@@ -164,14 +164,14 @@ keyroostctl name clear signing-yubikey              # remove it, wherever it is 
         serial from a vendor management applet over the smart-card (CCID) interface instead.</li>
     </ul>
     <p>So a named key is recognized the moment it's connected, in any port, and is shown as
-      "not connected" when it's absent. keyroost pairs a card reader to its USB device by
-      exact bus address first and refuses to fall back to a name-based guess when the
+      "not connected" when it's absent. keyroost pairs a card reader with its USB device by
+      where both sit on the USB bus (Linux) or in the Windows device tree, and refuses to fall back to a name-based guess when the
       evidence is ambiguous, so in a crowded, hard-to-disambiguate set a key may read as
       not connected rather than being confidently mistaken for its neighbor — deliberately,
       since a wrong match would send card operations and FIDO operations to two different
       physical keys.</p>
-    <p>Windows and macOS don't report that bus address. There, keyroost asks each side of the
-      key for the identity it reports (a YubiKey's serial, a Solo 2's ID, a Token2 key's
+    <p>macOS doesn't report where a device sits. There, and on Windows when the device tree
+      can't be read, keyroost asks each side of the key for the identity it reports (a YubiKey's serial, a Solo 2's ID, a Token2 key's
       serial) and joins the two only when they match. These reads change nothing on the key.
       If two keys of the same make are connected and one doesn't answer, it is shown as two
       entries rather than guessed at.</p>

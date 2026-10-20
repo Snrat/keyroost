@@ -142,11 +142,13 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   `$XDG_CONFIG_HOME/keyroost` (else `~/.config/keyroost`) elsewhere, macOS
   included, and names are validated with anti-spoofing checks while
   allowing a relaxed, readable character set.
-  On Windows and macOS the OS reports no USB position, so keyroost asks each
-  side of a key for the identity it reports (a YubiKey's serial, a Solo 2's
-  ID, a Token2 key's serial) and joins them into one entry when they match. If
-  two keys of the same make are connected and one doesn't answer, it is shown
-  as two entries rather than guessed at.
+  On Windows, keyroost recognizes a key's FIDO side and its smart-card reader
+  as one key from where both sit in the Windows device tree, without opening
+  either. On macOS, which reports no USB position, and on Windows when the
+  tree doesn't answer, keyroost asks each side for the identity it reports (a
+  YubiKey's serial, a Solo 2's ID, a Token2 key's serial) and joins them into
+  one entry when they match. If two keys of the same make are connected and
+  one doesn't answer, it is shown as two entries rather than guessed at.
 
 ## Supported devices
 
@@ -290,6 +292,11 @@ an open industry standard.
 - [OpenPGP Card v3.4](https://gnupg.org/ftp/specs/OpenPGP-smart-card-application-3.4.pdf)
   applet, with v4 key fingerprints per
   [RFC 4880](https://www.rfc-editor.org/rfc/rfc4880) §12.2.
+- Host-side key sets (`keyroost-pgpkey`): OpenPGP packets, ASCII armor and
+  passphrase-protected secret keys per RFC 4880, ECC keys per
+  [RFC 6637](https://www.rfc-editor.org/rfc/rfc6637), Curve25519 per
+  [RFC 7748](https://www.rfc-editor.org/rfc/rfc7748) /
+  [RFC 8032](https://www.rfc-editor.org/rfc/rfc8032).
 
 **PIV**
 - **NIST SP 800-73-4** / FIPS 201 Personal Identity Verification card interface,
@@ -323,10 +330,12 @@ an open industry standard.
 
 **Cryptographic primitives & encodings**
 - **AES** (FIPS 197) and **HMAC** ([RFC 2104](https://www.rfc-editor.org/rfc/rfc2104))
-  — client-PIN, OTP payload encryption, and PIV management-key auth (also 3DES).
+  — client-PIN, OTP payload encryption, PIV management-key auth (also 3DES),
+  and OpenPGP backup encryption.
 - **RSA** with **PKCS#1** ([RFC 8017](https://www.rfc-editor.org/rfc/rfc8017)) and
   **PKCS#8** ([RFC 5208](https://www.rfc-editor.org/rfc/rfc5208)) key
-  serialization, PEM/DER (X.509 / ASN.1 DER) — host-side OpenPGP key import, and
+  serialization, PEM/DER (X.509 / ASN.1 DER) — host-side OpenPGP key import and
+  key generation, and
   host-side verification in the PIV slot self-test (`keyroost-pivtest`).
 - **CBOR** ([RFC 8949](https://www.rfc-editor.org/rfc/rfc8949), canonical
   encoding) — the CTAP2 message format.
@@ -578,6 +587,7 @@ setup. The CLI has no build script.)
 > FIDO key (via readable HID metadata, without opening the protected
 > interface) and shows an "Administrator rights needed" card with a button to
 > relaunch elevated or open Windows' own security-key settings.
+> `keyroostctl list` and `doctor` say the same.
 
 > **Prebuilt binaries:** the Linux release tarball and the AppImage are built on
 > Ubuntu 22.04 and need glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36
@@ -953,6 +963,10 @@ a script, use `--json` where a command has it.
 Breaking changes are tracked per release on the site's
 [migration notes](https://framefilter.github.io/keyroost/migration.html)
 page, with the exact before → after for scripts and library consumers.
+**v0.14.0** changes `openpgp key import --generate`: it now needs
+`--backup FILE` and `--name`, fills all three slots, and no longer takes
+`--slot`. Library users: `usb_bus` / `usb_address` on `HidDevice`,
+`ReaderProbe` and `YubiKeyCcid` are replaced by one `usb_device` field.
 **v0.13.0** makes more commands ask before they erase or replace something
 (scripts pass `--yes`), refuses, in a script, to pick among several keys, and
 takes no secret on the command line (each secret flag takes `env:NAME` or
@@ -975,8 +989,8 @@ old script.
 | Crate | Purpose | External deps |
 |---|---|---|
 | `keyroost-proto` | Pure-Rust Molto2 wire protocol (SM4, SHA-1, APDU, MAC) | none |
-| `keyroost-transport` | PC/SC discovery, Molto2 session, CCID serial, OATH/OpenPGP/PIV applets, Token2 OTP session, import writers for OATH / Token2 OTP / Molto2 (in-tree `keyroost-import`) | `pcsc`, `aes`/`des`/`cipher` (mgmt-key auth), `getrandom`, `zeroize`, `miniz_oxide` (gzip-compressed PIV certificates); `hidapi` on macOS/Windows |
-| `keyroost-hid` | USB HID enumeration of FIDO devices, and the "same physical USB device" evidence used to pair a key's FIDO and smart-card sides | none on Linux (`sysfs`); `hidapi` on macOS/Windows |
+| `keyroost-transport` | PC/SC discovery, Molto2 session, CCID serial, OATH/OpenPGP/PIV applets, Token2 OTP session, import writers for OATH / Token2 OTP / Molto2 (in-tree `keyroost-import`) | `pcsc`, `aes`/`des`/`cipher` (mgmt-key auth), `getrandom`, `zeroize`, `miniz_oxide` (gzip-compressed PIV certificates); `hidapi` on macOS/Windows; in-tree `keyroost-windevtree` on Windows |
+| `keyroost-hid` | USB HID enumeration of FIDO devices, and the "same physical USB device" evidence used to pair a key's FIDO and smart-card sides | none on Linux (`sysfs`); `hidapi` on macOS/Windows; in-tree `keyroost-windevtree` on Windows |
 | `keyroost-ctap` | FIDO2/CTAP-HID transport, CBOR, PIN protocols, credential management, large-blob storage (including the name a key carries) | RustCrypto (`sha2`/`hmac`/`aes`/`cbc`/`p256`/`rand_core`) for client-PIN, `aes-gcm` + `miniz_oxide` for largeBlob entries, `zeroize`; `hidapi` on macOS/Windows |
 | `keyroost-oath` | Pure-Rust Yubico/Trussed OATH (TOTP/HOTP) byte layer | `zeroize` |
 | `keyroost-openpgp` | Pure-Rust OpenPGP Card v3.4 byte layer (APDU + BER-TLV) | `zeroize` |
