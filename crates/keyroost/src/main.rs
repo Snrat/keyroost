@@ -41,6 +41,106 @@ use keyroost_ctap::{AuthenticatorInfo, CtapHidDevice, InitResponse};
 /// the workspace version, so it can never drift from the release.
 const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
+/// How long the app keeps an unlocked FIDO session, a retained OATH password
+/// or OTP PIN, and displayed codes without a click, key press or scroll
+/// before locking them (see `App::idle_lock`). The lock messages below take
+/// their wording from it, so they can't name a different duration.
+const IDLE_LOCK_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// [`IDLE_LOCK_AFTER`] in words: "5 minutes", "1 minute", or "75 seconds"
+/// when it isn't a whole number of minutes.
+fn idle_lock_span() -> String {
+    let secs = IDLE_LOCK_AFTER.as_secs();
+    let (n, unit) = if secs.is_multiple_of(60) {
+        (secs / 60, "minute")
+    } else {
+        (secs, "second")
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
+/// Shown where the idle lock dropped something the user has to unlock again:
+/// the FIDO session, a password-protected OATH applet, the OTP PIN.
+fn idle_locked_msg() -> String {
+    format!(
+        "Locked after {} of inactivity \u{2014} unlock again to continue.",
+        idle_lock_span()
+    )
+}
+
+/// Shown where the idle lock only hid codes that need no unlock to show again.
+fn idle_hidden_msg() -> String {
+    format!("Codes hidden after {} of inactivity.", idle_lock_span())
+}
+
+/// Whether an egui input event is the user doing something deliberate
+/// (clicking, typing, scrolling, touching), as opposed to window bookkeeping
+/// such as focus changes or screenshots. Only these postpone the inactivity
+/// lock. Pointer movement alone doesn't: a pointer resting on or drifting
+/// across the window says nobody is reading the codes.
+fn is_user_activity(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Copy
+            | egui::Event::Cut
+            | egui::Event::Paste(_)
+            | egui::Event::Text(_)
+            | egui::Event::Key { .. }
+            | egui::Event::PointerButton { .. }
+            | egui::Event::Zoom(_)
+            | egui::Event::Rotate(_)
+            | egui::Event::Ime(_)
+            | egui::Event::Touch { .. }
+            | egui::Event::MouseWheel { .. }
+    )
+}
+
+/// Put a secret on the system clipboard through `slot`'s arboard handle
+/// (created on first use), with the platform's "keep this out of clipboard
+/// history" marker: `org.nspasteboard.ConcealedType` on macOS, the
+/// clipboard-history and cloud-clipboard exclusions on Windows, and the
+/// `x-kde-passwordManagerHint` type on X11. Returns `false` when it couldn't,
+/// and the caller copies the plain way instead.
+fn copy_concealed(slot: &mut Option<arboard::Clipboard>, text: &str) -> bool {
+    // A native Wayland window's clipboard is egui's own Wayland one. arboard
+    // is built X11-only here (its Wayland backend would be a new
+    // dependency), so a copy through it could land only in XWayland's
+    // clipboard, which not every compositor syncs. Leave Wayland to egui.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return false;
+    }
+    if slot.is_none() {
+        *slot = arboard::Clipboard::new().ok();
+    }
+    let Some(clipboard) = slot.as_mut() else {
+        return false;
+    };
+    let set = clipboard.set();
+    #[cfg(target_os = "macos")]
+    let set = {
+        use arboard::SetExtApple;
+        set.exclude_from_history()
+    };
+    #[cfg(windows)]
+    let set = {
+        use arboard::SetExtWindows;
+        set.exclude_from_history().exclude_from_cloud()
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let set = {
+        use arboard::SetExtLinux;
+        set.exclude_from_history()
+    };
+    if set.text(text).is_ok() {
+        true
+    } else {
+        // A broken handle (e.g. the X server went away) is rebuilt next time.
+        *slot = None;
+        false
+    }
+}
+
 /// How the selected FIDO key is reached: over USB-HID (a `hidraw` path) or over
 /// a PC/SC reader (NFC or contact, by reader name).
 #[derive(Debug, Clone)]
@@ -696,6 +796,9 @@ struct OathState {
     password_input: String,
     /// User-facing error/status from the last OATH operation.
     error: Option<String>,
+    /// Why the codes went away when the idle lock took them (see
+    /// `App::idle_lock`); cleared by the next successful listing.
+    notice: Option<String>,
     /// True once a list has been fetched for the current selection.
     loaded: bool,
     /// "Add credential" dialog state.
@@ -730,6 +833,11 @@ struct OathRow {
     /// The TOTP period the name implies (its `period/` prefix, else 30): the
     /// code is computed with it and the countdown ring runs on it.
     period: u32,
+    /// The card wouldn't give this TOTP code without a touch (the first read
+    /// timed out waiting for one). Like HOTP, its code is read only on
+    /// request: re-reading it every time window would make the key wait for a
+    /// touch each time, holding back every other row's fresh code meanwhile.
+    touch: bool,
 }
 
 impl OathRow {
@@ -747,6 +855,7 @@ impl OathRow {
             code,
             hotp,
             period,
+            touch: false,
         }
     }
 }
@@ -3668,6 +3777,15 @@ struct App {
     /// clipboard-manager history forever. Cleared conditionally: only if the
     /// clipboard still holds that exact code.
     clipboard_clear_at: Option<(String, f64)>,
+    /// The clipboard handle secrets are copied through (see
+    /// [`App::copy_secret`]), created on first use. Kept alive rather than
+    /// made per copy: on X11 the copying app serves the clipboard's contents,
+    /// so a dropped handle could take the copied code with it.
+    secret_clipboard: Option<arboard::Clipboard>,
+    /// When the user last gave the window input (or an operation last ran);
+    /// drives the inactivity lock (see [`IDLE_LOCK_AFTER`]). `None` until the
+    /// first frame.
+    last_activity: Option<std::time::Instant>,
     /// True once the first automatic device scan has been kicked off.
     scanned: bool,
     /// Sidebar filter text (filters the visible device list by vendor/model).
@@ -3683,6 +3801,9 @@ struct App {
     /// codes. When the window rolls over, the codes have expired, so the pane
     /// auto-reloads. `None` until first observed.
     otp_last_window: Option<u64>,
+    /// The same for the Authenticator (OATH) codes, while the Authenticator
+    /// tab or the Overview shows them.
+    oath_last_window: Option<u64>,
     /// OATH (TOTP) view state.
     oath: OathState,
     /// OpenPGP view state.
@@ -3754,6 +3875,10 @@ struct App {
     piv_tried: bool,
     /// Same guard for the OTP pane's auto-read.
     otp_tried: bool,
+    /// A Refresh click is waiting for its rescan: when the scan lands with the
+    /// same key still selected, the open tab is read again (see
+    /// [`App::user_refresh`]).
+    reread_after_scan: bool,
     /// True while the Molto2 factory-reset confirmation is showing.
     molto_reset_confirm: bool,
     /// True while the per-slot seed-delete confirmation card is showing.
@@ -5136,6 +5261,132 @@ impl App {
         wipe(&mut self.security_keys.pin_input);
     }
 
+    /// Whether the app holds anything [`Self::idle_lock`] would clear: an
+    /// unlocked FIDO session (with its PIN), a retained OATH password or OTP
+    /// PIN, or displayed OATH / OTP codes.
+    fn holds_unlocked_secrets(&self) -> bool {
+        self.security_keys.session.is_some()
+            || self.oath.unlocked_password.is_some()
+            || self.oath.creds.iter().any(|r| r.code.is_some())
+            || self.otp.pin.is_some()
+            || self.otp.rows.iter().any(|r| r.code.is_some())
+            || !self.otp.touch_codes.is_empty()
+    }
+
+    /// The inactivity check, run once per frame. `user_input` is whether this
+    /// frame carried deliberate input ([`is_user_activity`]). The clock runs
+    /// only while something is held, from the last input. A running
+    /// operation (a worker job — including a touch or fingerprint wait or a
+    /// code refresh on a window rollover — an import stage, or an armed
+    /// reset) postpones the lock until it ends, so nothing is locked out from
+    /// under it, but doesn't restart the clock: the panes' own periodic
+    /// refreshes would otherwise keep the codes up for good. Returns how long
+    /// until the next check is due, or `None` when nothing is held.
+    fn idle_lock_tick(
+        &mut self,
+        now: std::time::Instant,
+        user_input: bool,
+    ) -> Option<std::time::Duration> {
+        let operating = self.busy() || self.import_busy() || self.reset_arm.is_some();
+        let held = self.holds_unlocked_secrets();
+        // Judge the time idle before this frame's input counts. Where the
+        // platform stops drawing a minimized window, the timer's frame never
+        // comes; the first frame back can carry the click that restored the
+        // window, and counting that first would restart the clock and show
+        // the secrets again.
+        let idle = self.last_activity.map(|t| now.saturating_duration_since(t));
+        if held && !operating && idle.is_some_and(|d| d >= IDLE_LOCK_AFTER) {
+            self.idle_lock();
+            return None;
+        }
+        // While nothing is held the clock follows the frame, so it starts
+        // when something is unlocked rather than at the last click before.
+        if user_input || !held || idle.is_none() {
+            self.last_activity = Some(now);
+        }
+        if !held {
+            return None;
+        }
+        let idle = now.saturating_duration_since(self.last_activity.unwrap_or(now));
+        let due = IDLE_LOCK_AFTER.saturating_sub(idle);
+        // Past due but postponed by an operation: check again shortly rather
+        // than asking for a repaint loop.
+        Some(if operating {
+            due.max(std::time::Duration::from_secs(1))
+        } else {
+            due
+        })
+    }
+
+    /// Lock what [`Self::holds_unlocked_secrets`] reports, after
+    /// [`IDLE_LOCK_AFTER`] without input: the FIDO session through the same
+    /// path as the Lock button, the retained OATH password and OTP PIN (a
+    /// protected applet goes back to its unlock prompt, as after a rejected
+    /// password), and every displayed code. Local only — no device I/O.
+    fn idle_lock(&mut self) {
+        if self.security_keys.session.is_some() {
+            self.lock_session();
+            self.security_keys.error = Some(idle_locked_msg());
+        }
+
+        let oath_codes = self.oath.creds.iter().any(|r| r.code.is_some());
+        for row in &mut self.oath.creds {
+            if let Some(mut code) = row.code.take() {
+                wipe(&mut code);
+            }
+        }
+        let protected = self
+            .oath
+            .unlocked_password
+            .take()
+            .is_some_and(|password| !password.is_empty());
+        if protected {
+            self.oath.creds.clear();
+            self.oath.locked = true;
+            self.oath.notice = Some(idle_locked_msg());
+        } else if oath_codes {
+            // Nothing to unlock: the pane offers to read the codes again
+            // (and the Overview goes back to "Open Authenticator…").
+            self.oath.creds.clear();
+            self.oath.loaded = false;
+            self.oath.notice = Some(idle_hidden_msg());
+        }
+
+        let otp_codes =
+            self.otp.rows.iter().any(|r| r.code.is_some()) || !self.otp.touch_codes.is_empty();
+        for row in &mut self.otp.rows {
+            if let Some(mut code) = row.code.take() {
+                wipe(&mut code);
+            }
+        }
+        for (_, mut code) in self.otp.touch_codes.drain() {
+            wipe(&mut code);
+        }
+        if self.otp.pin.take().is_some() {
+            self.otp.pin_required = true;
+            self.otp.rows.clear();
+            self.otp.info = Some(idle_locked_msg());
+        } else if otp_codes {
+            self.otp.info = Some(format!("{} Refresh to show them again.", idle_hidden_msg()));
+        }
+        self.log(
+            Severity::Info,
+            format!("Locked after {} of inactivity.", idle_lock_span()),
+        );
+    }
+
+    /// Copy a secret (an OTP / OATH code, a generated management key) to the
+    /// clipboard, marked for exclusion from clipboard history where the
+    /// platform has a marker, and schedule the 45 s conditional auto-clear.
+    /// Falls back to egui's own clipboard path when the marked copy can't be
+    /// made, so copying never silently stops working.
+    fn copy_secret(&mut self, ctx: &egui::Context, text: String) {
+        if !copy_concealed(&mut self.secret_clipboard, &text) {
+            ctx.copy_text(text.clone());
+        }
+        self.clipboard_clear_at = Some((text, now_secs_f64() + 45.0));
+    }
+
     /// Resolve a failed unlocked-session operation. When the underlying CTAP
     /// error is a PIN / PIN-auth failure (`0x31` / `0x33` / `0x34`) the key has
     /// invalidated the in-flight session, so we drop it and ask the user to
@@ -6077,8 +6328,12 @@ impl App {
 
     /// Off-thread helper: list credentials and compute each current TOTP. Also
     /// returns how many undecodable entries the card holds (partial listing).
+    /// TOTP codes named in `touch` (rows already known to need a touch, see
+    /// [`OathRow::touch`]) are not computed; a code that fails to compute
+    /// marks its row as needing a touch.
     fn oath_list_rows(
         session: &mut keyroost_transport::OathSession,
+        touch: &[String],
     ) -> Result<(Vec<OathRow>, usize), TransportError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6094,12 +6349,16 @@ impl App {
             // the card out of the server's look-ahead window. The row shows a
             // "Read code" button instead.
             let mut row = OathRow::new(c.name, None, hotp);
-            if !hotp {
-                // A touch-required credential blocks until touched; fine off-thread.
+            if !hotp && touch.contains(&row.name) {
+                row.touch = true;
+            } else if !hotp {
+                // A touch-required credential blocks until touched (or the
+                // card gives up); fine off-thread, but only on this first read.
                 row.code = session
                     .calculate_totp(&row.name, now, row.period)
                     .ok()
                     .map(|otp| otp.code);
+                row.touch = row.code.is_none();
             }
             rows.push(row);
         }
@@ -6109,25 +6368,47 @@ impl App {
         Ok((rows, listing.skipped))
     }
 
-    /// Compute one HOTP code on explicit request and patch it into the row.
-    /// Deliberately not part of the listing: each computation advances the
-    /// card's counter.
-    fn read_hotp_code(&mut self, name: &str) {
+    /// Compute one code on explicit request and patch it into the row: an
+    /// HOTP code (not part of the listing: each computation advances the
+    /// card's counter) or a TOTP code that needs a touch (see
+    /// [`OathRow::touch`]; the job waits until the key is touched).
+    fn read_code_on_request(&mut self, name: &str) {
         self.oath.error = None;
         let Some(reader) = self.selected_oath_reader() else {
             self.oath.error = Some("no OATH key selected".into());
             return;
         };
         let cred = name.to_owned();
+        // HOTP, or the TOTP period to compute with.
+        let totp_period = self
+            .oath
+            .creds
+            .iter()
+            .find(|r| r.name == cred && !r.hotp)
+            .map(|r| r.period);
         // The listing already consumed (wiped) password_input, so this read
         // sends the retained accepted password — an empty string here could
         // never unlock a protected applet and re-locked the pane every time.
         let password = oath_effective_password(&self.oath);
         let for_device = self.selected_device.clone();
-        self.spawn_job("Reading code\u{2026}", move || {
+        let label = if totp_period.is_some() {
+            "Touch your key to read the code\u{2026}"
+        } else {
+            "Reading code\u{2026}"
+        };
+        self.spawn_job(label, move || {
             let result = (|| -> Result<String, TransportError> {
                 let mut session = Self::oath_open_unlock(&reader, &password)?;
-                Ok(session.calculate_hotp(&cred)?.code)
+                match totp_period {
+                    Some(period) => {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        Ok(session.calculate_totp(&cred, now, period)?.code)
+                    }
+                    None => Ok(session.calculate_hotp(&cred)?.code),
+                }
             })();
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
@@ -6190,10 +6471,25 @@ impl App {
                 // The applet accepted this password (or needed none): retain
                 // it for on-demand reads against the same selection.
                 app.oath.unlocked_password = Some(password);
+                // An HOTP code read on demand doesn't expire, and the listing
+                // never computes one (that would advance the counter): keep
+                // it across a refresh rather than blanking the row.
+                let mut rows = rows;
+                for row in rows.iter_mut().filter(|r| r.hotp && r.code.is_none()) {
+                    if let Some(old) = app
+                        .oath
+                        .creds
+                        .iter_mut()
+                        .find(|o| o.hotp && o.name == row.name)
+                    {
+                        row.code = old.code.take();
+                    }
+                }
                 app.oath.creds = rows;
                 app.oath.skipped = skipped;
                 app.oath.loaded = true;
                 app.oath.locked = false;
+                app.oath.notice = None;
             }
             Err(TransportError::OathPasswordRejected) => {
                 app.oath.unlocked_password = None;
@@ -6214,6 +6510,17 @@ impl App {
         }
     }
 
+    /// Names of the shown TOTP rows whose codes need a touch, for the next
+    /// listing to leave alone (see [`OathRow::touch`]).
+    fn oath_touch_names(&self) -> Vec<String> {
+        self.oath
+            .creds
+            .iter()
+            .filter(|r| r.touch)
+            .map(|r| r.name.clone())
+            .collect()
+    }
+
     /// List credentials on the selected key, computing each current TOTP. Unlocks
     /// first with the entered password when the applet is protected.
     fn load_oath_creds(&mut self) {
@@ -6224,9 +6531,10 @@ impl App {
         };
         let password = oath_effective_password(&self.oath);
         let for_device = self.selected_device.clone();
+        let touch = self.oath_touch_names();
         self.spawn_job("Reading OATH codes\u{2026}", move || {
             let result = Self::oath_open_unlock(&name, &password)
-                .and_then(|mut session| Self::oath_list_rows(&mut session));
+                .and_then(|mut session| Self::oath_list_rows(&mut session, &touch));
             Box::new(move |app: &mut App| {
                 // Discard if the user switched devices while the read (which
                 // can block on a touch) was in flight — device B's pane must
@@ -6265,6 +6573,12 @@ impl App {
         };
         let require_touch = self.oath.add.require_touch;
         let password = oath_effective_password(&self.oath);
+        // A new touch account joins the rows left alone, so the listing after
+        // the add doesn't wait for a touch either.
+        let mut touch = self.oath_touch_names();
+        if require_touch {
+            touch.push(cred_name.clone());
+        }
         // The form stays open showing the spinner; it is wiped/closed on the
         // modal's Done (success) or Cancel/✕/Esc. Do not reset it here.
         let for_device = self.selected_device.clone();
@@ -6288,7 +6602,7 @@ impl App {
                     );
                     if refused.is_some() {
                         // Nothing sent; the list is refreshed as usual.
-                        return Self::oath_list_rows(&mut session);
+                        return Self::oath_list_rows(&mut session, &touch);
                     }
                 }
                 session.put(&keyroost_oath::PutParams {
@@ -6300,7 +6614,7 @@ impl App {
                     require_touch,
                     imf: 0,
                 })?;
-                Self::oath_list_rows(&mut session)
+                Self::oath_list_rows(&mut session, &touch)
             })();
             Box::new(move |app: &mut App| {
                 if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
@@ -6323,11 +6637,12 @@ impl App {
         let cred_name = name.to_owned();
         let password = oath_effective_password(&self.oath);
         let for_device = self.selected_device.clone();
+        let touch = self.oath_touch_names();
         self.spawn_job("Deleting credential\u{2026}", move || {
             let result = (|| -> Result<(Vec<OathRow>, usize), TransportError> {
                 let mut session = Self::oath_open_unlock(&reader, &password)?;
                 session.delete(&cred_name)?;
-                Self::oath_list_rows(&mut session)
+                Self::oath_list_rows(&mut session, &touch)
             })();
             Box::new(move |app: &mut App| {
                 if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
@@ -8655,6 +8970,41 @@ impl App {
         self.next_scan_at = None; // first scan is due immediately
     }
 
+    /// What every Refresh button does, wherever it sits: rescan for keys,
+    /// then read the open tab of the selected key again — so a change made
+    /// outside the app (an account added with `keyroostctl`, say) shows up
+    /// whichever Refresh was clicked. The re-read waits for the scan, since
+    /// the worker takes one job at a time.
+    fn user_refresh(&mut self) {
+        self.schedule_scan_burst();
+        self.reread_after_scan = true;
+    }
+
+    /// Read the open tab of the selected key again, as its pane does on first
+    /// showing. Leaves unlocked sessions alone (a password-locked OATH applet
+    /// waits for its password); a Molto2 re-reads its slot list through its
+    /// open session, as "Refresh slots" does.
+    fn reread_open_tab(&mut self) {
+        if self
+            .selected_device()
+            .is_some_and(|d| d.kind == DeviceKind::Token)
+        {
+            self.resweep_slot_meta(LogKind::User);
+            return;
+        }
+        match self.cap_tab {
+            CapTab::Oath => {
+                if !self.oath.locked {
+                    self.load_oath_creds();
+                }
+            }
+            CapTab::Piv => self.load_piv_status_with_cache(LogKind::User, PivCache::Bypass),
+            CapTab::Pgp => self.load_openpgp_status(),
+            CapTab::Otp => self.refresh_otp(),
+            CapTab::Fido2 | CapTab::Overview => self.fetch_selected_info(),
+        }
+    }
+
     fn refresh_devices(&mut self) {
         self.scanned = true;
         self.spawn_job("Scanning for devices\u{2026}", move || {
@@ -8777,11 +9127,16 @@ impl App {
                     // everything on the next successful scan for no reason).
                     app.piv_session_state
                         .retain(|id, _| app.devices.iter().any(|d| &d.id == id));
+                    // A different selection reads its tabs afresh anyway.
+                    let reread = std::mem::take(&mut app.reread_after_scan);
                     if changed {
                         app.on_device_selected(previous);
+                    } else if reread && app.selected_device.is_some() {
+                        app.reread_open_tab();
                     }
                 }
                 Err(e) => {
+                    app.reread_after_scan = false;
                     app.log_global(
                         Severity::Warn,
                         LogKind::Background,
@@ -8883,6 +9238,7 @@ impl App {
         self.oath.loaded = false;
         self.oath.locked = false;
         self.oath.error = None;
+        self.oath.notice = None;
         self.oath.unlocked_password = None;
         self.openpgp.status = None;
         self.openpgp.loaded = false;
@@ -9823,8 +10179,7 @@ impl App {
         let hex = hex_lower(&key);
         wipe(&mut self.piv.new_mgmt_key_input);
         self.piv.new_mgmt_key_input.push_str(&hex);
-        ctx.copy_text(hex.clone());
-        self.clipboard_clear_at = Some((hex, now_secs_f64() + 45.0));
+        self.copy_secret(ctx, hex);
         self.secret_reveal.insert("piv-new-mgmt-key", true);
     }
 
@@ -13210,10 +13565,15 @@ impl eframe::App for App {
         // already in the tree via eframe's clipboard integration; if the
         // clipboard can't be read (e.g. some Wayland setups), fail open and
         // clear nothing rather than risk destroying foreign content.
+        // The read and the clear go through the same long-lived handle the
+        // secret was copied with (`copy_secret`) when there is one.
         if let Some((ref code, t)) = self.clipboard_clear_at {
             let now = now_secs_f64();
             if now >= t {
-                if let Ok(mut cb) = arboard::Clipboard::new() {
+                if self.secret_clipboard.is_none() {
+                    self.secret_clipboard = arboard::Clipboard::new().ok();
+                }
+                if let Some(cb) = self.secret_clipboard.as_mut() {
                     if cb.get_text().is_ok_and(|current| current == *code) {
                         let _ = cb.clear();
                     }
@@ -13348,6 +13708,14 @@ impl eframe::App for App {
             }
         }
 
+        // Inactivity lock: after IDLE_LOCK_AFTER without input, drop the
+        // unlocked FIDO session, retained OATH password / OTP PIN and shown
+        // codes. The timer wakes the frame loop even when nothing else draws.
+        let user_input = ctx.input(|i| i.events.iter().any(is_user_activity));
+        if let Some(next) = self.idle_lock_tick(std::time::Instant::now(), user_input) {
+            ctx.request_repaint_after(next);
+        }
+
         self.top_bar(root_ui, &p);
         self.device_sidebar(root_ui, &p);
         if self.log_open && !self.log_detached {
@@ -13424,6 +13792,40 @@ impl eframe::App for App {
             self.otp_last_window = None;
         }
 
+        // The same for the Authenticator (OATH) codes, on the tabs that show
+        // them. A refresh that can't start yet (a job is running) is retried
+        // on a later frame rather than skipped for the whole window. Codes
+        // the idle lock took are gone, so nothing re-reads them unasked.
+        let oath_period = (matches!(self.cap_tab, CapTab::Oath | CapTab::Overview)
+            && self.oath.loaded)
+            .then(|| {
+                self.oath
+                    .creds
+                    .iter()
+                    .filter(|r| !r.hotp && r.code.is_some())
+                    .map(|r| u64::from(r.period.max(1)))
+                    .min()
+            })
+            .flatten();
+        match oath_period {
+            Some(period) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let window = now / period;
+                match self.oath_last_window {
+                    Some(prev) if prev != window && !self.busy() => {
+                        self.oath_last_window = Some(window);
+                        self.load_oath_creds();
+                    }
+                    None => self.oath_last_window = Some(window),
+                    _ => {}
+                }
+            }
+            None => self.oath_last_window = None,
+        }
+
         let animating = self.copied.is_some()
             || matches!(self.cap_tab, CapTab::Oath)
             || (matches!(self.cap_tab, CapTab::Overview)
@@ -13438,8 +13840,10 @@ impl eframe::App for App {
             || self
                 .selected_device()
                 .is_some_and(|d| d.kind == DeviceKind::Token);
+        // Once a second is enough for second-resolution countdowns, and halves the
+        // redraw cost where the GPU is missing and drawing falls back to software.
         if animating {
-            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
     }
 }
@@ -14097,7 +14501,7 @@ impl App {
                         |ui| {
                             // Right-to-left: Refresh is the rightmost item.
                             if theme::button(ui, p, BtnKind::Ghost, "Refresh").clicked() {
-                                self.schedule_scan_burst();
+                                self.user_refresh();
                             }
                             if !fit.links_in_menu {
                                 ui.add_space(TOPBAR_GAP);
@@ -14692,7 +15096,7 @@ impl App {
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
-                    app.schedule_scan_burst();
+                    app.user_refresh();
                 }
             },
         );
@@ -14817,7 +15221,7 @@ impl App {
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
         {
-            self.schedule_scan_burst();
+            self.user_refresh();
         }
         if self.devices.is_empty() {
             return ev;
@@ -15993,9 +16397,8 @@ impl App {
                             );
                         }
                         if let Some((name, code)) = copy {
-                            ui.ctx().copy_text(code.clone());
                             self.copied = Some((name, now_secs_f64() + 1.2));
-                            self.clipboard_clear_at = Some((code, now_secs_f64() + 45.0));
+                            self.copy_secret(ui.ctx(), code);
                         }
                     } else {
                         ui.label(
@@ -20751,13 +21154,21 @@ impl App {
                     }));
                 }
             }
-            Some(2) => self.load_oath_creds(),
+            Some(2) => self.user_refresh(),
             _ => {}
         }
         ui.add_space(12.0);
         if let Some(err) = &self.oath.error {
             ui.colored_label(p.err, err);
             ui.add_space(6.0);
+        }
+        if let Some(notice) = &self.oath.notice {
+            ui.label(
+                egui::RichText::new(notice.as_str())
+                    .font(theme::f_reg(13.0))
+                    .color(p.txt2),
+            );
+            ui.add_space(8.0);
         }
         if self.oath.locked {
             theme::card_frame(p).show(ui, |ui| {
@@ -20793,6 +21204,13 @@ impl App {
             return;
         }
         if !self.oath.loaded {
+            if self.oath.notice.is_some() && !self.busy() {
+                // Hidden by the idle lock: reading them again is one click.
+                if theme::button(ui, p, BtnKind::Primary, "Show codes").clicked() {
+                    self.load_oath_creds();
+                }
+                return;
+            }
             ui.label(
                 egui::RichText::new("Reading codes\u{2026}")
                     .font(theme::f_reg(13.0))
@@ -20861,9 +21279,8 @@ impl App {
             }
         });
         if let Some((name, code)) = copy {
-            ui.ctx().copy_text(code.clone());
             self.copied = Some((name, now_secs_f64() + 1.2));
-            self.clipboard_clear_at = Some((code, now_secs_f64() + 45.0));
+            self.copy_secret(ui.ctx(), code);
         }
         if let Some(name) = delete {
             if let Some(dev) = self.selected_device.clone() {
@@ -20871,7 +21288,7 @@ impl App {
             }
         }
         if let Some(name) = read {
-            self.read_hotp_code(&name);
+            self.read_code_on_request(&name);
         }
 
         // Danger card at the bottom of the pane, mirroring the FIDO2 /
@@ -22993,7 +23410,7 @@ impl App {
             self.piv.selected_slot = slot;
         }
         if do_refresh {
-            self.load_piv_status_with_cache(LogKind::User, PivCache::Bypass);
+            self.user_refresh();
         }
         // The three buttons open the centered credential modal; the modal itself
         // (rendered once per frame) runs the actual op. Opening wipes any stale
@@ -24095,18 +24512,19 @@ fn oath_row(
                 }
                 ui.add_space(8.0);
             }
-            if hotp && code.is_none() {
-                // No code yet: reading one advances the card's counter, so it
-                // happens only on request. (No copy icon either — there's
-                // nothing to copy.) The compact overview card doesn't handle
-                // the click, so it gets a passive label instead of a button.
+            if (hotp || row.touch) && code.is_none() {
+                // No code yet: reading one advances the card's counter (HOTP)
+                // or waits for a touch, so it happens only on request. (No
+                // copy icon either — there's nothing to copy.) The compact
+                // overview card doesn't handle the click, so it gets a passive
+                // label instead of a button.
                 if with_delete {
                     if theme::button(ui, p, BtnKind::Ghost, "Read code").clicked() {
                         read = true;
                     }
                 } else {
                     ui.label(
-                        egui::RichText::new("on demand")
+                        egui::RichText::new(if hotp { "on demand" } else { "touch" })
                             .font(theme::f_reg(13.0))
                             .color(p.txt3),
                     );
@@ -28365,6 +28783,293 @@ mod tests {
         );
     }
 
+    fn otp_row(code: Option<&str>) -> otp_pane::OtpRow {
+        otp_pane::OtpRow {
+            app_name: "Example".into(),
+            account_name: "alice".into(),
+            type_str: "TOTP",
+            algo_str: "SHA1",
+            button_required: false,
+            code: code.map(str::to_owned),
+            period: 30,
+        }
+    }
+
+    /// Nothing held: the inactivity check schedules nothing and locks nothing.
+    #[test]
+    fn idle_lock_is_idle_when_nothing_is_unlocked() {
+        let mut app = App::default();
+        let t0 = std::time::Instant::now();
+        assert_eq!(app.idle_lock_tick(t0, false), None);
+        assert_eq!(app.idle_lock_tick(t0 + IDLE_LOCK_AFTER * 2, false), None);
+    }
+
+    /// A protected OATH applet's password and codes are dropped after the
+    /// timeout and the pane returns to its unlock prompt; until then the
+    /// check asks to be woken when the timeout would fall due.
+    #[test]
+    fn idle_lock_relocks_a_protected_oath_applet() {
+        let mut app = App::default();
+        app.oath.unlocked_password = Some(zeroize::Zeroizing::new("hunter2".into()));
+        app.oath.loaded = true;
+        app.oath.creds = vec![OathRow::new(
+            "Example:alice".into(),
+            Some("123456".into()),
+            false,
+        )];
+        let t0 = std::time::Instant::now();
+        assert_eq!(app.idle_lock_tick(t0, false), Some(IDLE_LOCK_AFTER));
+        let almost = t0 + IDLE_LOCK_AFTER - std::time::Duration::from_secs(1);
+        assert_eq!(
+            app.idle_lock_tick(almost, false),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert!(app.oath.unlocked_password.is_some(), "not yet");
+
+        assert_eq!(app.idle_lock_tick(t0 + IDLE_LOCK_AFTER, false), None);
+        assert!(app.oath.unlocked_password.is_none());
+        assert!(app.oath.creds.is_empty());
+        assert!(app.oath.locked, "back to the unlock prompt");
+        assert_eq!(app.oath.notice.as_deref(), Some(idle_locked_msg().as_str()));
+        assert!(!app.holds_unlocked_secrets());
+    }
+
+    /// An unprotected applet has nothing to re-enter: the codes go, the pane
+    /// says why and offers to read them again (no unlock prompt), and the
+    /// Overview falls back to "Open Authenticator…".
+    #[test]
+    fn idle_lock_hides_codes_of_an_unprotected_oath_applet() {
+        let mut app = App::default();
+        app.oath.unlocked_password = Some(zeroize::Zeroizing::new(String::new()));
+        app.oath.loaded = true;
+        app.oath.creds = vec![OathRow::new(
+            "Example:alice".into(),
+            Some("123456".into()),
+            false,
+        )];
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        app.idle_lock_tick(t0 + IDLE_LOCK_AFTER, false);
+        assert!(app.oath.creds.is_empty());
+        assert!(!app.oath.loaded, "the Overview stops showing rows");
+        assert!(!app.oath.locked);
+        assert_eq!(app.oath.notice.as_deref(), Some(idle_hidden_msg().as_str()));
+        assert!(!app.holds_unlocked_secrets());
+    }
+
+    /// Input restarts the clock. A running operation postpones the lock, so
+    /// a long touch / fingerprint wait is never locked out from under, but
+    /// doesn't restart it: the lock comes as soon as the operation ends.
+    #[test]
+    fn idle_lock_waits_for_input_and_postpones_for_operations() {
+        let mut app = App::default();
+        app.otp.rows = vec![otp_row(Some("654321"))];
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        let t1 = t0 + IDLE_LOCK_AFTER - std::time::Duration::from_secs(1);
+        assert_eq!(app.idle_lock_tick(t1, true), Some(IDLE_LOCK_AFTER));
+
+        app.busy_jobs = 1;
+        let t2 = t1 + IDLE_LOCK_AFTER * 3;
+        assert_eq!(
+            app.idle_lock_tick(t2, false),
+            Some(std::time::Duration::from_secs(1)),
+            "past due: checks again shortly instead of spinning"
+        );
+        assert!(app.otp.rows[0].code.is_some(), "never mid-operation");
+        app.busy_jobs = 0;
+        assert_eq!(
+            app.idle_lock_tick(t2 + std::time::Duration::from_secs(1), false),
+            None
+        );
+        assert_eq!(app.otp.rows[0].code, None);
+    }
+
+    /// The lock messages name the duration the lock actually uses.
+    #[test]
+    fn idle_lock_messages_name_the_lock_duration() {
+        assert_eq!(IDLE_LOCK_AFTER.as_secs(), 5 * 60);
+        assert_eq!(idle_lock_span(), "5 minutes");
+        assert_eq!(
+            idle_locked_msg(),
+            "Locked after 5 minutes of inactivity \u{2014} unlock again to continue."
+        );
+        assert_eq!(
+            idle_hidden_msg(),
+            "Codes hidden after 5 minutes of inactivity."
+        );
+    }
+
+    /// The panes re-read their codes every time window, each a short job.
+    /// Those reads must not count as activity, or codes left on screen
+    /// would never lock.
+    #[test]
+    fn idle_lock_is_not_kept_off_by_periodic_refreshes() {
+        let mut app = App::default();
+        app.otp.rows = vec![otp_row(Some("654321"))];
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        let window = std::time::Duration::from_secs(30);
+        let mut t = t0;
+        while t + window < t0 + IDLE_LOCK_AFTER {
+            t += window;
+            app.busy_jobs = 1;
+            app.idle_lock_tick(t, false);
+            app.busy_jobs = 0;
+            app.idle_lock_tick(t + std::time::Duration::from_millis(200), false);
+        }
+        assert!(app.otp.rows[0].code.is_some(), "not yet");
+        assert_eq!(app.idle_lock_tick(t0 + IDLE_LOCK_AFTER, false), None);
+        assert_eq!(app.otp.rows[0].code, None);
+    }
+
+    /// The clock starts when something is unlocked, not at the last click
+    /// before it: codes that appear after a long quiet spell (a key plugged
+    /// in, read on its own) get the full timeout.
+    #[test]
+    fn idle_lock_clock_starts_when_something_is_held() {
+        let mut app = App::default();
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, true);
+        // The frame that starts the read, long after the last input.
+        let t1 = t0 + IDLE_LOCK_AFTER * 3;
+        assert_eq!(app.idle_lock_tick(t1, false), None);
+        app.otp.rows = vec![otp_row(Some("654321"))];
+        let t2 = t1 + std::time::Duration::from_secs(1);
+        assert_eq!(
+            app.idle_lock_tick(t2, false),
+            Some(IDLE_LOCK_AFTER - std::time::Duration::from_secs(1))
+        );
+        assert!(app.otp.rows[0].code.is_some());
+    }
+
+    /// A code read with a touch is held like any other: it keeps the clock
+    /// running and is wiped by the lock, and the pane says why it went.
+    #[test]
+    fn idle_lock_wipes_touch_read_otp_codes() {
+        let mut app = App::default();
+        app.otp.rows = vec![otp_row(None)];
+        app.otp
+            .touch_codes
+            .insert(("Example".into(), "alice".into()), "112233".into());
+        assert!(app.holds_unlocked_secrets());
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        app.idle_lock_tick(t0 + IDLE_LOCK_AFTER, false);
+        assert!(app.otp.touch_codes.is_empty());
+        assert!(app
+            .otp
+            .info
+            .as_deref()
+            .is_some_and(|m| m.starts_with(&idle_hidden_msg())));
+        assert!(!app.holds_unlocked_secrets());
+    }
+
+    /// A window whose frames stopped while minimized locks on the first
+    /// frame back, even when that frame carries the click that restored it.
+    #[test]
+    fn idle_lock_fires_before_input_on_the_first_frame_back() {
+        let mut app = App::default();
+        app.otp.rows = vec![otp_row(Some("654321"))];
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        assert_eq!(app.idle_lock_tick(t0 + IDLE_LOCK_AFTER * 4, true), None);
+        assert_eq!(app.otp.rows[0].code, None);
+    }
+
+    /// A cached OTP PIN is dropped and the pane goes back to its PIN prompt.
+    #[test]
+    fn idle_lock_drops_a_cached_otp_pin() {
+        let mut app = App::default();
+        app.otp.pin = Some(zeroize::Zeroizing::new("1234".into()));
+        app.otp.rows = vec![otp_row(Some("654321"))];
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        app.idle_lock_tick(t0 + IDLE_LOCK_AFTER, false);
+        assert!(app.otp.pin.is_none());
+        assert!(app.otp.pin_required);
+        assert!(app.otp.rows.is_empty());
+        assert_eq!(app.otp.info.as_deref(), Some(idle_locked_msg().as_str()));
+    }
+
+    /// Only deliberate input postpones the lock: not window bookkeeping like
+    /// a focus change, and not the pointer merely moving over the window.
+    #[test]
+    fn user_activity_is_deliberate_input_only() {
+        assert!(is_user_activity(&egui::Event::Text("a".into())));
+        assert!(is_user_activity(&egui::Event::PointerButton {
+            pos: egui::pos2(1.0, 2.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }));
+        assert!(!is_user_activity(&egui::Event::PointerMoved(egui::pos2(
+            1.0, 2.0
+        ))));
+        assert!(!is_user_activity(&egui::Event::MouseMoved(egui::vec2(
+            1.0, 0.0
+        ))));
+        assert!(!is_user_activity(&egui::Event::WindowFocused(true)));
+        assert!(!is_user_activity(&egui::Event::PointerGone));
+    }
+
+    /// A listing clears the idle-lock notice, and keeps an HOTP code read on
+    /// demand (it doesn't expire; the listing never computes one).
+    #[test]
+    fn oath_listing_clears_the_notice_and_keeps_hotp_codes() {
+        let mut app = App::default();
+        app.oath.notice = Some(idle_hidden_msg());
+        app.oath.creds = vec![OathRow::new(
+            "Example:bob".into(),
+            Some("111111".into()),
+            true,
+        )];
+        let rows = vec![
+            OathRow::new("Example:bob".into(), None, true),
+            OathRow::new("Example:alice".into(), Some("222222".into()), false),
+        ];
+        App::apply_oath_rows(
+            &mut app,
+            Ok((rows, 0)),
+            zeroize::Zeroizing::new(String::new()),
+        );
+        assert_eq!(app.oath.notice, None);
+        assert_eq!(app.oath.creds[0].code.as_deref(), Some("111111"));
+        assert_eq!(app.oath.creds[1].code.as_deref(), Some("222222"));
+    }
+
+    /// TOTP rows that needed a touch stay marked across a listing, and only
+    /// they are handed to the next listing to leave alone, so the per-window
+    /// re-read never waits for a touch.
+    #[test]
+    fn oath_touch_rows_are_left_to_on_request_reads() {
+        let mut app = App::default();
+        let mut touch = OathRow::new("Example:touchy".into(), None, false);
+        touch.touch = true;
+        let rows = vec![
+            OathRow::new("Example:alice".into(), Some("222222".into()), false),
+            touch,
+            OathRow::new("Example:bob".into(), None, true),
+        ];
+        App::apply_oath_rows(
+            &mut app,
+            Ok((rows, 0)),
+            zeroize::Zeroizing::new(String::new()),
+        );
+        assert!(app.oath.creds[1].touch);
+        assert_eq!(app.oath_touch_names(), vec!["Example:touchy".to_string()]);
+    }
+
+    /// Every Refresh button rescans and then re-reads the open tab: the click
+    /// queues the scan burst and marks the re-read for when the scan lands.
+    #[test]
+    fn refresh_rescans_and_queues_a_reread_of_the_open_tab() {
+        let mut app = App::default();
+        app.user_refresh();
+        assert_eq!(app.pending_scans, 4);
+        assert!(app.reread_after_scan);
+    }
+
     /// The HOTP-read regression: a successful listing consumes the typed
     /// password but retains the accepted copy, so a later on-demand HOTP
     /// read can still unlock the protected applet.
@@ -28385,7 +29090,7 @@ mod tests {
             Some("hunter2"),
             "the accepted password is retained for on-demand reads"
         );
-        // …which is exactly what read_hotp_code will now pick up:
+        // …which is exactly what read_code_on_request will now pick up:
         assert_eq!(&*oath_effective_password(&app.oath), "hunter2");
     }
 

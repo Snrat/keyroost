@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use keyroost_transport::{OtpTransportError, Token2OtpSession};
 
 use crate::ui::theme::{self, BtnKind, Palette};
-use crate::{now_secs_f64, wipe, App};
+use crate::{wipe, App};
 
 /// Which transport the OTP pane should use. Mirrors the CLI `--transport` flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -514,6 +514,14 @@ impl App {
                 }
             })
         });
+    }
+
+    /// Read the pane again from scratch: forget the transport and serial the
+    /// last read settled on, then list. The pane's part of a Refresh.
+    pub(crate) fn refresh_otp(&mut self) {
+        self.otp.active = None;
+        self.otp.serial = None;
+        self.load_otp_entries();
     }
 
     /// List entries on the selected key over the chosen transport.
@@ -1673,9 +1681,7 @@ impl App {
                 }
                 ui.add_space(6.0);
                 if theme::button(ui, p, BtnKind::Default, "Refresh").clicked() {
-                    self.otp.active = None;
-                    self.otp.serial = None;
-                    self.load_otp_entries();
+                    self.user_refresh();
                 }
             });
         });
@@ -1950,8 +1956,7 @@ impl App {
         });
 
         if let Some(code) = copy {
-            ui.ctx().copy_text(code.clone());
-            self.clipboard_clear_at = Some((code, now_secs_f64() + 45.0));
+            self.copy_secret(ui.ctx(), code);
         }
         if let Some((a, acct)) = delete {
             self.otp.confirm_delete = Some((a, acct));
