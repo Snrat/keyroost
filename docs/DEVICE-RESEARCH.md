@@ -10,8 +10,8 @@ Hardware in play (all on hand): Token2 Molto2 (`349e:0300`), YubiKey 5
 Nothing here is "incoming" any more — the Solo 2 carried the first successful
 FIDO F1–F5 run (`docs/BRINGUP.md`), and the two-YubiKey case is what the
 correlation work was verified against. Token2 PIN+ / FIDO2+ coverage
-comes from the vendor rather than this bench. An OnlyKey is on order — see the
-identity note below; it is the interesting case.
+comes from the vendor rather than this bench. No OnlyKey is on this bench — see the identity
+note below; it is the interesting case.
 
 - **Thread A — Device identity** (for local "friendly names"). Narrow, technical,
   has a privacy gate.
@@ -46,7 +46,7 @@ and **without undermining the key's anti-tracking design**.
 | **Molto2** | `DeviceInfo.serial` (read on connect) | **Works** — stable, per-unit, no extra read, no write. |
 | **FIDO (any)** | `HidDevice` path/vid/pid/name | `path` not stable across re-plug; vid:pid per-model; no serial. |
 | **FIDO (any)** | CTAP `AuthenticatorInfo.aaguid` | **Per-model, not per-unit** — useless for two identical keys. |
-| **OnlyKey** | USB iSerial | **Unusable as identity** — the firmware reports a fixed serial (`1000000000`) on *every* unit (issue #37; the README roadmap records it as "fixed, non-unique"). FIDO-HID only, no CCID interface, so no serial fallback either. Not yet on the bench — vendor/device-survey fact, not one of our captures. |
+| **OnlyKey** | USB iSerial | **Unusable as identity** — the firmware reports a fixed serial (`1000000000`) on *every* unit (issue #37; the README roadmap records it as "fixed, non-unique"). FIDO-HID only, no CCID interface, so no serial fallback either. Not on the bench — vendor/device-survey fact, not one of our captures. |
 
 **A serial is not automatically a per-unit ID.** The OnlyKey row is the
 counterexample that constrains E1: a candidate that is stable across re-plug can
