@@ -169,12 +169,12 @@ fn card_vendor(openpgp_manufacturer: Option<u16>, reader_name: &str) -> String {
 }
 
 /// Map a USB vendor id to a display name; unknown ids fall back to a generic label.
-fn vendor_name(vid: u16) -> &'static str {
+pub fn vendor_name(vid: u16) -> &'static str {
     match vid {
         0x1050 => "Yubico",
         0x20a0 => "Nitrokey",
         0x1209 => "SoloKeys",
-        0x096e | 0x311f => "Feitian",
+        0x096e => "Feitian",
         0x2581 => "Kanokey",
         0x349e => "Token2",
         0x1e0d => "OpenSK",
@@ -2248,6 +2248,8 @@ mod tests {
         assert_eq!(vendor_name(0x1209), "SoloKeys");
         assert_eq!(vendor_name(0x349e), "Token2");
         assert_eq!(vendor_name(0xffff), "Security key");
+        // 0x311F is not Feitian's (re #195: a TrustKey key was named Feitian).
+        assert_eq!(vendor_name(0x311f), "Security key");
     }
 
     #[test]

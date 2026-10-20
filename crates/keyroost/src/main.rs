@@ -9052,7 +9052,7 @@ impl App {
                                     devices.push(Device {
                                         id: format!("winfido:{vid:04x}:{pid:04x}:{i}"),
                                         name: None,
-                                        vendor: format!("{vid:04X}"),
+                                        vendor: keyroost_resolve::vendor_name(vid).to_string(),
                                         model,
                                         serial: String::new(),
                                         transport: "USB · FIDO HID (admin required)".into(),
