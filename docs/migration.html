@@ -61,6 +61,74 @@
 
 <main class="kr-wrap">
 
+  <section class="kr-section" id="v0-14-0">
+    <h2>v0.14.0</h2>
+    <p>One command changes: <code>openpgp key import --generate</code> now
+      makes a full OpenPGP key set and saves it before writing the card, so it
+      needs <code>--backup FILE</code> and <code>--name</code>. In the app,
+      <em>Generate &amp; import</em> is replaced by <em>Create keys with a
+      backup&hellip;</em>. The macOS builds now need macOS 11 (Big Sur) or
+      newer. Library consumers: <code>keyroost-hid</code> and
+      <code>keyroost-transport</code> replace the USB bus and address fields
+      with one <code>usb_device</code> field, and
+      <code>keyroost-rsakey</code> drops <code>generate_2048</code> (see the
+      table at the end).</p>
+    <h3>CLI</h3>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Before</th><th>Now</th></tr>
+      <tr><td><code>openpgp key import --generate [--slot sign|decrypt|auth]</code>:
+          one RSA-2048 key made on the computer, loaded into one slot, then
+          discarded</td>
+        <td><code>openpgp key import --generate --backup FILE --name NAME
+          [--email EMAIL] [--algorithm TYPE] [--expires WHEN]</code>: a
+          signing key with decryption and authentication subkeys, saved as
+          <code>FILE.asc</code> (passphrase-protected backup),
+          <code>FILE.pub.asc</code> and <code>FILE.rev.asc</code>, then loaded
+          into all three slots. <code>--slot</code> now goes with
+          <code>--in</code> only; without <code>--backup</code> or
+          <code>--name</code> the command is refused before the card is
+          touched.</td></tr>
+      <tr><td><code>openpgp key import --in FILE</code> with an RSA key file</td>
+        <td>Unchanged (into <code>sign</code> unless <code>--slot</code>);
+          <code>--in</code> also restores a keyroost or GnuPG backup into
+          every slot it has a key for.</td></tr>
+    </table>
+    </div>
+    <h3>Library (crates.io) API changes</h3>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Crate</th><th>Change</th></tr>
+      <tr><td><code>keyroost-hid</code></td>
+        <td><code>HidDevice</code>'s <code>usb_bus</code> and
+          <code>usb_address</code> are replaced by
+          <code>usb_device: Option&lt;UsbDeviceKey&gt;</code>
+          (<code>BusAddr(bus, address)</code> on Linux, <code>WinNode</code>
+          on Windows). Compare two with <code>same_usb_device</code>;
+          <code>UsbDeviceKey::from_bus_addr</code> builds the Linux one.</td></tr>
+      <tr><td><code>keyroost-transport</code></td>
+        <td>The same change on <code>ReaderProbe</code> and
+          <code>YubiKeyCcid</code>: <code>usb_bus</code> /
+          <code>usb_address</code> become <code>usb_device</code>.
+          <code>ReaderProbe</code> also gains <code>usb_product</code> (the
+          USB product string, when Windows reports it).</td></tr>
+      <tr><td><code>keyroost-rsakey</code></td>
+        <td><code>generate_2048</code> is removed. Loading a key file
+          (<code>load_from_file</code>) is unchanged, now for 2048, 3072 and
+          4096 bits. To make keys, use the new <code>keyroost-pgpkey</code>
+          crate (<code>cert::create</code>).</td></tr>
+      <tr><td><code>keyroost-resolve</code></td>
+        <td>New, additive: <code>vendor_name</code> (the display name for a
+          USB vendor ID).</td></tr>
+      <tr><td>New crates</td>
+        <td><code>keyroost-pgpkey</code> (OpenPGP key sets, backups, restore,
+          expiry) and <code>keyroost-windevtree</code> (Windows device-tree
+          reads, used by <code>keyroost-hid</code> and
+          <code>keyroost-transport</code> on Windows).</td></tr>
+    </table>
+    </div>
+  </section>
+
   <section class="kr-section" id="v0-13-0">
     <h2>v0.13.0</h2>
     <p>Every command now finds its key the same way, and more commands ask

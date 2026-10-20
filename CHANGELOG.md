@@ -6,6 +6,118 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-19
+
+### Added
+- **Create OpenPGP keys with a backup.** One step makes the signature,
+  decryption and authentication keys, saves them to a passphrase-protected
+  backup that GnuPG can read, writes your public key and a revocation
+  certificate beside it, and loads the keys onto the card. In the app it is
+  **Create keys with a backup…** on the OpenPGP card; on the command line,
+  `keyroostctl openpgp key import --generate --backup FILE`. ([#177])
+- **Restore a backup** onto a new or reset card, from a keyroost backup or a
+  GnuPG export (`keyroostctl openpgp key import --in FILE`).
+- **Change expiry date** on a key set, signed with the card or the backup;
+  *Never* removes the date. New keys default to three years, as in GnuPG.
+- **More key types** for backups: RSA-2048/3072/4096, NIST P-256/384/521,
+  secp256k1 and Curve 25519. Brainpool keys can still be made on the card.
+- The old *Generate & import* option, which made a key on the computer and
+  discarded it after loading, is gone; use *Create keys with a backup* or
+  *Generate on-card*. On the command line, `openpgp key import --generate`
+  now needs `--backup FILE` and `--name`, fills all three slots, and no
+  longer takes `--slot`. The migration page has the details.
+
+### Changed
+- **Fewer round trips for PIV admin actions on keys without GET METADATA.**
+  On keys that don't report their management key's algorithm, the app
+  tried all four algorithms before every action that needs it. It now
+  remembers the answer while the key stays plugged in and checks it with one
+  request (two for AES-192), falling back to the full check whenever that
+  could choose differently. ([#113])
+- **A tidier, more adaptable window.** Theme, colorblind-friendly colors and
+  text size now live in one Appearance menu, so the top bar no longer
+  overlaps; the device list shrinks to a rail of key icons when space runs
+  short; and every pane stays inside the window at large text sizes.
+  Switching between OpenPGP keys, PIV slots and FIDO2 tabs now visibly
+  lands, with the open tab joined to its card. ([#176])
+- **The Windows app draws with DirectX 12.** It now opens on computers
+  without OpenGL 2.0, such as virtual machines without 3D acceleration and
+  some remote-desktop sessions, where it couldn't start before. If DirectX
+  12 doesn't work, it falls back to OpenGL. Linux and macOS are unchanged.
+  ([#185])
+- **Less CPU while codes are counting down.** The app now redraws once a
+  second for countdowns instead of twice, which matters most on machines
+  without a GPU, where drawing is done in software. ([#190])
+- **Every Refresh button does the same thing.** The top-bar Refresh, the
+  sidebar's rescan icon and the Refresh on the Authenticator, PIV and OTP
+  tabs now all look for keys again and then re-read the open tab of the
+  selected key (on a Molto2, its slot list). Before, the top-bar Refresh
+  only rescanned, so an account added with `keyroostctl` while the app was
+  open didn't show up until the key was replugged or the app restarted.
+  ([#190])
+
+### Fixed
+- **One row per key on Windows, even with two keys of the same make.** A key's
+  FIDO interface and its smart-card reader are now recognized as one physical
+  key from where both sit in the Windows device tree, the same evidence Linux
+  gets from the USB bus. Neither the key nor the card is opened to find out.
+  Under `--debug`, `keyroostctl list` prints what Windows reported for each
+  key (`devtree` lines). Library users: `usb_bus` / `usb_address` on
+  `HidDevice`, `ReaderProbe` and `YubiKeyCcid` are replaced by one
+  `usb_device` field. Keys are also named properly there: "YubiKey" rather
+  than "YubiKey 0", and "Solo 2" rather than "0". ([#51])
+- **The Molto2's serial stays in the app's header.** After any device
+  rescan (Refresh, or plugging in another key) the header showed "#—" and
+  dropped the token's saved name until it was selected again. Reported by
+  @janschmidt76. ([#125])
+- **Windows: the zip runs on a fresh install, and says why when it can't.**
+  The programs no longer need the Visual C++ runtime installed. If the
+  computer's graphics can't run the app's window, a message explains it
+  instead of the app silently closing. Without administrator rights,
+  `keyroostctl list` and `doctor` now say when a FIDO key is plugged in
+  but only an administrator can open it. ([#184])
+- **macOS fixes from a macOS test.** `keyroostctl doctor` no longer reports
+  every FIDO key as "No such file or directory" on macOS and Windows: it
+  now opens each key the same way `fido info` does. Scanning a QR code from
+  the screen on macOS covers every display instead of only the main one,
+  and the screenshots go in a private temporary folder that is always
+  removed afterwards. Smart-card readers plugged in after the app started
+  are now noticed where the system doesn't announce new readers (as on
+  macOS). The macOS builds now state their minimum: macOS 11 (Big Sur) or
+  newer. The PIV page records that macOS's built-in PIV support read a
+  compressed certificate. ([#188])
+- **FIDO-only keys appear when plugged in.** The app noticed new keys only
+  through their smart-card reader, so a key with just FIDO (no smart-card
+  interface) showed up or disappeared only after Refresh. It now watches
+  the FIDO key list too and rescans when a key comes or goes. ([#189])
+- **Authenticator codes no longer go stale on screen.** The codes on the
+  Authenticator tab and the Overview are read again when their time window
+  rolls over, as the OTP tab already did; before, a code stayed up past its
+  window while the countdown kept cycling. A code read on demand for a
+  counter-based (HOTP) account stays shown across these refreshes. An
+  account that requires a touch gets a **Read code** button instead of being
+  re-read each window, so the key doesn't wait for a touch every 30 seconds
+  and the other accounts' new codes aren't held back meanwhile. ([#190])
+- **Authenticator accounts that require a touch can be added again.** The
+  "require touch" setting was sent in a form YubiKeys refuse, so adding such
+  an account (`oath add --touch`, or the touch option in the app) failed
+  with `SW=6A80`. It now uses the layout the YubiKey accepts and the Trussed
+  firmware source reads. ([#190])
+- **Keys with USB vendor ID 0x311F are no longer labeled Feitian.** That ID
+  was filed under Feitian by mistake, so other makers' keys showed the wrong
+  brand; they now show the generic "Security key" until their maker is
+  known. On Windows without administrator rights, a FIDO-only key's card
+  showed its raw vendor ID instead of a name; it now uses the same names as
+  everywhere else. Reported by @Ephemera42. ([#195])
+
+### Security
+- **The app locks itself after 5 minutes without input.** An unlocked FIDO
+  key, a remembered Authenticator password or OTP PIN, and the codes on
+  screen are cleared once the window has had no click, key press or scroll
+  for 5 minutes, and the pane says so. A running operation is never
+  interrupted. Copied codes and generated management keys are now marked to
+  stay out of clipboard history on macOS, Windows and X11. ([#190])
+
 ## [0.13.0] - 2026-10-10
 
 ### Added
@@ -1626,7 +1738,16 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#167]: https://github.com/framefilter/keyroost/issues/167
 [#170]: https://github.com/framefilter/keyroost/issues/170
 [#171]: https://github.com/framefilter/keyroost/issues/171
-[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.13.0...HEAD
+[#176]: https://github.com/framefilter/keyroost/issues/176
+[#177]: https://github.com/framefilter/keyroost/issues/177
+[#184]: https://github.com/framefilter/keyroost/issues/184
+[#185]: https://github.com/framefilter/keyroost/issues/185
+[#188]: https://github.com/framefilter/keyroost/issues/188
+[#189]: https://github.com/framefilter/keyroost/issues/189
+[#190]: https://github.com/framefilter/keyroost/issues/190
+[#195]: https://github.com/framefilter/keyroost/issues/195
+[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/framefilter/keyroost/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/framefilter/keyroost/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/framefilter/keyroost/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/framefilter/keyroost/compare/v0.10.0...v0.11.0
