@@ -66,10 +66,6 @@ Being worked on right now — check with whoever holds it before starting.
   AppImageHub-style failures (AppImage/appimage.github.io#9258) show up on
   the packaging probe, not after a release. (S–M)
 
-- **Retake the screenshots after the v0.14.0 GUI pass.** The Learn site's
-  `docs/assets/screenshots/` and the metainfo `<screenshots>` still show the
-  layout from before #176. (S)
-
 - **Duplicate keys on Windows with two identical keys ([#51](https://github.com/framefilter/keyroost/issues/51), reopened) — device-tree pairing shipped in v0.14.0; awaiting a Windows run with two Token2 PIN+ keys.**
   On Windows, keyroost pairs a key's two halves from where both sit in the
   device tree. Identity matching (v0.13.0) remains the fallback there and
