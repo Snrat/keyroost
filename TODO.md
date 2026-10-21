@@ -114,7 +114,7 @@ Being worked on right now — check with whoever holds it before starting.
 
 - **OnlyKey recognition
   ([#37](https://github.com/framefilter/keyroost/issues/37), filed as "serial
-  number detection on hardware keys") — blocked on hardware** (units ordered).
+  number detection on hardware keys") — needs testing on an OnlyKey.**
   Teach `keyroost-resolve` to recognize `1d50:60fc` / product `ONLYKEY`, label it
   "OnlyKey", and treat serial `1000000000` as a non-unique placeholder (fall
   back to the hidraw path). Today OnlyKey appears only in the GUI AAGUID table.
@@ -197,6 +197,22 @@ plan's two-key manual steps were never executed):
 ---
 
 ## Deferred to a later release
+
+- **Keep copied codes out of clipboard history on native Wayland** (after
+  v0.15). Copies are marked `x-kde-passwordManagerHint=secret` on X11 and
+  with the platform markers on Windows and macOS, but on native Wayland they
+  go through egui's own clipboard, which can't add the marker. arboard's
+  `wayland-data-control` feature would (9 more crates, among them
+  `wl-clipboard-rs` and a MIME sniffer); it needs a compositor with a
+  data-control protocol. Research (2026-10-20, primary sources): KDE Plasma
+  (ext-data-control since 6.4; Klipper honors the hint), COSMIC (both
+  protocols since 1.0), Sway 1.11+ and Hyprland have it; GNOME's Mutter does
+  not and its developers have said they won't add it
+  ([mutter#3941](https://gitlab.gnome.org/GNOME/mutter/-/issues/3941)), so
+  arboard falls back to X11 through XWayland there. COSMIC, Sway and (from a
+  coming Plasma release) KDE withhold data-control from sandboxed apps, so the
+  Flatpak would get the fallback too. Until then, `KEYROOST_X11=1` runs the
+  app under X11, where the marker already works. (M)
 
 - **Submit keyroost to Flathub** — deferred, not ruled out; not in v0.14.0.
   The maintainer submits it himself. Flathub's generative-AI
