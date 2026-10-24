@@ -337,6 +337,20 @@ pub enum PivExtension {
     /// [`FeatureGate::Unsupported`], since only HID Crescendo's XAUTH key can
     /// be removed outright rather than only ever replaced.
     ManagementKeyAlgorithm(MgmtAlgChoice),
+    /// Whether a given [`crate::KeyAlg`] can be imported into a slot as an
+    /// existing private key (from a PKCS#12 file, say) rather than generated
+    /// on the device — same plain payload-free-per-value shape as
+    /// [`Self::SlotKeyAlgorithm`], and never more permissive than it: where
+    /// generating the algorithm is [`FeatureGate::Unsupported`], so is
+    /// importing it ([`resolve`] enforces that). A YubiKey resolves exactly
+    /// as its [`Self::SlotKeyAlgorithm`] does, since import shares the card's
+    /// algorithm support; a Nitrokey (Trussed `piv-authenticator`) imports
+    /// RSA-2048/3072/4096 only; other fingerprints have no import data of
+    /// their own and resolve [`FeatureGate::Unverified`] unless generation is
+    /// known unsupported. Says nothing about which slots accept an import —
+    /// see [`import_slot_allowed`] — or which key layout the applet expects —
+    /// see [`import_layout`].
+    ImportKey(KeyAlg),
 }
 
 impl PivExtension {
@@ -413,6 +427,9 @@ impl PivExtension {
             }
             PivExtension::SlotKeyAlgorithm(alg) => {
                 format!("Not every key can generate {} keys.", alg.label())
+            }
+            PivExtension::ImportKey(alg) => {
+                format!("Not every key can import {} keys.", alg.label())
             }
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Delete) => {
                 "Deleting the management key outright uses the device's own command (e.g. \
@@ -2295,6 +2312,18 @@ const HID_CRESCENDO_C2300_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 ///   family has never attempted to mimic a Yubico extension APDU, and GET PIV
 ///   PROPERTIES / INJECT PKI KEY carry no PIN/touch-policy fields of their
 ///   own to stand in for these two.
+/// * [`PivExtension::ImportKey`] — `Verdict::KnownUnsupportedSince` for
+///   every [`crate::KeyAlg`] at the universal `[]` version, on the same
+///   standing-pattern reasoning: keyroost imports a key with Yubico's IMPORT
+///   ASYMMETRIC KEY extension (`INS FEh`), while HID documents its own
+///   INJECT PKI KEY (`INS D8h`,
+///   <https://docs.hidglobal.com/crescendo/api/low-level/inject-pki-key.htm>)
+///   for this, which keyroost doesn't implement. Not confirmed on hardware.
+///   Refusing up front keeps the slot as it was: the import writes the
+///   certificate before the key. Shared with
+///   `HID_CRESCENDO_C4000_APPLET_VERDICTS` and
+///   [`HID_CRESCENDO_GENERIC_APPLET_VERDICTS`], as the pattern is the
+///   vendor's, not one model's.
 /// * [`PivExtension::SlotKeyAlgorithm`] — C2300's own GENERATE KEY PAIR
 ///   reference
 ///   (<https://docs.hidglobal.com/crescendo/api/low-level/generate-key-pair.htm>)
@@ -2340,6 +2369,15 @@ const HID_CRESCENDO_C2300_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
             PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
             PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+            PivExtension::ImportKey(KeyAlg::Rsa1024),
+            PivExtension::ImportKey(KeyAlg::Rsa2048),
+            PivExtension::ImportKey(KeyAlg::Rsa3072),
+            PivExtension::ImportKey(KeyAlg::Rsa4096),
+            PivExtension::ImportKey(KeyAlg::EccP256),
+            PivExtension::ImportKey(KeyAlg::EccP384),
+            PivExtension::ImportKey(KeyAlg::EccP521),
+            PivExtension::ImportKey(KeyAlg::Ed25519),
+            PivExtension::ImportKey(KeyAlg::X25519),
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
         ],
@@ -2437,9 +2475,11 @@ const HID_CRESCENDO_C4000_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::MergeR
 /// * [`PivExtension::ResetGlobal`]'s RESET CARD reference
 ///   (<https://docs.hidglobal.com/crescendo/api/c4000/reset-card.htm>) is
 ///   C4000's own page, distinct from (but equivalent to) C2300's.
-/// * [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] — same
-///   `Verdict::KnownUnsupportedSince` row as
-///   `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s — see its doc.
+/// * [`PivExtension::SlotPinPolicy`]/[`PivExtension::SlotTouchPolicy`] and
+///   [`PivExtension::ImportKey`] — same `Verdict::KnownUnsupportedSince` row
+///   as `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s — see its doc (C4000's own
+///   INJECT PKI KEY page:
+///   <https://docs.hidglobal.com/crescendo/api/c4000/inject-pki-key.htm>).
 /// * [`PivExtension::SlotKeyAlgorithm`] — unlike every row above, this one
 ///   *is* confirmed from C4000's own dedicated reference rather than assumed
 ///   from C2300's:
@@ -2487,6 +2527,15 @@ const HID_CRESCENDO_C4000_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
             PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
             PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+            PivExtension::ImportKey(KeyAlg::Rsa1024),
+            PivExtension::ImportKey(KeyAlg::Rsa2048),
+            PivExtension::ImportKey(KeyAlg::Rsa3072),
+            PivExtension::ImportKey(KeyAlg::Rsa4096),
+            PivExtension::ImportKey(KeyAlg::EccP256),
+            PivExtension::ImportKey(KeyAlg::EccP384),
+            PivExtension::ImportKey(KeyAlg::EccP521),
+            PivExtension::ImportKey(KeyAlg::Ed25519),
+            PivExtension::ImportKey(KeyAlg::X25519),
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
         ],
@@ -2549,7 +2598,8 @@ const HID_CRESCENDO_GENERIC_AXIS_MERGE_MODE: AxisMergeMode = AxisMergeMode::Merg
 ///
 /// * [`PivExtension::MoveKey`], [`PivExtension::Reset`],
 ///   [`PivExtension::SetPinPukRetries`], [`PivExtension::SlotPinPolicy`],
-///   [`PivExtension::SlotTouchPolicy`] — share one row:
+///   [`PivExtension::SlotTouchPolicy`], [`PivExtension::ImportKey`] — share
+///   one row:
 ///   `Verdict::KnownUnsupportedSince` at the universal `[]` version, shared
 ///   with `HID_CRESCENDO_C2300_APPLET_VERDICTS`/`HID_CRESCENDO_C4000_APPLET_VERDICTS`:
 ///   the reasoning ("never implements a Yubico extension APDU, always ships
@@ -2593,6 +2643,15 @@ const HID_CRESCENDO_GENERIC_APPLET_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SetPinPukRetries,
             PivExtension::SlotPinPolicy,
             PivExtension::SlotTouchPolicy,
+            PivExtension::ImportKey(KeyAlg::Rsa1024),
+            PivExtension::ImportKey(KeyAlg::Rsa2048),
+            PivExtension::ImportKey(KeyAlg::Rsa3072),
+            PivExtension::ImportKey(KeyAlg::Rsa4096),
+            PivExtension::ImportKey(KeyAlg::EccP256),
+            PivExtension::ImportKey(KeyAlg::EccP384),
+            PivExtension::ImportKey(KeyAlg::EccP521),
+            PivExtension::ImportKey(KeyAlg::Ed25519),
+            PivExtension::ImportKey(KeyAlg::X25519),
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes256),
         ],
@@ -3121,23 +3180,45 @@ const TRUSSED_NITROKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdic
 ///   live unit at firmware 1.8.3 accepting all four, PIN VERIFY unlocking
 ///   management included.
 /// * [`PivExtension::SetPinPukRetries`], [`PivExtension::MoveKey`],
-///   [`PivExtension::DeleteKey`], [`PivExtension::Attest`],
-///   [`PivExtension::SlotPinPolicy`], [`PivExtension::SlotTouchPolicy`] —
+///   [`PivExtension::DeleteKey`], [`PivExtension::Attest`] —
 ///   `Verdict::KnownUnsupported` pinned to exactly the version keyroost has
 ///   evidence for, firmware 1.8.3 (`[1, 8, 3]`): a live unit there rejects
-///   all six, corroborated for the two policy rows by the Trussed
-///   `piv-authenticator` source itself
-///   (<https://github.com/trussed-dev/piv-authenticator>), which implements
-///   no `0xAA`/`0xAB` handling on GENERATE ASYMMETRIC KEYPAIR. Per
-///   `Verdict::KnownUnsupported`'s backward-extension rule this is assumed
-///   to also hold at every earlier, untested version — including 1.8 itself —
-///   without a separate `[1, 8]` entry on these rows; the single `[1, 8, 3]`
-///   verdict already covers both. A firmware newer than 1.8.3 with no verdict
-///   of its own softens to [`FeatureGate::Unverified`] rather than staying
-///   `Unsupported`, since a later firmware may have added any of these six —
-///   unlike [`PivExtension::ResetGlobal`]'s `Verdict::KnownUnsupportedSince`
-///   row above, which has a standing reason (this vendor's own architecture)
-///   to expect it never comes back.
+///   all four. Per `Verdict::KnownUnsupported`'s backward-extension rule this
+///   is assumed to also hold at every earlier, untested version — including
+///   1.8 itself — without a separate `[1, 8]` entry on these rows; the single
+///   `[1, 8, 3]` verdict already covers both. A firmware newer than 1.8.3
+///   with no verdict of its own softens to [`FeatureGate::Unverified`] rather
+///   than staying `Unsupported`, since a later firmware may have added any of
+///   these — unlike [`PivExtension::ResetGlobal`]'s
+///   `Verdict::KnownUnsupportedSince` row above, which has a standing reason
+///   (this vendor's own architecture) to expect it never comes back.
+/// * [`PivExtension::SlotPinPolicy`], [`PivExtension::SlotTouchPolicy`] —
+///   `Verdict::KnownUnsupported` at firmware 1.9.1 (`[1, 9, 1]`), the newest
+///   release whose source was read; the backward rule covers every older
+///   firmware. From the Trussed `piv-authenticator` source
+///   (<https://github.com/trussed-dev/piv-authenticator>), mapped to firmware
+///   through the `nitrokey-3-firmware` `Cargo.lock`
+///   (<https://github.com/Nitrokey/nitrokey-3-firmware>: 1.7.0-1.7.2 ship
+///   0.3.4, 1.8.0 0.3.8, 1.8.1 0.3.9, 1.8.2/1.8.3 0.5.3, 1.9.0/1.9.1 0.7.0):
+///   * 0.3.8 through 0.7.0 (firmware 1.8.0-1.9.1) accept tags `0xAA`/`0xAB`
+///     and ignore them. GENERATE reads its template with
+///     `tlv::get_do(&[0xAC, 0x80])`, which skips tags it doesn't ask for
+///     (v0.7.0 `src/lib.rs` line 866, v0.5.3 line 878); IMPORT (`INS FE`)
+///     looks up only `0x01`/`0x02`/`0x03` (v0.7.0 `src/lib.rs` lines
+///     1076-1078). The stored key record (`KeyWithAlg`) has no policy field,
+///     so a per-key policy can't be kept. The PIN rule is fixed per slot
+///     (`container.rs` lines 163-171): 9C asks for the PIN before each use,
+///     9E and 9B never, every other slot once per session; no code path asks
+///     for a touch.
+///   * 0.3.4 (firmware 1.7.x) parses the template strictly
+///     (`derp::nested`), so GENERATE with a policy tag fails with
+///     IncorrectDataParameter (`6A80` by the usual mapping).
+///
+///   A live unit at firmware 1.8.3 was earlier recorded as rejecting the
+///   policy tags. The source above says 1.8.x/1.9.x accept and ignore them,
+///   so that observation may have come from something else and needs a
+///   recheck on hardware. The verdict is "not supported" either way: the
+///   device never applies a requested policy.
 /// * [`PivExtension::SlotKeyAlgorithm`] — RSA-2048, RSA-4096, and ECC P-256
 ///   are supported on every firmware keyroost has evidence for, pre-1.8.2 and
 ///   1.8.2-and-later alike: one `Verdict::KnownSupported` row at the
@@ -3160,6 +3241,14 @@ const TRUSSED_NITROKEY_APPLET_VERDICTS: &[ExtensionVerdicts] = &[ExtensionVerdic
 ///   `Verdict::KnownUnsupportedSince` at the universal `[]` version — the
 ///   same closed-enumeration reasoning `HID_CRESCENDO_C2300_APPLET_VERDICTS`'s
 ///   own row uses.
+///
+/// * [`PivExtension::ImportKey`] — RSA-2048/3072/4096 `Verdict::KnownSupported`
+///   at firmware `[1, 8]` (piv-authenticator >= 0.3.6) and
+///   `Verdict::KnownUnsupported` below it; every other algorithm
+///   `Verdict::KnownUnsupportedSince` at `[]`. Source-verified in
+///   piv-authenticator's `import_asymmetric_key`; RSA-2048 into 9A is
+///   hardware-verified on firmware 1.9.1, RSA-3072/4096 not yet.
+///   [`resolve`] additionally clamps import to the `SlotKeyAlgorithm` verdict.
 const TRUSSED_NITROKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
     ExtensionVerdicts {
         extensions: &[
@@ -3168,11 +3257,40 @@ const TRUSSED_NITROKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::SlotKeyAlgorithm(KeyAlg::EccP521),
             PivExtension::SlotKeyAlgorithm(KeyAlg::Ed25519),
             PivExtension::SlotKeyAlgorithm(KeyAlg::X25519),
+            PivExtension::ImportKey(KeyAlg::Rsa1024),
+            PivExtension::ImportKey(KeyAlg::EccP256),
+            PivExtension::ImportKey(KeyAlg::EccP384),
+            PivExtension::ImportKey(KeyAlg::EccP521),
+            PivExtension::ImportKey(KeyAlg::Ed25519),
+            PivExtension::ImportKey(KeyAlg::X25519),
         ],
         verdicts: &[VersionVerdict {
             version: &[],
             verdict: Verdict::KnownUnsupportedSince,
         }],
+    },
+    // `piv-authenticator`'s import command (`import_asymmetric_key`, since
+    // 0.3.6, first shipped in firmware 1.8) takes RSA-2048/3072/4096 only, in
+    // slot 9A only — source-verified; RSA-2048 hardware-verified on 1.9.1. Firmware
+    // before 1.8 has no import command at all (source-verified), hence the
+    // `[]` `KnownUnsupported` below it. Every other `ImportKey` algorithm is
+    // in the row above.
+    ExtensionVerdicts {
+        extensions: &[
+            PivExtension::ImportKey(KeyAlg::Rsa2048),
+            PivExtension::ImportKey(KeyAlg::Rsa3072),
+            PivExtension::ImportKey(KeyAlg::Rsa4096),
+        ],
+        verdicts: &[
+            VersionVerdict {
+                version: &[],
+                verdict: Verdict::KnownUnsupported,
+            },
+            VersionVerdict {
+                version: &[1, 8],
+                verdict: Verdict::KnownSupported,
+            },
+        ],
     },
     ExtensionVerdicts {
         extensions: &[
@@ -3198,13 +3316,22 @@ const TRUSSED_NITROKEY_FIRMWARE_VERDICTS: &[ExtensionVerdicts] = &[
             PivExtension::MoveKey,
             PivExtension::DeleteKey,
             PivExtension::Attest,
-            PivExtension::SlotPinPolicy,
-            PivExtension::SlotTouchPolicy,
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes128),
             PivExtension::ManagementKeyAlgorithm(MgmtAlgChoice::Aes192),
         ],
         verdicts: &[VersionVerdict {
             version: &[1, 8, 3],
+            verdict: Verdict::KnownUnsupported,
+        }],
+    },
+    // PIN and touch policies: ignored (1.8.0-1.9.1) or refused (1.7.x) per
+    // the piv-authenticator source, never applied — see this const's doc.
+    // Pinned to the newest firmware read; older ones follow by the backward
+    // rule, a newer one softens to `Unverified`.
+    ExtensionVerdicts {
+        extensions: &[PivExtension::SlotPinPolicy, PivExtension::SlotTouchPolicy],
+        verdicts: &[VersionVerdict {
+            version: &[1, 9, 1],
             verdict: Verdict::KnownUnsupported,
         }],
     },
@@ -3667,6 +3794,25 @@ pub fn resolve(
     applet_version: Option<&[u8]>,
     firmware_version: Option<&[u8]>,
 ) -> FeatureGate {
+    // Importing a key is never more permissive than generating one: where
+    // generation is known unsupported, so is import, whatever rows (or lack
+    // of them) the fingerprint carries. A YubiKey shares the card's algorithm
+    // support exactly, so it resolves as generation does and carries no
+    // `ImportKey` rows that could drift from its `SlotKeyAlgorithm` ones.
+    if let PivExtension::ImportKey(alg) = extension {
+        let generation = resolve(
+            PivExtension::SlotKeyAlgorithm(alg),
+            fingerprint,
+            applet_version,
+            firmware_version,
+        );
+        if generation == FeatureGate::Unsupported {
+            return FeatureGate::Unsupported;
+        }
+        if fingerprint == AppletFingerprint::YubiKey {
+            return generation;
+        }
+    }
     if extension == PivExtension::GetSlotKeyStatus
         && applet_verdicts(fingerprint, PivExtension::GetSlotKeyStatus).is_none()
     {
@@ -3677,6 +3823,24 @@ pub fn resolve(
             firmware_version,
         );
     }
+    resolve_axes(extension, fingerprint, applet_version, firmware_version)
+}
+
+/// One version axis as [`resolve`] reads it: which axis, `extension`'s rows on
+/// it (`None` when there are none), and the reported version.
+type AxisReading<'a> = (
+    VersionAxis,
+    Option<&'static [VersionVerdict]>,
+    Option<&'a [u8]>,
+);
+
+/// Both axes of `extension` on `fingerprint`, applet first.
+fn axes<'a>(
+    extension: PivExtension,
+    fingerprint: AppletFingerprint,
+    applet_version: Option<&'a [u8]>,
+    firmware_version: Option<&'a [u8]>,
+) -> [AxisReading<'a>; 2] {
     // See "Both axes unset, one exception" above: only when *neither* axis
     // carries a reported version does the universal `[]` sentinel version
     // apply to both — an axis that's `None` while the other has data is left
@@ -3688,9 +3852,185 @@ pub fn resolve(
         (None, None) => (Some(&[][..]), Some(&[][..])),
         versions => versions,
     };
-    let applet_gate = resolve_in(applet_verdicts(fingerprint, extension), applet_version);
-    let firmware_gate = resolve_in(firmware_verdicts(fingerprint, extension), firmware_version);
-    merge_gates(axis_merge_mode(fingerprint), applet_gate, firmware_gate)
+    [
+        (
+            VersionAxis::Applet,
+            applet_verdicts(fingerprint, extension),
+            applet_version,
+        ),
+        (
+            VersionAxis::Firmware,
+            firmware_verdicts(fingerprint, extension),
+            firmware_version,
+        ),
+    ]
+}
+
+/// [`resolve`] after its special cases: `extension`'s own rows on both axes,
+/// merged per the fingerprint's [`AxisMergeMode`].
+fn resolve_axes(
+    extension: PivExtension,
+    fingerprint: AppletFingerprint,
+    applet_version: Option<&[u8]>,
+    firmware_version: Option<&[u8]>,
+) -> FeatureGate {
+    let [(_, applet_rows, applet_version), (_, firmware_rows, firmware_version)] =
+        axes(extension, fingerprint, applet_version, firmware_version);
+    merge_gates(
+        axis_merge_mode(fingerprint),
+        resolve_in(applet_rows, applet_version),
+        resolve_in(firmware_rows, firmware_version),
+    )
+}
+
+/// Which reported version a [`VersionFloor`] is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionAxis {
+    /// The PIV applet's own version ([`resolve`]'s `applet_version`).
+    Applet,
+    /// The device's firmware version ([`resolve`]'s `firmware_version`).
+    Firmware,
+}
+
+/// "Needs version [`Self::version`] or later": the lowest version, on one
+/// axis, from which keyroost's list marks an extension known supported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionFloor {
+    pub axis: VersionAxis,
+    pub version: &'static [u8],
+}
+
+/// Why [`resolve`] says [`FeatureGate::Unsupported`], when the only reason is
+/// that the reported version is too old: the lowest version, on the one axis
+/// that refuses, from which keyroost's list marks `extension` known
+/// supported. Follows [`resolve`]'s special cases, so an import that is
+/// refused because generating that key type is gets the later of the two
+/// floors. `None` when `extension` isn't refused, when nothing on record
+/// lifts the refusal (a feature this device is known never to have), or when
+/// both axes refuse.
+#[must_use]
+pub fn supported_from(
+    extension: PivExtension,
+    fingerprint: AppletFingerprint,
+    applet_version: Option<&[u8]>,
+    firmware_version: Option<&[u8]>,
+) -> Option<VersionFloor> {
+    if resolve(extension, fingerprint, applet_version, firmware_version) != FeatureGate::Unsupported
+    {
+        return None;
+    }
+    floor_of(extension, fingerprint, applet_version, firmware_version)
+}
+
+/// [`supported_from`] for an `extension` [`resolve`] refuses.
+fn floor_of(
+    extension: PivExtension,
+    fingerprint: AppletFingerprint,
+    applet_version: Option<&[u8]>,
+    firmware_version: Option<&[u8]>,
+) -> Option<VersionFloor> {
+    if let PivExtension::ImportKey(alg) = extension {
+        let generation = PivExtension::SlotKeyAlgorithm(alg);
+        let generation_floor = if resolve(generation, fingerprint, applet_version, firmware_version)
+            == FeatureGate::Unsupported
+        {
+            Some(floor_of(
+                generation,
+                fingerprint,
+                applet_version,
+                firmware_version,
+            )?)
+        } else {
+            None
+        };
+        if fingerprint == AppletFingerprint::YubiKey {
+            return generation_floor;
+        }
+        let own_floor = if resolve_axes(extension, fingerprint, applet_version, firmware_version)
+            == FeatureGate::Unsupported
+        {
+            Some(axis_floor(
+                extension,
+                fingerprint,
+                applet_version,
+                firmware_version,
+            )?)
+        } else {
+            None
+        };
+        return match (generation_floor, own_floor) {
+            (Some(a), Some(b)) if a.axis == b.axis => {
+                Some(if a.version >= b.version { a } else { b })
+            }
+            (Some(_), Some(_)) => None,
+            (a, b) => a.or(b),
+        };
+    }
+    if extension == PivExtension::GetSlotKeyStatus
+        && applet_verdicts(fingerprint, PivExtension::GetSlotKeyStatus).is_none()
+    {
+        return floor_of(
+            PivExtension::GetMetadata,
+            fingerprint,
+            applet_version,
+            firmware_version,
+        );
+    }
+    axis_floor(extension, fingerprint, applet_version, firmware_version)
+}
+
+/// The floor on the one axis whose own rows refuse `extension`: its first
+/// known-supported verdict above the reported version. `None` when both axes
+/// refuse, or the refusing one has no such verdict.
+fn axis_floor(
+    extension: PivExtension,
+    fingerprint: AppletFingerprint,
+    applet_version: Option<&[u8]>,
+    firmware_version: Option<&[u8]>,
+) -> Option<VersionFloor> {
+    let mut floor = None;
+    for (axis, rows, version) in axes(extension, fingerprint, applet_version, firmware_version) {
+        if resolve_in(rows, version) != FeatureGate::Unsupported {
+            continue;
+        }
+        if floor.is_some() {
+            return None;
+        }
+        // An axis only refuses with rows and a version to read them at.
+        let (rows, version) = (rows?, version?);
+        let lifted = rows
+            .iter()
+            .find(|r| r.version > version && r.verdict == Verdict::KnownSupported)?;
+        floor = Some(VersionFloor {
+            axis,
+            version: lifted.version,
+        });
+    }
+    floor
+}
+
+/// Which private-key layout `fingerprint`'s import command expects: the
+/// Trussed Nitrokey takes RSA as `p`, `q`, `e` (source-verified in
+/// piv-authenticator's `import_asymmetric_key`, not yet hardware-verified);
+/// every other applet gets Yubico's layout.
+#[must_use]
+pub fn import_layout(fingerprint: AppletFingerprint) -> crate::ImportLayout {
+    match fingerprint {
+        AppletFingerprint::Trussed(TrussedVariant::NitroKey) => crate::ImportLayout::NitrokeyRsa,
+        _ => crate::ImportLayout::Yubico,
+    }
+}
+
+/// Whether `fingerprint`'s import command accepts `slot`: the Trussed
+/// Nitrokey imports into the authentication slot (9A) only (source-verified in
+/// piv-authenticator's `import_asymmetric_key`, not yet hardware-verified);
+/// every other applet is not restricted here.
+#[must_use]
+pub fn import_slot_allowed(fingerprint: AppletFingerprint, slot: crate::Slot) -> bool {
+    match fingerprint {
+        AppletFingerprint::Trussed(TrussedVariant::NitroKey) => slot == crate::Slot::Authentication,
+        _ => true,
+    }
 }
 
 /// [`AxisMergeMode::MergeStrict`]'s rule: [`FeatureGate::Unsupported`] wins
@@ -6191,26 +6531,27 @@ mod tests {
     }
 
     #[test]
-    fn trussed_nitrokey_slot_pin_and_touch_policy_unsupported_at_1_8_3_firmware() {
+    fn trussed_nitrokey_slot_pin_and_touch_policy_unsupported_through_1_9_1_firmware() {
+        // Source-read up to 1.9.1: policy tags ignored (1.8.0-1.9.1) or
+        // refused (1.7.x), never applied — see
+        // `TRUSSED_NITROKEY_FIRMWARE_VERDICTS`'s doc.
+        let fp = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
         for ext in [PivExtension::SlotPinPolicy, PivExtension::SlotTouchPolicy] {
+            // Backward from 1.9.1 to every older firmware, and with no
+            // firmware version read at all.
+            for fw in [&[1, 9, 1][..], &[1, 9, 0], &[1, 8, 3], &[1, 8], &[1, 7, 2]] {
+                assert_eq!(
+                    resolve(ext, fp, Some(&[6, 6, 6]), Some(fw)),
+                    FeatureGate::Unsupported,
+                    "{ext:?} at firmware {fw:?}"
+                );
+            }
+            assert_eq!(resolve(ext, fp, None, None), FeatureGate::Unsupported);
+            // Newer than the newest source read: may have changed.
             assert_eq!(
-                resolve(
-                    ext,
-                    AppletFingerprint::Trussed(TrussedVariant::NitroKey),
-                    None,
-                    Some(&[1, 8, 3]),
-                ),
-                FeatureGate::Unsupported
-            );
-            // Backward-extends to earlier, untested firmware too.
-            assert_eq!(
-                resolve(
-                    ext,
-                    AppletFingerprint::Trussed(TrussedVariant::NitroKey),
-                    None,
-                    Some(&[1, 8]),
-                ),
-                FeatureGate::Unsupported
+                resolve(ext, fp, None, Some(&[1, 9, 2])),
+                FeatureGate::Unverified,
+                "{ext:?} above 1.9.1"
             );
         }
     }
@@ -8041,5 +8382,286 @@ mod tests {
                 "{alg:?}"
             );
         }
+    }
+    // --- import key (#174) ---
+
+    const NITROKEY: AppletFingerprint = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
+
+    #[test]
+    fn nitrokey_import_gate() {
+        let fw: Option<&[u8]> = Some(&[1, 9, 1]);
+        for alg in [KeyAlg::Rsa2048, KeyAlg::Rsa3072, KeyAlg::Rsa4096] {
+            assert_eq!(
+                resolve(PivExtension::ImportKey(alg), NITROKEY, None, fw),
+                FeatureGate::Supported,
+                "{alg:?}"
+            );
+        }
+        for alg in [
+            KeyAlg::Rsa1024,
+            KeyAlg::EccP256,
+            KeyAlg::EccP384,
+            KeyAlg::EccP521,
+            KeyAlg::Ed25519,
+            KeyAlg::X25519,
+        ] {
+            assert_eq!(
+                resolve(PivExtension::ImportKey(alg), NITROKEY, None, fw),
+                FeatureGate::Unsupported,
+                "{alg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nitrokey_import_needs_firmware_1_8() {
+        // `import_asymmetric_key` first shipped in firmware 1.8.
+        for fw in [&[1u8, 7, 0][..], &[1, 7, 9], &[1, 0]] {
+            assert_eq!(
+                resolve(
+                    PivExtension::ImportKey(KeyAlg::Rsa2048),
+                    NITROKEY,
+                    None,
+                    Some(fw)
+                ),
+                FeatureGate::Unsupported,
+                "{fw:?}"
+            );
+        }
+        assert_eq!(
+            resolve(
+                PivExtension::ImportKey(KeyAlg::Rsa2048),
+                NITROKEY,
+                None,
+                Some(&[1, 8, 0])
+            ),
+            FeatureGate::Supported
+        );
+    }
+
+    #[test]
+    fn import_is_never_more_permissive_than_generation() {
+        // R9: wherever generating the algorithm is Unsupported, importing it
+        // is too, on every fingerprint and a spread of versions.
+        let versions: [Option<&[u8]>; 5] = [
+            None,
+            Some(&[]),
+            Some(&[1, 8]),
+            Some(&[1, 8, 1]),
+            Some(&[5, 7, 0]),
+        ];
+        let fps = [
+            AppletFingerprint::Generic,
+            AppletFingerprint::YubiKey,
+            AppletFingerprint::Token2,
+            NITROKEY,
+            AppletFingerprint::HidCrescendo(HidCrescendoVariant::C2300),
+            AppletFingerprint::HidCrescendo(HidCrescendoVariant::C4000),
+            AppletFingerprint::AuthentrendATKey,
+        ];
+        for fp in fps {
+            for alg in KeyAlg::ALL {
+                for a in versions {
+                    for f in versions {
+                        let slot = resolve(PivExtension::SlotKeyAlgorithm(alg), fp, a, f);
+                        let imp = resolve(PivExtension::ImportKey(alg), fp, a, f);
+                        if slot == FeatureGate::Unsupported {
+                            assert_eq!(imp, FeatureGate::Unsupported, "{fp:?} {alg:?} {a:?} {f:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hid_crescendo_refuses_import() {
+        // HID documents its own INJECT PKI KEY, not Yubico's IMPORT
+        // ASYMMETRIC KEY: every algorithm is refused up front, on every
+        // model, whatever version is read.
+        for variant in [
+            HidCrescendoVariant::C2300,
+            HidCrescendoVariant::C4000,
+            HidCrescendoVariant::Generic,
+        ] {
+            let fp = AppletFingerprint::HidCrescendo(variant);
+            for alg in KeyAlg::ALL {
+                for v in [None, Some(&[][..]), Some(&[2, 0][..])] {
+                    assert_eq!(
+                        resolve(PivExtension::ImportKey(alg), fp, v, None),
+                        FeatureGate::Unsupported,
+                        "{variant:?} {alg:?} {v:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn yubikey_import_mirrors_generation() {
+        let versions: [Option<&[u8]>; 6] = [
+            None,
+            Some(&[]),
+            Some(&[4, 3, 7]),
+            Some(&[5, 1, 0]),
+            Some(&[5, 2, 7]),
+            Some(&[5, 7, 1]),
+        ];
+        for alg in KeyAlg::ALL {
+            for a in versions {
+                assert_eq!(
+                    resolve(
+                        PivExtension::ImportKey(alg),
+                        AppletFingerprint::YubiKey,
+                        a,
+                        None
+                    ),
+                    resolve(
+                        PivExtension::SlotKeyAlgorithm(alg),
+                        AppletFingerprint::YubiKey,
+                        a,
+                        None
+                    ),
+                    "{alg:?} {a:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn token2_import_is_unverified() {
+        // Token2 import is a user report, not seen on project hardware.
+        assert_eq!(
+            resolve(
+                PivExtension::ImportKey(KeyAlg::Rsa2048),
+                AppletFingerprint::Token2,
+                Some(&[5, 4, 0]),
+                None
+            ),
+            FeatureGate::Unverified
+        );
+    }
+
+    #[test]
+    fn token2_import_unsupported_where_generation_unsupported() {
+        let mut checked = 0;
+        for alg in KeyAlg::ALL {
+            for v in [&[][..], &[5, 4, 0][..], &[6, 0, 0][..]] {
+                let slot = resolve(
+                    PivExtension::SlotKeyAlgorithm(alg),
+                    AppletFingerprint::Token2,
+                    Some(v),
+                    None,
+                );
+                let imp = resolve(
+                    PivExtension::ImportKey(alg),
+                    AppletFingerprint::Token2,
+                    Some(v),
+                    None,
+                );
+                if slot == FeatureGate::Unsupported {
+                    assert_eq!(imp, FeatureGate::Unsupported, "{alg:?} {v:?}");
+                    checked += 1;
+                } else {
+                    assert_eq!(imp, FeatureGate::Unverified, "{alg:?} {v:?}");
+                }
+            }
+        }
+        assert!(checked > 0, "Token2 has at least one unsupported algorithm");
+    }
+
+    #[test]
+    fn nitrokey_slot_rule() {
+        use crate::Slot;
+        assert!(import_slot_allowed(NITROKEY, Slot::Authentication));
+        assert!(!import_slot_allowed(NITROKEY, Slot::Signature));
+        assert!(!import_slot_allowed(NITROKEY, Slot::Retired(1)));
+        assert!(import_slot_allowed(
+            AppletFingerprint::YubiKey,
+            Slot::Signature
+        ));
+        assert!(import_slot_allowed(
+            AppletFingerprint::Token2,
+            Slot::Retired(1)
+        ));
+    }
+
+    #[test]
+    fn import_layout_by_fingerprint() {
+        assert_eq!(import_layout(NITROKEY), crate::ImportLayout::NitrokeyRsa);
+        assert_eq!(
+            import_layout(AppletFingerprint::YubiKey),
+            crate::ImportLayout::Yubico
+        );
+        assert_eq!(
+            import_layout(AppletFingerprint::Token2),
+            crate::ImportLayout::Yubico
+        );
+    }
+
+    #[test]
+    fn import_requirement_names_the_algorithm() {
+        let s = PivExtension::ImportKey(KeyAlg::EccP384).requirement();
+        assert!(
+            s.contains("P-384") || s.contains(KeyAlg::EccP384.label()),
+            "{s}"
+        );
+    }
+
+    /// A Nitrokey below firmware 1.8 has no import command; the refusal can
+    /// name the firmware that lifts it, read from the same rows.
+    #[test]
+    fn nitrokey_import_floor_is_firmware_1_8() {
+        let fp = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
+        let floor = |alg, fw: Option<&[u8]>| {
+            supported_from(PivExtension::ImportKey(alg), fp, Some(&[6, 6, 6]), fw)
+        };
+        let fw = |version| {
+            Some(VersionFloor {
+                axis: VersionAxis::Firmware,
+                version,
+            })
+        };
+        for alg in [KeyAlg::Rsa2048, KeyAlg::Rsa4096] {
+            assert_eq!(floor(alg, Some(&[1, 7, 2])), fw(&[1, 8]), "{alg:?}");
+            assert_eq!(floor(alg, Some(&[1, 8])), None, "{alg:?} supported");
+        }
+        // RSA-3072 import is in from 1.8, but generating it only from 1.8.2,
+        // and import is never ahead of generation.
+        assert_eq!(floor(KeyAlg::Rsa3072, Some(&[1, 7])), fw(&[1, 8, 2]));
+        assert_eq!(floor(KeyAlg::Rsa3072, Some(&[1, 8, 1])), fw(&[1, 8, 2]));
+        assert_eq!(floor(KeyAlg::Rsa3072, Some(&[1, 8, 2])), None);
+        // Never importable: no floor to name.
+        assert_eq!(floor(KeyAlg::EccP256, Some(&[1, 7])), None);
+        assert_eq!(floor(KeyAlg::EccP256, Some(&[1, 9, 1])), None);
+        // No version read at all reads as `[]`, below every floor.
+        assert_eq!(
+            supported_from(PivExtension::ImportKey(KeyAlg::Rsa2048), fp, None, None),
+            fw(&[1, 8])
+        );
+    }
+
+    #[test]
+    fn supported_from_is_none_unless_refused_or_never_lifted() {
+        // Supported: no floor.
+        assert_eq!(
+            supported_from(
+                PivExtension::MoveKey,
+                AppletFingerprint::YubiKey,
+                Some(&[5, 7, 0]),
+                None
+            ),
+            None
+        );
+        // Refused for good (`KnownUnsupportedSince`): no floor either.
+        let nitrokey = AppletFingerprint::Trussed(TrussedVariant::NitroKey);
+        assert_eq!(
+            resolve(PivExtension::ResetGlobal, nitrokey, None, Some(&[1, 8])),
+            FeatureGate::Unsupported
+        );
+        assert_eq!(
+            supported_from(PivExtension::ResetGlobal, nitrokey, None, Some(&[1, 8])),
+            None
+        );
     }
 }

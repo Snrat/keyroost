@@ -180,8 +180,14 @@ pub struct PivStatus {
     /// neither source answers.
     pub serial: Option<u128>,
     /// Remaining PIN tries from a no-op VERIFY (`63 Cx`); `Some(0)` when blocked,
-    /// `None` when the card didn't report a count.
+    /// `None` when the card didn't report a count — see [`Self::pin_verified`]
+    /// for the one known reason it doesn't.
     pub pin_retries: Option<u8>,
+    /// The PIN is verified in this session: the no-op VERIFY answered `9000`,
+    /// which is how a card says so instead of reporting a count (then
+    /// [`Self::pin_retries`] is `None`). Seen on a status read in the same
+    /// session as a PIN-using operation (import, self-sign, self-test).
+    pub pin_verified: bool,
     /// Per-slot certificate presence, in canonical slot order.
     pub slots: Vec<PivSlotStatus>,
     /// The card's CHUID (FASC-N, GUID, expiration), when it has one. A
@@ -230,10 +236,9 @@ pub struct PivSlotStatus {
     /// True when the certificate is stored gzip-compressed (CertInfo `0x01`)
     /// and inflated cleanly. `cert_len` is still the inflated DER length.
     pub cert_compressed: bool,
-    /// Whether the slot holds a key, for a slot without a certificate (see
-    /// [`SlotKeyPresence`]). Not read for a slot with a certificate, readable
-    /// or not: [`SlotKeyPresence::Unknown`] there, and the certificate is
-    /// what a caller shows.
+    /// Whether the slot holds a key (see [`SlotKeyPresence`]), read for every
+    /// slot, with a certificate or without: a certificate can sit in a slot
+    /// that holds no key.
     pub key: SlotKeyPresence,
 }
 
@@ -370,10 +375,10 @@ pub struct PivSlotDetail {
 /// can't fail that same way, since the compiler checks the field name at
 /// every use.
 #[derive(Clone)]
-struct SessionIdentity {
-    fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
-    version: Option<Vec<u8>>,
-    version_firmware: Option<Vec<u8>>,
+pub(crate) struct SessionIdentity {
+    pub(crate) fingerprint: keyroost_piv::fingerprint::AppletFingerprint,
+    pub(crate) version: Option<Vec<u8>>,
+    pub(crate) version_firmware: Option<Vec<u8>>,
 }
 
 /// [`PivSession::applet_fingerprint`]'s resolved shape — see that method's
@@ -680,10 +685,15 @@ pub struct PivSessionState {
     chuid_cache: Option<Option<keyroost_piv::Chuid>>,
     /// Remaining PIV application-PIN tries, resolved via a no-op VERIFY —
     /// see [`PivSession::pin_retries`]. `None` until first resolved this
-    /// lineage; the inner `Option<u8>` mirrors that method's own return
-    /// value (`None` there means "already verified" or "not reportable",
-    /// not "unresolved" — this outer `Option` is what distinguishes the
-    /// two). Invalidated by [`PivSession::verify_pin`],
+    /// lineage; the inner `PinReading` is that method's own return value (a
+    /// count, "verified in this session", or neither) — this outer `Option`
+    /// is what tells any of those apart from "unresolved". A "verified"
+    /// reading holds only for the connection that saw it: a session's
+    /// connection ends with a card reset (the `pcsc` crate's `Card` drop),
+    /// which clears the verification, so
+    /// [`PivSession::with_cached_transaction`] drops such a reading on reuse
+    /// (`PivSessionState::forget_pin_verification`) and the next read asks
+    /// the card again. Invalidated by [`PivSession::verify_pin`],
     /// [`PivSession::change_pin`], [`PivSession::unblock_pin`], and
     /// [`PivSession::set_pin_retries`] — every operation that can move the
     /// counter, whether by consuming a try or resetting it — so a stale
@@ -691,7 +701,7 @@ pub struct PivSessionState {
     /// *not* touched by [`PivSession::verify_pin_hid_crescendo_aca`], which
     /// authenticates a wholly different PIN reference (HID Crescendo's ACA
     /// instance, not the standard PIV application PIN this cache tracks).
-    pin_retries_cache: Option<Option<u8>>,
+    pin_retries_cache: Option<PinReading>,
     /// The management-key algorithm [`PivSession::resolve_management_key_algorithm`]
     /// last settled on by probing (cards without GET METADATA). Only a hint:
     /// the next resolution re-checks it with one witness request (two for
@@ -1352,6 +1362,47 @@ fn piv_session_cache_reusable(pcsc_trustworthy: bool, pcsc_identity_matches: boo
     pcsc_trustworthy && pcsc_identity_matches
 }
 
+/// What a no-op VERIFY says about the PIV application PIN — see
+/// [`PivSession::pin_retries`]. `retries` and `verified` are never both set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PinReading {
+    retries: Option<u8>,
+    verified: bool,
+}
+
+/// `63 Cx` → `x` tries left, `6983` (blocked) → `0`, `9000` → verified in
+/// this session (a card that answers so reports no count), anything else →
+/// neither.
+fn pin_reading_from_sw(sw: u16) -> PinReading {
+    if let Some(n) = crate::sw_tries_remaining(sw) {
+        PinReading {
+            retries: Some(n),
+            verified: false,
+        }
+    } else if sw == 0x6983 {
+        PinReading {
+            retries: Some(0),
+            verified: false,
+        }
+    } else {
+        PinReading {
+            retries: None,
+            verified: sw == piv::SW_OK,
+        }
+    }
+}
+
+impl PivSessionState {
+    /// Drop a cached "PIN verified" reading before this state is reused on a
+    /// new connection: the verification belonged to the connection that saw
+    /// it (see `pin_retries_cache`). A cached count is kept.
+    fn forget_pin_verification(&mut self) {
+        if self.pin_retries_cache.is_some_and(|r| r.verified) {
+            self.pin_retries_cache = None;
+        }
+    }
+}
+
 impl<'tx> PivSession<'tx> {
     /// Connect to `reader_name`, SELECT the PIV application, and run `f` —
     /// the entire session — with every APDU it issues, from that initial
@@ -1612,6 +1663,7 @@ impl<'tx> PivSession<'tx> {
             cached.pcsc_identity.matches(&fresh_identity),
         ) {
             session.state = cached;
+            session.state.forget_pin_verification();
         } else {
             session.select()?;
             session.fingerprint();
@@ -2413,7 +2465,7 @@ impl<'tx> PivSession<'tx> {
     }
 
     /// Read a read-only status snapshot: version, serial, PIN retries, CHUID,
-    /// and which slots hold a certificate. No PIN, no touch.
+    /// and which slots hold a certificate and a key. No PIN, no touch.
     pub fn status(&mut self) -> Result<PivStatus, TransportError> {
         // Fingerprint resolution (which also resolves `version` and
         // `serial` — see `Self::applet_fingerprint`'s doc) runs first and is
@@ -2427,26 +2479,21 @@ impl<'tx> PivSession<'tx> {
             version_firmware,
             serial,
         } = self.applet_fingerprint();
-        let pin_retries = self.pin_retries();
+        let pin = self.pin_retries();
         // Best-effort: a transport hiccup reading the CHUID shouldn't fail
         // the whole status snapshot, any more than an unsupported GET
         // VERSION/SERIAL does above.
         let chuid = self.read_chuid().unwrap_or_default();
         let mut slots = Vec::with_capacity(4);
         for slot in piv::Slot::all() {
-            let mut st = self.slot_status(slot)?;
-            // Only a slot without a certificate needs the key answer, so only
-            // it costs a GET METADATA (once per session: it's cached).
-            if !st.cert_present {
-                st.key = self.slot_key_presence(slot);
-            }
-            slots.push(st);
+            slots.push(self.slot_status(slot)?);
         }
         Ok(PivStatus {
             version,
             version_firmware,
             serial,
-            pin_retries,
+            pin_retries: pin.retries,
+            pin_verified: pin.verified,
             slots,
             chuid,
             applet_fingerprint,
@@ -2522,7 +2569,7 @@ impl<'tx> PivSession<'tx> {
             version_firmware,
             serial,
         } = self.applet_fingerprint();
-        let pin_retries = self.pin_retries();
+        let pin = self.pin_retries();
         let chuid = self.read_chuid().unwrap_or_default();
 
         let mut slots = Vec::with_capacity(4);
@@ -2553,13 +2600,10 @@ impl<'tx> PivSession<'tx> {
                 .map(|dn| dn.to_string());
             let policy = self.slot_policy(slot);
 
-            let mut st = slot_status_of(slot, &cert);
-            // Same answer as `status` gives; the algorithm reads above have
+            // Same answer as `status` gives; the algorithm read above has
             // already cached everything it needs, so no APDU here.
-            if !st.cert_present {
-                st.key = self.slot_key_presence(slot);
-            }
-            slots.push(st);
+            let key = self.slot_key_presence(slot);
+            slots.push(slot_status_of(slot, &cert, key));
             detail.push(PivSlotDetail {
                 slot,
                 algorithm,
@@ -2572,7 +2616,8 @@ impl<'tx> PivSession<'tx> {
                 version,
                 version_firmware,
                 serial,
-                pin_retries,
+                pin_retries: pin.retries,
+                pin_verified: pin.verified,
                 slots,
                 chuid,
                 applet_fingerprint,
@@ -2618,32 +2663,29 @@ impl<'tx> PivSession<'tx> {
 
     /// Remaining PIN tries via a no-op VERIFY (consumes no try itself — the
     /// query the card answers is distinct from an actual PIN presentation).
-    /// `63 Cx` → `Some(x)`, `6983` (blocked) → `Some(0)`, `9000` (already
-    /// verified) / anything else → `None`.
+    /// `63 Cx` → `x` tries left, `6983` (blocked) → `0`, `9000` → verified in
+    /// this session, no count, anything else → neither (see
+    /// `pin_reading_from_sw`).
     ///
     /// Cached in `PivSessionState::pin_retries_cache` for the rest of this
-    /// lineage once a real status word comes back — a transport-level
-    /// failure (the early `?` below) is never cached, same as every other
-    /// cache here. [`Self::verify_pin`]/[`Self::change_pin`]/
+    /// lineage once a real status word comes back — except that a
+    /// "verified" reading is dropped when the state is reused on a new
+    /// connection (see that field's doc) — and a transport-level failure
+    /// (the early return below) is never cached, same as every other cache
+    /// here. [`Self::verify_pin`]/[`Self::change_pin`]/
     /// [`Self::unblock_pin`]/[`Self::set_pin_retries`] each invalidate this
     /// on the way out, since each is the one thing that can actually move
-    /// the counter this method itself never touches.
-    fn pin_retries(&mut self) -> Option<u8> {
+    /// the counter (or the verification) this method itself never touches.
+    fn pin_retries(&mut self) -> PinReading {
         if let Some(cached) = self.state.pin_retries_cache {
             return cached;
         }
         let Ok((_, sw)) = self.transmit_full(&piv::verify_pin_status()) else {
-            return None;
+            return PinReading::default();
         };
-        let retries = if let Some(n) = crate::sw_tries_remaining(sw) {
-            Some(n)
-        } else if sw == 0x6983 {
-            Some(0)
-        } else {
-            None
-        };
-        self.state.pin_retries_cache = Some(retries);
-        retries
+        let reading = pin_reading_from_sw(sw);
+        self.state.pin_retries_cache = Some(reading);
+        reading
     }
 
     /// This session's [`keyroost_piv::fingerprint::AppletFingerprint`] plus
@@ -2658,7 +2700,7 @@ impl<'tx> PivSession<'tx> {
     /// [`Self::status`]/[`Self::status_detailed`]/[`Self::feature_gate`],
     /// which need its `name`/`serial` fields too) — this is just the
     /// narrower view over the same cached value.
-    fn identity(&mut self) -> SessionIdentity {
+    pub(crate) fn identity(&mut self) -> SessionIdentity {
         let AppletFingerprintResult {
             fingerprint,
             version,
@@ -2773,7 +2815,7 @@ impl<'tx> PivSession<'tx> {
     /// function's `Trussed`/`NitroKey` entry is gated by it. Cached via
     /// `Self::identity`, so this costs no extra round trip once the
     /// fingerprint has already been probed this session.
-    fn slot_key_algorithm_apdu_id(&mut self, alg: KeyAlg) -> u8 {
+    pub(crate) fn slot_key_algorithm_apdu_id(&mut self, alg: KeyAlg) -> u8 {
         let SessionIdentity {
             fingerprint,
             version_firmware,
@@ -4253,6 +4295,96 @@ impl<'tx> PivSession<'tx> {
             .remember(slot.key_ref(), Some((alg, key)));
     }
 
+    /// Send an IMPORT ASYMMETRIC KEY `body` ([`import_key_body_for`]) for
+    /// `slot` with P1 `alg_id` (a Yubico extension other applets share).
+    /// Requires prior management-key auth; only
+    /// [`crate::piv_import::run_import`] calls it, after the import plan's
+    /// checks.
+    ///
+    /// Sent as one APDU (extended length when the key needs it), or chained
+    /// on a T=0 link, after a reader failure of the extended APDU, or when the
+    /// card refuses it as too long (see `key_import_retry_sw`); any other
+    /// refusal is returned as is. A failure after a reader failure is
+    /// [`TransportError::PivWriteUnconfirmed`]: the key may be on the card.
+    /// The key bytes never appear in a `--debug` trace.
+    /// Unlike [`Self::generate_key`] this leaves the slot's certificate alone
+    /// (the PKCS#12 import writes the matching one first); it evicts the
+    /// slot's cached policy and public key the same way, then reads the
+    /// policy back.
+    pub(crate) fn write_import_key(
+        &mut self,
+        slot: Slot,
+        alg_id: u8,
+        body: &[u8],
+    ) -> Result<(), TransportError> {
+        let link = self.long_link();
+        let sent = send_import_key(link, slot, alg_id, body, &mut |apdu| {
+            self.transmit_full(apdu)
+        });
+        // Whatever was cached for the slot describes the old key. Evict even
+        // when the exchange failed: a lost answer may hide an accepted key.
+        // Both caches go before `slot_policy` reads back, for the reason
+        // `generate_key` gives.
+        self.state.policy_cache.evict(slot.key_ref());
+        self.state.pubkey_cache.evict(slot.key_ref());
+        sent?;
+        let _ = self.slot_policy(slot);
+        Ok(())
+    }
+
+    /// Run the slot self-test ([`keyroost_pivtest::run`]) on `slot`, which
+    /// holds an `alg` key whose public key is `pubkey`: decrypt, key agreement
+    /// and sign, as far as the algorithm does them, each reply checked on the
+    /// host against `pubkey`.
+    ///
+    /// With `pin`, the PIN is verified once before the first operation, so a
+    /// wrong PIN fails here (costing one retry) before anything is tested, and
+    /// again before every later one: PIN-per-use slots (9C) drop the verified
+    /// state after each GENERAL AUTHENTICATE. Without it the operations run as
+    /// the slot's PIN policy allows. A card error during an operation is that
+    /// operation's [`keyroost_pivtest::Outcome::Failed`]; `Err` means nothing
+    /// was tested.
+    pub fn self_test(
+        &mut self,
+        slot: Slot,
+        alg: KeyAlg,
+        pubkey: &PublicKey,
+        pin: Option<&[u8]>,
+    ) -> Result<Vec<(keyroost_pivtest::SelfTest, keyroost_pivtest::Outcome)>, TransportError> {
+        self.self_test_with_progress(slot, alg, pubkey, pin, || {})
+    }
+
+    /// [`Self::self_test`], calling `on_start` once the PIN (if any) is
+    /// verified and just before the first operation — where a caller prints
+    /// its "testing…" line.
+    pub fn self_test_with_progress(
+        &mut self,
+        slot: Slot,
+        alg: KeyAlg,
+        pubkey: &PublicKey,
+        pin: Option<&[u8]>,
+        on_start: impl FnOnce(),
+    ) -> Result<Vec<(keyroost_pivtest::SelfTest, keyroost_pivtest::Outcome)>, TransportError> {
+        if let Some(pin) = pin {
+            self.verify_pin(pin)?;
+        }
+        on_start();
+        let mut ran = 0usize;
+        Ok(keyroost_pivtest::run(alg, pubkey, |op, input| {
+            if let (Some(pin), true) = (pin, ran > 0) {
+                self.verify_pin(pin)?;
+            }
+            ran += 1;
+            if op.is_key_agreement() {
+                self.key_agree(slot, alg, input)
+            } else if op == keyroost_pivtest::SelfTest::Decrypt {
+                self.decrypt(slot, alg, input)
+            } else {
+                self.sign(slot, alg, input)
+            }
+        }))
+    }
+
     /// Import a DER-encoded X.509 certificate into `slot`, stored compressed
     /// or not as `compression` says. Requires prior management-key auth.
     ///
@@ -4302,9 +4434,23 @@ impl<'tx> PivSession<'tx> {
         compression: CertCompression,
     ) -> Result<CertImport, TransportError> {
         self.reject_certificate_key_mismatch(slot, der)?;
-        let done = store_certificate(slot, der, compression, |info, payload| {
-            let sw = self.put_cert_object(slot, &piv::encode_certificate(payload, info))?;
-            cert_write_result(slot, der.len(), sw)
+        self.store_certificate_unchecked(slot, der, compression)
+    }
+
+    /// [`Self::import_certificate`] without its key-match guard: store `der`
+    /// in `slot` (compressed as `compression` says, with the same read-back
+    /// after a compressed write). For the PKCS#12 import, whose certificate
+    /// belongs to the key about to be written, not to the slot's current one
+    /// the guard compares against.
+    pub(crate) fn store_certificate_unchecked(
+        &mut self,
+        slot: Slot,
+        der: &[u8],
+        compression: CertCompression,
+    ) -> Result<CertImport, TransportError> {
+        let link = self.long_link();
+        let done = send_certificate(link, slot, der, compression, &mut |apdu| {
+            self.transmit_full(apdu)
         })?;
         if done.auto_compressed {
             trace::line(self.traced, || {
@@ -4336,73 +4482,12 @@ impl<'tx> PivSession<'tx> {
         Ok(done)
     }
 
-    /// PUT DATA of a slot's certificate object `value`, returning the final
-    /// status word.
-    ///
-    /// Tries a single extended-length PUT DATA first; a cert big enough to
-    /// need one (any real X.509 cert typically is) that gets rejected falls
-    /// back to ISO 7816-4 command chaining — see [`Self::sign`] for why. The
-    /// fallback also runs when the extended APDU fails at the PC/SC layer
-    /// before any status word comes back (seen with certificates of a few
-    /// KB). A mid-chain `6700` / `6A84` comes back as that status word.
-    fn put_cert_object(&mut self, slot: Slot, value: &[u8]) -> Result<u16, TransportError> {
-        let tag = slot.cert_object_tag();
-        let apdu = piv::put_data(&tag, value);
-        let sw = if self.chain_upfront() {
-            trace::line(self.traced, || {
-                format_line(
-                    Dir::Note,
-                    "piv import certificate",
-                    &format!("command chaining up front ({})", self.chain_reason()),
-                )
-            });
-            chained_cert_sw(self.transmit_chain(
-                "piv import certificate",
-                &piv::put_data_chained(&tag, value, CHAIN_CHUNK),
-            ))?
-        } else {
-            let extended = uses_extended_length(&apdu);
-            let direct = self.transmit_full(&apdu);
-            if retry_chained_after(&direct, extended) {
-                if let Err(e) = &direct {
-                    trace::line(self.traced, || {
-                        format_line(
-                            Dir::Note,
-                            "piv import certificate",
-                            &format!(
-                                "extended length failed at the PC/SC \
-                             layer ({e}); retrying with command chaining"
-                            ),
-                        )
-                    });
-                }
-                chained_cert_sw(self.transmit_chain(
-                    "piv import certificate",
-                    &piv::put_data_chained(&tag, value, CHAIN_CHUNK),
-                ))?
-            } else {
-                let (_, sw) = direct?;
-                if sw == piv::SW_OK || !extended {
-                    sw
-                } else {
-                    trace::line(self.traced, || {
-                        format_line(
-                            Dir::Note,
-                            "piv import certificate",
-                            &format!(
-                                "extended length rejected (SW={sw:04X}); \
-                             retrying with command chaining"
-                            ),
-                        )
-                    });
-                    chained_cert_sw(self.transmit_chain(
-                        "piv import certificate",
-                        &piv::put_data_chained(&tag, value, CHAIN_CHUNK),
-                    ))?
-                }
-            }
-        };
-        Ok(sw)
+    /// How [`send_long`] may send on this link.
+    fn long_link(&self) -> LongLink {
+        LongLink {
+            traced: self.traced,
+            chain_upfront: self.chain_upfront().then(|| self.chain_reason()),
+        }
     }
 
     /// [`Self::import_certificate`]'s pre-flight key check — see that
@@ -5109,7 +5194,8 @@ impl<'tx> PivSession<'tx> {
     /// Whether `slot` holds a private key, via GET METADATA. Works for retired
     /// slots too — it just reads whatever key reference `slot` maps to. This is
     /// the on-demand occupancy check (not part of [`status`]'s snapshot, which
-    /// stays 4 GET DATA calls rather than 24 by never touching retired slots).
+    /// stays at 4 GET DATA calls and up to 4 cached GET METADATA reads, rather
+    /// than 24 of each, by never touching retired slots).
     ///
     /// Derives occupancy from `Self::cached_slot_key` — cache-preferring,
     /// same as `status_detailed`'s own use, since this backs a UI dimming
@@ -5732,10 +5818,14 @@ impl<'tx> PivSession<'tx> {
         }
     }
 
-    /// Whether `slot` holds a certificate (GET DATA), and its size if so.
-    fn slot_status(&mut self, slot: piv::Slot) -> Result<PivSlotStatus, TransportError> {
+    /// Whether `slot` holds a certificate (GET DATA; its size if so) and a
+    /// key ([`Self::slot_key_presence`]). Works for retired slots too. Both
+    /// reads are cached, so a slot costs at most one GET DATA and one GET
+    /// METADATA per session lineage.
+    pub fn slot_status(&mut self, slot: piv::Slot) -> Result<PivSlotStatus, TransportError> {
         let cert = self.cert_object(slot)?;
-        Ok(slot_status_of(slot, &cert))
+        let key = self.slot_key_presence(slot);
+        Ok(slot_status_of(slot, &cert, key))
     }
 
     /// Transmit one APDU and reassemble a response the card splits across
@@ -5803,29 +5893,235 @@ impl<'tx> PivSession<'tx> {
     /// [`OpenPgpSession::transmit_chain`](crate::OpenPgpSession), added here
     /// for the same reason: extended-length rejection ([`Self::sign`],
     /// [`Self::import_certificate`]).
-    fn transmit_chain(
+    fn transmit_chain<C: AsRef<[u8]>>(
         &mut self,
         label: &'static str,
-        chunks: &[Vec<u8>],
+        chunks: &[C],
     ) -> Result<(Vec<u8>, u16), TransportError> {
-        let last = chunks.len().saturating_sub(1);
-        for (i, chunk) in chunks.iter().enumerate() {
-            let (data, sw) = self.transmit_full(chunk)?;
-            if i == last {
-                return Ok((data, sw));
-            }
-            // An intermediate chain link the card didn't accept (anything but
-            // 9000) aborts the chain.
-            if sw != piv::SW_OK {
-                return Err(TransportError::Apdu {
-                    label,
-                    sw1: (sw >> 8) as u8,
-                    sw2: sw as u8,
-                });
-            }
-        }
-        Ok((Vec::new(), piv::SW_OK)) // unreachable: chunk builders never return an empty list
+        transmit_chain_with(label, chunks, &mut |apdu| self.transmit_full(apdu))
     }
+}
+
+/// [`PivSession::transmit_chain`] over any single-APDU `send`, so the
+/// long-command logic built on it is tested without a card.
+fn transmit_chain_with<C: AsRef<[u8]>>(
+    label: &'static str,
+    chunks: &[C],
+    send: &mut impl FnMut(&[u8]) -> Result<(Vec<u8>, u16), TransportError>,
+) -> Result<(Vec<u8>, u16), TransportError> {
+    let last = chunks.len().saturating_sub(1);
+    for (i, chunk) in chunks.iter().enumerate() {
+        let (data, sw) = send(chunk.as_ref())?;
+        if i == last {
+            return Ok((data, sw));
+        }
+        // An intermediate chain link the card didn't accept (anything but
+        // 9000) aborts the chain.
+        if sw != piv::SW_OK {
+            return Err(TransportError::Apdu {
+                label,
+                sw1: (sw >> 8) as u8,
+                sw2: sw as u8,
+            });
+        }
+    }
+    Ok((Vec::new(), piv::SW_OK)) // unreachable: chunk builders never return an empty list
+}
+
+/// How a command too long for one short APDU may go out on a link: chained
+/// from the start (with the reason, for the trace), or one APDU first.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LongLink {
+    pub(crate) traced: bool,
+    pub(crate) chain_upfront: Option<&'static str>,
+}
+
+/// What [`send_long`] got back. `after_reader_failure`: the one-APDU attempt
+/// failed at the PC/SC layer and the command went again chained, so `result`
+/// is the retry's and the first attempt may have been applied anyway.
+pub(crate) struct LongSent {
+    pub(crate) result: Result<(Vec<u8>, u16), TransportError>,
+    pub(crate) after_reader_failure: bool,
+}
+
+/// Send a command whose data may not fit one short APDU: `single` (one
+/// extended-length APDU when the data needs it), or the `chained` ISO 7816-4
+/// sequence. Chains up front when `link` says so (T=0, or forced); chains as
+/// a fallback when an extended `single` fails at the PC/SC layer, or when the
+/// card answers it with a status word `retry_on` accepts. A short-form
+/// `single` is never retried. A refused intermediate link comes back as
+/// [`TransportError::Apdu`] ([`transmit_chain_with`]).
+pub(crate) fn send_long<C: AsRef<[u8]>>(
+    link: LongLink,
+    label: &'static str,
+    single: &[u8],
+    chained: impl FnOnce() -> Vec<C>,
+    retry_on: impl Fn(u16) -> bool,
+    send: &mut impl FnMut(&[u8]) -> Result<(Vec<u8>, u16), TransportError>,
+) -> LongSent {
+    let note = |text: &str| trace::line(link.traced, || format_line(Dir::Note, label, text));
+    if let Some(reason) = link.chain_upfront {
+        note(&format!("command chaining up front ({reason})"));
+        return LongSent {
+            result: transmit_chain_with(label, &chained(), send),
+            after_reader_failure: false,
+        };
+    }
+    let extended = uses_extended_length(single);
+    let direct = send(single);
+    if retry_chained_after(&direct, extended) {
+        if let Err(e) = &direct {
+            note(&format!(
+                "extended length failed at the PC/SC layer ({e}); retrying with command chaining"
+            ));
+        }
+        return LongSent {
+            result: transmit_chain_with(label, &chained(), send),
+            after_reader_failure: true,
+        };
+    }
+    let result = match direct {
+        Ok((_, sw)) if extended && sw != piv::SW_OK && retry_on(sw) => {
+            note(&format!(
+                "extended length rejected (SW={sw:04X}); retrying with command chaining"
+            ));
+            transmit_chain_with(label, &chained(), send)
+        }
+        other => other,
+    };
+    LongSent {
+        result,
+        after_reader_failure: false,
+    }
+}
+
+/// `e`, marked [`TransportError::PivWriteUnconfirmed`] when an earlier
+/// attempt at the same write failed at the reader and may have been applied.
+fn unconfirmed_if(after_reader_failure: bool, e: TransportError) -> TransportError {
+    match e {
+        TransportError::PivWriteUnconfirmed(_) => e,
+        e if after_reader_failure => TransportError::PivWriteUnconfirmed(Box::new(e)),
+        e => e,
+    }
+}
+
+/// PUT DATA of a slot's certificate object `value`, returning the final
+/// status word.
+///
+/// Tries a single extended-length PUT DATA first; a cert big enough to need
+/// one (any real X.509 cert typically is) that gets rejected falls back to
+/// ISO 7816-4 command chaining — see [`PivSession::sign`] for why. The
+/// fallback also runs when the extended APDU fails at the PC/SC layer before
+/// any status word comes back (seen with certificates of a few KB); that sets
+/// `after_reader_failure`. A mid-chain `6700` / `6A84` comes back as that
+/// status word.
+fn put_cert_object_with(
+    link: LongLink,
+    slot: Slot,
+    value: &[u8],
+    send: &mut impl FnMut(&[u8]) -> Result<(Vec<u8>, u16), TransportError>,
+    after_reader_failure: &mut bool,
+) -> Result<u16, TransportError> {
+    let tag = slot.cert_object_tag();
+    let sent = send_long(
+        link,
+        "piv import certificate",
+        &piv::put_data(&tag, value),
+        || piv::put_data_chained(&tag, value, CHAIN_CHUNK),
+        |_| true,
+        send,
+    );
+    *after_reader_failure |= sent.after_reader_failure;
+    chained_cert_sw(sent.result)
+}
+
+/// Store `der` in `slot`'s certificate object as `compression` says
+/// ([`store_certificate`]), each APDU through `send`. A failure after a write
+/// that failed at the reader (and was retried chained) is
+/// [`TransportError::PivWriteUnconfirmed`]: that first write may have landed.
+pub(crate) fn send_certificate(
+    link: LongLink,
+    slot: Slot,
+    der: &[u8],
+    compression: CertCompression,
+    send: &mut impl FnMut(&[u8]) -> Result<(Vec<u8>, u16), TransportError>,
+) -> Result<CertImport, TransportError> {
+    let mut after_reader_failure = false;
+    let stored = store_certificate(slot, der, compression, |info, payload| {
+        let sw = put_cert_object_with(
+            link,
+            slot,
+            &piv::encode_certificate(payload, info),
+            send,
+            &mut after_reader_failure,
+        )?;
+        cert_write_result(slot, der.len(), sw)
+    });
+    stored.map_err(|e| unconfirmed_if(after_reader_failure, e))
+}
+
+/// `6883` "last command of the chain expected": how some applets answer an
+/// extended-length command they would take chained.
+const SW_LAST_COMMAND_EXPECTED: u16 = 0x6883;
+
+/// Whether an IMPORT ASYMMETRIC KEY sent as one extended APDU and answered
+/// `sw` is worth sending again chained: only the answers cards give an
+/// extended length they don't take — `6700` (wrong length), `6883` (chain
+/// expected), and `6A80`, which a Token2 PIV token's contact interface gives
+/// a well-formed extended-length command it accepts chained (see
+/// [`PivSession::sign`]). Anything else (`6982` no management key, …) is the
+/// card's real answer; the private key isn't sent twice for it.
+fn key_import_retry_sw(sw: u16) -> bool {
+    matches!(sw, piv::SW_WRONG_LENGTH | SW_LAST_COMMAND_EXPECTED | 0x6A80)
+}
+
+/// Send an IMPORT ASYMMETRIC KEY `body` for `slot`, each APDU through `send`.
+/// A failure after an attempt that failed at the reader (and was retried
+/// chained) is [`TransportError::PivWriteUnconfirmed`]: the key may be on the
+/// card.
+pub(crate) fn send_import_key(
+    link: LongLink,
+    slot: Slot,
+    alg_id: u8,
+    body: &[u8],
+    send: &mut impl FnMut(&[u8]) -> Result<(Vec<u8>, u16), TransportError>,
+) -> Result<(), TransportError> {
+    let LongSent {
+        result,
+        after_reader_failure,
+    } = send_long(
+        link,
+        "piv import key",
+        &piv::import_key(slot, alg_id, body),
+        || piv::import_key_chained(slot, alg_id, body, CHAIN_CHUNK),
+        key_import_retry_sw,
+        send,
+    );
+    result
+        .and_then(|(_, sw)| ok_or_write("piv import key", sw))
+        .map_err(|e| unconfirmed_if(after_reader_failure, e))
+}
+
+/// The IMPORT ASYMMETRIC KEY body for `key`, refused when its parts are not
+/// the form `layout` takes (RSA CRT parts for Yubico, primes and exponent for
+/// the Nitrokey layout; EC and 25519 keys are the same in both) or don't fit
+/// their fields. Pure, so the checks are tested without a card.
+pub(crate) fn import_key_body_for(
+    key: &piv::ImportKey<'_>,
+    pin_policy: PinPolicy,
+    touch_policy: TouchPolicy,
+    layout: piv::ImportLayout,
+) -> Result<Zeroizing<Vec<u8>>, piv::ImportBodyError> {
+    use piv::{ImportLayout, ImportParts};
+    let fits = match key.parts {
+        ImportParts::RsaCrt { .. } => layout == ImportLayout::Yubico,
+        ImportParts::RsaPrimes { .. } => layout == ImportLayout::NitrokeyRsa,
+        ImportParts::Ec { .. } | ImportParts::Ed25519 { .. } | ImportParts::X25519 { .. } => true,
+    };
+    if !fits {
+        return Err(piv::ImportBodyError::PartsMismatch);
+    }
+    piv::import_key_body(key, pin_policy, touch_policy)
 }
 
 /// Whether a direct (single-APDU) certificate PUT DATA that came back as
@@ -5864,7 +6160,7 @@ fn chained_cert_sw(result: Result<(Vec<u8>, u16), TransportError>) -> Result<u16
 /// compressed length, if any, is filled in by [`store_certificate`]),
 /// `6A84` (not enough memory) → [`TransportError::PivCardFull`], anything
 /// else as any PIV write ([`ok_or_write`]).
-fn cert_write_result(slot: Slot, len: usize, sw: u16) -> Result<(), TransportError> {
+pub(crate) fn cert_write_result(slot: Slot, len: usize, sw: u16) -> Result<(), TransportError> {
     match sw {
         piv::SW_WRONG_LENGTH => Err(TransportError::PivCertTooLarge {
             slot,
@@ -5883,7 +6179,7 @@ fn cert_write_result(slot: Slot, len: usize, sw: u16) -> Result<(), TransportErr
 /// every other error is returned as is. A refused compressed write reports
 /// the compressed length too. Pure apart from `put`, so the decision is
 /// unit-tested without a card.
-fn store_certificate(
+pub(crate) fn store_certificate(
     slot: Slot,
     der: &[u8],
     compression: CertCompression,
@@ -5945,8 +6241,9 @@ fn check_readback(
 /// `exmode = -254`, one byte short of the short-form `Lc` ceiling).
 const CHAIN_CHUNK: usize = 254;
 
-/// Whether `apdu` — built by [`piv::general_auth_sign`] or [`piv::put_data`],
-/// whose data field is never empty — used extended-length encoding. Both
+/// Whether `apdu` — built by [`piv::general_auth_sign`], [`piv::put_data`]
+/// or [`piv::import_key`], whose data field is never empty — used
+/// extended-length encoding. Both
 /// always emit a non-zero short-form `Lc` for a body that fits in one byte,
 /// so byte 4 being the `0x00` extended-length marker is unambiguous.
 fn uses_extended_length(apdu: &[u8]) -> bool {
@@ -6033,7 +6330,9 @@ fn reset_route(
 /// (CLA INS P1 P2 Lc) stays visible either way. VERIFY (`0x20`), CHANGE
 /// REFERENCE DATA (`0x24`), RESET RETRY COUNTER (`0x2C`) carry PINs/PUKs;
 /// GENERAL AUTHENTICATE (`0x87`) carries the decrypted witness/challenge;
-/// SET MANAGEMENT KEY (`0xFF`) carries the raw new key. The same VERIFY
+/// SET MANAGEMENT KEY (`0xFF`) carries the raw new key; IMPORT ASYMMETRIC
+/// KEY (`0xFE`) carries a private key, in every link of a chained import.
+/// The same VERIFY
 /// (`0x20`) INS covers HID Crescendo's ACA VERIFY PIN
 /// ([`PivSession::verify_pin_hid_crescendo_aca`]) too, just at a different
 /// P2 — see [`keyroost_piv::fingerprint::HID_CRESCENDO_ACA_PIN_REF`]. The
@@ -6063,7 +6362,13 @@ fn piv_cmd_sensitive(apdu: &[u8]) -> bool {
         (_, Some(0xD8)) => apdu.get(4) != Some(&0x04),
         (_, ins) => matches!(
             ins,
-            Some(0x20) | Some(0x24) | Some(0x2C) | Some(0x87) | Some(0xFF) | Some(0x82)
+            Some(0x20)
+                | Some(0x24)
+                | Some(0x2C)
+                | Some(0x87)
+                | Some(0xFF)
+                | Some(0xFE)
+                | Some(0x82)
         ),
     }
 }
@@ -6360,11 +6665,13 @@ fn cert_object_decode(body: &[u8]) -> Result<Option<StoredCert>, CertUnreadable>
     }))
 }
 
-/// A slot's [`PivSlotStatus`] from its decoded certificate object:
-/// [`slot_occupancy`] plus the compressed flag of a readable certificate.
+/// A slot's [`PivSlotStatus`] from its decoded certificate object and the
+/// card's key answer: [`slot_occupancy`] plus the compressed flag of a
+/// readable certificate, and `key` whether a certificate is there or not.
 fn slot_status_of(
     slot: piv::Slot,
     cert: &Result<Option<StoredCert>, CertUnreadable>,
+    key: SlotKeyPresence,
 ) -> PivSlotStatus {
     let der = cert
         .as_ref()
@@ -6379,6 +6686,7 @@ fn slot_status_of(
                 ..
             }))
         );
+    status.key = key;
     status
 }
 
@@ -6403,7 +6711,7 @@ fn slot_occupancy(slot: piv::Slot, cert: Result<Option<&[u8]>, CertUnreadable>) 
                 cert_len: len,
                 cert_unreadable: None,
                 cert_compressed: false,
-                // The status reads fill this in; it needs the card.
+                // `slot_status_of` fills this in; it needs the card.
                 key: SlotKeyPresence::Unknown,
             }
         }
@@ -6604,6 +6912,38 @@ fn block_crypt(
 mod tests {
     use super::*;
     use crate::gzip::MAX_CERT_DECOMPRESSED;
+
+    #[test]
+    fn pin_reading_tells_count_blocked_and_verified_apart() {
+        let tries = |retries, verified| PinReading { retries, verified };
+        assert_eq!(pin_reading_from_sw(0x63C3), tries(Some(3), false));
+        assert_eq!(pin_reading_from_sw(0x63C0), tries(Some(0), false));
+        assert_eq!(pin_reading_from_sw(0x6983), tries(Some(0), false));
+        // A card that already verified the PIN in this session reports no
+        // count: that's "verified", not "unknown".
+        assert_eq!(pin_reading_from_sw(0x9000), tries(None, true));
+        assert_eq!(pin_reading_from_sw(0x6D00), tries(None, false));
+    }
+
+    #[test]
+    fn reused_state_forgets_pin_verification_but_keeps_a_count() {
+        let mut state = PivSessionState {
+            pin_retries_cache: Some(pin_reading_from_sw(0x9000)),
+            ..Default::default()
+        };
+        state.forget_pin_verification();
+        assert_eq!(state.pin_retries_cache, None, "verified must be re-asked");
+
+        let count = Some(pin_reading_from_sw(0x63C2));
+        state.pin_retries_cache = count;
+        state.forget_pin_verification();
+        assert_eq!(state.pin_retries_cache, count);
+
+        let unknown = Some(pin_reading_from_sw(0x6D00));
+        state.pin_retries_cache = unknown;
+        state.forget_pin_verification();
+        assert_eq!(state.pin_retries_cache, unknown);
+    }
 
     #[test]
     fn decode_serial_if_bcd_applies_only_when_the_quirk_resolves() {
@@ -7071,6 +7411,203 @@ mod tests {
             &keyroost_piv::fingerprint::hid_crescendo_c4000_delete_key(KeyAlg::EccP256, 0x9C)
                 .unwrap()
         ));
+    }
+
+    #[test]
+    fn import_key_apdus_are_redacted_single_and_chained() {
+        let body = [0x06, 0x20, 0x5A, 0x5A, 0x5A, 0x5A];
+        let single = piv::import_key(Slot::Authentication, 0x11, &body);
+        assert!(piv_cmd_sensitive(&single));
+        let dump = crate::dump_cmd(&single, piv_cmd_sensitive(&single));
+        assert!(dump.contains("redacted"), "{dump}");
+        assert!(!dump.contains("5A 5A"), "{dump}");
+        // Every link of a chained import carries key bytes, the CLA-0x10
+        // continuation links as much as the last one.
+        let chained = piv::import_key_chained(Slot::Authentication, 0x07, &[0x5A; 600], 254);
+        assert!(chained.len() > 1);
+        for apdu in &chained {
+            assert!(piv_cmd_sensitive(apdu));
+        }
+    }
+
+    /// A single-APDU `send` answering from `script` in order (`9000` once it
+    /// runs out), recording each APDU's CLA and data length.
+    fn scripted(
+        script: Vec<Result<(Vec<u8>, u16), TransportError>>,
+        sent: &mut Vec<(u8, usize)>,
+    ) -> impl FnMut(&[u8]) -> Result<(Vec<u8>, u16), TransportError> + '_ {
+        let mut script = std::collections::VecDeque::from(script);
+        move |apdu| {
+            sent.push((apdu[0], command_data(apdu).map_or(0, <[u8]>::len)));
+            script.pop_front().unwrap_or(Ok((Vec::new(), piv::SW_OK)))
+        }
+    }
+
+    const DIRECT: LongLink = LongLink {
+        traced: false,
+        chain_upfront: None,
+    };
+
+    fn reader_failure() -> Result<(Vec<u8>, u16), TransportError> {
+        Err(TransportError::Pcsc(pcsc::Error::CommError))
+    }
+
+    fn sw(sw: u16) -> Result<(Vec<u8>, u16), TransportError> {
+        Ok((Vec::new(), sw))
+    }
+
+    fn fixture_cert() -> Vec<u8> {
+        std::fs::read(format!(
+            "{}/../keyroost-p12/tests/fixtures/rsa2048-modern.crt.der",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn key_import_is_resent_chained_only_for_length_refusals() {
+        let body = [0x5A; 600];
+        for (answer, chained) in [
+            (0x6700, true),
+            (0x6883, true),
+            (0x6A80, true),
+            (0x6982, false),
+            (0x6A84, false),
+        ] {
+            let mut sent = Vec::new();
+            let r = send_import_key(
+                DIRECT,
+                Slot::Authentication,
+                0x07,
+                &body,
+                &mut scripted(vec![sw(answer), sw(answer)], &mut sent),
+            );
+            assert_eq!(sent.len() > 1, chained, "SW {answer:04X}: {sent:?}");
+            assert!(r.is_err());
+            if answer == 0x6982 {
+                // The card's own answer, mapped as for every PIV write.
+                assert!(matches!(r, Err(TransportError::PivSecurityNotSatisfied)));
+            }
+        }
+    }
+
+    #[test]
+    fn key_import_refused_after_a_reader_failure_is_unconfirmed() {
+        let mut sent = Vec::new();
+        let r = send_import_key(
+            DIRECT,
+            Slot::Authentication,
+            0x07,
+            &[0x5A; 600],
+            &mut scripted(vec![reader_failure(), sw(0x6A80)], &mut sent),
+        );
+        assert!(
+            matches!(&r, Err(TransportError::PivWriteUnconfirmed(inner))
+                if matches!(**inner, TransportError::Apdu { sw1: 0x6A, sw2: 0x80, .. })),
+            "{r:?}"
+        );
+        // Without the reader failure the same refusal is a plain refusal.
+        let mut sent = Vec::new();
+        let r = send_import_key(
+            DIRECT,
+            Slot::Authentication,
+            0x07,
+            &[0x5A; 600],
+            &mut scripted(vec![sw(0x6A80), sw(0x6A80)], &mut sent),
+        );
+        assert!(matches!(r, Err(TransportError::Apdu { .. })), "{r:?}");
+    }
+
+    #[test]
+    fn certificate_refused_after_a_reader_failure_is_unconfirmed() {
+        let der = fixture_cert();
+        let mut sent = Vec::new();
+        let r = send_certificate(
+            DIRECT,
+            Slot::Authentication,
+            &der,
+            CertCompression::Never,
+            &mut scripted(vec![reader_failure(), sw(0x6700)], &mut sent),
+        );
+        assert!(
+            matches!(&r, Err(TransportError::PivWriteUnconfirmed(inner))
+                if matches!(**inner, TransportError::PivCertTooLarge { .. })),
+            "{r:?}"
+        );
+        // A plain refusal stays what it was.
+        let mut sent = Vec::new();
+        let r = send_certificate(
+            DIRECT,
+            Slot::Authentication,
+            &der,
+            CertCompression::Never,
+            // Refused extended, then refused at the first chained link.
+            &mut scripted(vec![sw(0x6A84), sw(0x6A84)], &mut sent),
+        );
+        assert!(
+            matches!(r, Err(TransportError::PivCardFull { .. })),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn auto_still_compresses_after_a_reader_failure_then_length_refusal() {
+        // Extended PUT DATA fails at the reader, the chained retry is refused
+        // as too long: Auto stores it compressed, as before.
+        let der = fixture_cert();
+        let mut sent = Vec::new();
+        let done = send_certificate(
+            DIRECT,
+            Slot::Authentication,
+            &der,
+            CertCompression::Auto,
+            &mut scripted(vec![reader_failure(), sw(0x6700)], &mut sent),
+        )
+        .unwrap();
+        assert!(done.compressed && done.auto_compressed);
+    }
+
+    #[test]
+    fn import_key_body_must_fit_the_layout() {
+        let crt = piv::ImportKey {
+            alg: KeyAlg::Rsa2048,
+            alg_id: KeyAlg::Rsa2048.id(),
+            parts: piv::ImportParts::RsaCrt {
+                p: &[1],
+                q: &[2],
+                dp: &[3],
+                dq: &[4],
+                qinv: &[5],
+            },
+        };
+        let primes = piv::ImportKey {
+            parts: piv::ImportParts::RsaPrimes {
+                p: &[1],
+                q: &[2],
+                e: &[1, 0, 1],
+            },
+            ..crt
+        };
+        let body =
+            |k, layout| import_key_body_for(k, PinPolicy::Default, TouchPolicy::Default, layout);
+        assert!(body(&crt, piv::ImportLayout::Yubico).is_ok());
+        assert!(body(&primes, piv::ImportLayout::NitrokeyRsa).is_ok());
+        for (k, layout) in [
+            (&crt, piv::ImportLayout::NitrokeyRsa),
+            (&primes, piv::ImportLayout::Yubico),
+        ] {
+            assert!(matches!(
+                body(k, layout),
+                Err(piv::ImportBodyError::PartsMismatch)
+            ));
+        }
+        let ec = piv::ImportKey {
+            alg: KeyAlg::EccP256,
+            alg_id: KeyAlg::EccP256.id(),
+            parts: piv::ImportParts::Ec { scalar: &[7; 32] },
+        };
+        assert!(body(&ec, piv::ImportLayout::NitrokeyRsa).is_ok());
+        assert!(body(&ec, piv::ImportLayout::Yubico).is_ok());
     }
 
     #[test]
@@ -7946,22 +8483,48 @@ mod tests {
         let slot = Slot::Signature;
         let der = sample_der();
         let obj = compressed_cert_object(&crate::gzip::gzip_member(&der));
-        let st = slot_status_of(slot, &cert_object_decode(&obj));
+        let st = slot_status_of(slot, &cert_object_decode(&obj), SlotKeyPresence::Unknown);
         assert!(st.cert_present);
         assert!(st.cert_compressed);
         assert_eq!(st.cert_len, der.len()); // the DER, not the gzip member
 
         let plain = [0x53, 0x07, 0x70, 0x02, 0xAB, 0xCD, 0x71, 0x01, 0x00];
-        let st = slot_status_of(slot, &cert_object_decode(&plain));
+        let st = slot_status_of(slot, &cert_object_decode(&plain), SlotKeyPresence::Unknown);
         assert!(st.cert_present);
         assert!(!st.cert_compressed);
 
         // Flagged compressed but damaged: present, unreadable, not "compressed".
         let bad = compressed_cert_object(b"not gzip at all, just bytes");
-        let st = slot_status_of(slot, &cert_object_decode(&bad));
+        let st = slot_status_of(slot, &cert_object_decode(&bad), SlotKeyPresence::Unknown);
         assert!(st.cert_present);
         assert!(!st.cert_compressed);
         assert_eq!(st.cert_unreadable, Some(CertUnreadable::Damaged));
+    }
+
+    #[test]
+    fn slot_status_carries_the_key_answer_for_a_slot_with_a_certificate() {
+        // A certificate can sit in a slot that holds no key (or one that
+        // does): the status says which, rather than leaving it unknown.
+        let slot = Slot::CardAuthentication;
+        let plain = [0x53, 0x07, 0x70, 0x02, 0xAB, 0xCD, 0x71, 0x01, 0x00];
+        for key in [
+            SlotKeyPresence::Present,
+            SlotKeyPresence::NoKey,
+            SlotKeyPresence::Unknown,
+        ] {
+            let st = slot_status_of(slot, &cert_object_decode(&plain), key);
+            assert!(st.cert_present);
+            assert_eq!(st.key, key);
+        }
+        // An unreadable certificate keeps the key answer too.
+        let bad = compressed_cert_object(b"not gzip at all, just bytes");
+        let st = slot_status_of(slot, &cert_object_decode(&bad), SlotKeyPresence::NoKey);
+        assert!(st.cert_unreadable.is_some());
+        assert_eq!(st.key, SlotKeyPresence::NoKey);
+        // And a slot without a certificate, as before.
+        let st = slot_status_of(slot, &Ok(None), SlotKeyPresence::Present);
+        assert!(!st.cert_present);
+        assert_eq!(st.key, SlotKeyPresence::Present);
     }
 
     #[test]
