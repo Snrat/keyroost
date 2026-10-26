@@ -153,6 +153,15 @@ pub(crate) struct FidoInfoJson {
     pub ctap2: Option<Ctap2InfoJson>,
 }
 
+/// `keyroostctl fido --json info --reader` — a card in a smart-card reader has
+/// no CTAPHID facts, so only the reader name and the CTAP2 payload.
+#[derive(Serialize)]
+pub(crate) struct FidoReaderInfoJson {
+    pub device: String,
+    /// `null` when the card speaks U2F only.
+    pub ctap2: Option<Ctap2InfoJson>,
+}
+
 /// The authenticatorGetInfo payload (CTAP2 devices only).
 #[derive(Serialize)]
 pub(crate) struct Ctap2InfoJson {
@@ -199,6 +208,11 @@ pub(crate) struct PivStatusJson {
     /// beyond — the same rendering `piv info`'s text output uses.
     pub serial: Option<String>,
     pub pin_retries: Option<u8>,
+    /// `true` when the card reported the PIN verified in the session that
+    /// read this status (then `pin_retries` is `null`). `piv info` never
+    /// verifies the PIN itself, so this is true only when the card kept a
+    /// verification from elsewhere.
+    pub pin_verified: bool,
     pub chuid: Option<PivChuidJson>,
     pub slots: Vec<PivSlotJson>,
     /// Best-effort applet fingerprint — from ATR/SELECT text as well as
@@ -207,7 +221,7 @@ pub(crate) struct PivStatusJson {
     /// form — e.g. `"YubiKey"` or `"OpenFips201::SwissbitIShield2"`.
     pub applet_fingerprint: String,
     /// The token's own reported name, when one was actually discovered
-    /// (currently: a Nitrokey's admin application, for `Trussed::NitroKey`).
+    /// (currently: a Nitrokey's admin application, for `Trussed::Nitrokey`).
     /// Empty when none was — not backfilled with a generic name for
     /// `applet_fingerprint`, so an empty string here means specifically
     /// "the token didn't tell us its name," not "fingerprinting failed."
@@ -216,7 +230,7 @@ pub(crate) struct PivStatusJson {
     pub applet_name: String,
     /// The applet's own firmware version, dotted (same formatting as
     /// `version`), when a specific fingerprint's probe discovered one —
-    /// currently `Trussed::NitroKey` (Trussed's admin application) only.
+    /// currently `Trussed::Nitrokey` (Trussed's admin application) only.
     /// Not necessarily equal to `version`, which is the PIV applet's own
     /// version. `None` when no such probe applies or it found nothing
     /// parseable.
@@ -252,6 +266,20 @@ pub(crate) struct PivSlotJson {
     /// `true` when the certificate is stored gzip-compressed; `cert_len` is
     /// still the DER length.
     pub cert_compressed: bool,
+    /// Whether the slot holds a private key: `true`, `false`, or `null` when
+    /// keyroost can't tell ([`piv_key_present`]).
+    pub key_present: Option<bool>,
+}
+
+/// The JSON form of a slot's key presence. Only a definite answer becomes a
+/// bool; `Unknown` (and any variant added later) is `null`.
+pub(crate) fn piv_key_present(k: keyroost_transport::SlotKeyPresence) -> Option<bool> {
+    use keyroost_transport::SlotKeyPresence;
+    match k {
+        SlotKeyPresence::Present => Some(true),
+        SlotKeyPresence::NoKey => Some(false),
+        _ => None,
+    }
 }
 
 /// The value `--slot` takes for this slot: "9a", "9c", "9d", "9e", "82".."95".
@@ -295,6 +323,11 @@ pub(crate) struct OpenpgpStatusJson {
     pub fingerprint_sig: Option<String>,
     pub fingerprint_dec: Option<String>,
     pub fingerprint_aut: Option<String>,
+    /// `true` when the slot's public key reads back; `null` when it doesn't
+    /// (an empty slot and a card that won't say look the same), never `false`.
+    pub key_present_sig: Option<bool>,
+    pub key_present_dec: Option<bool>,
+    pub key_present_aut: Option<bool>,
     pub user_pin_retries: u8,
     pub reset_code_retries: u8,
     pub admin_pin_retries: u8,
@@ -880,6 +913,7 @@ mod tests {
             ("cert_len", "number"),
             ("cert_unreadable", "string|null"),
             ("cert_compressed", "bool"),
+            ("key_present", "bool|null"),
         ];
         let slot = keyroost_piv::Slot::Authentication;
         for (unreadable, compressed) in [(Some("damaged"), false), (None, true), (None, false)] {
@@ -890,6 +924,7 @@ mod tests {
                 cert_len: 0,
                 cert_unreadable: unreadable,
                 cert_compressed: compressed,
+                key_present: Some(true),
             });
             assert_shape(&v, &shape);
             assert_eq!(v["slot"], "9a");
@@ -898,11 +933,20 @@ mod tests {
     }
 
     #[test]
+    fn piv_key_present_maps_all_three() {
+        use keyroost_transport::SlotKeyPresence;
+        assert_eq!(piv_key_present(SlotKeyPresence::Present), Some(true));
+        assert_eq!(piv_key_present(SlotKeyPresence::NoKey), Some(false));
+        assert_eq!(piv_key_present(SlotKeyPresence::Unknown), None);
+    }
+
+    #[test]
     fn piv_status_shape() {
         let shape = [
             ("version", "string|null"),
             ("serial", "string|null"),
             ("pin_retries", "number|null"),
+            ("pin_verified", "bool"),
             ("chuid", "object|null"),
             ("slots", "array"),
             ("applet_fingerprint", "string"),
@@ -914,6 +958,7 @@ mod tests {
                 version: some.then(|| "5.7.1".to_string()),
                 serial: some.then(|| "12345678".to_string()),
                 pin_retries: some.then_some(3),
+                pin_verified: !some,
                 chuid: some.then(|| PivChuidJson {
                     fasc_n: "d4".into(),
                     guid: "00".into(),
@@ -990,6 +1035,9 @@ mod tests {
             ("fingerprint_sig", "string|null"),
             ("fingerprint_dec", "string|null"),
             ("fingerprint_aut", "string|null"),
+            ("key_present_sig", "bool|null"),
+            ("key_present_dec", "bool|null"),
+            ("key_present_aut", "bool|null"),
             ("user_pin_retries", "number"),
             ("reset_code_retries", "number"),
             ("admin_pin_retries", "number"),
@@ -1004,6 +1052,9 @@ mod tests {
             fingerprint_sig: fpr.clone(),
             fingerprint_dec: fpr.clone(),
             fingerprint_aut: fpr.clone(),
+            key_present_sig: Some(true),
+            key_present_dec: None,
+            key_present_aut: None,
             user_pin_retries: 3,
             reset_code_retries: 0,
             admin_pin_retries: 3,

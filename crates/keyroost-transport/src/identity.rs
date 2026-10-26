@@ -10,7 +10,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use pcsc::{Context, Protocols, Scope, ShareMode};
+use pcsc::{Protocols, ShareMode};
 
 use crate::trace;
 use keyroost_proto::trace::{format_line, Dir};
@@ -83,30 +83,81 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// Whether the FIDO interface at `path` speaks CBOR (CTAP2), from the
-/// capability byte of its CTAPHID INIT answer; `false` means U2F (CTAP1)
-/// only. INIT is the only command sent. `None` when the interface can't be
-/// opened or doesn't answer.
-pub fn ctaphid_speaks_cbor(path: &Path, debug: bool) -> Option<bool> {
-    let shown = path.display().to_string();
-    match keyroost_ctap::CtapHidDevice::open(path) {
-        Ok((_, init)) => {
-            trace::line(debug, || {
-                format_line(
-                    Dir::Note,
-                    "identity",
-                    &format!("{shown} ctaphid init caps=0x{:02x}", init.capabilities),
-                )
-            });
-            Some(init.supports_cbor())
-        }
-        Err(e) => {
-            trace::line(debug, || {
-                format_line(Dir::Note, "identity", &format!("{shown} open failed: {e}"))
-            });
-            None
-        }
+/// What a FIDO interface said to CTAPHID INIT, the first question keyroost
+/// asks it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitAnswer {
+    /// INIT answered; `true` when its capability byte says CBOR (CTAP2),
+    /// `false` for U2F (CTAP1) only.
+    Cbor(bool),
+    /// The interface didn't open (no permission, held by another program,
+    /// gone), an I/O or backend error stopped INIT, or INIT got a "not now"
+    /// CTAPHID error (busy, locked to another channel, message timeout,
+    /// invalid channel or sequence). Nothing is known about the key; worth
+    /// asking again.
+    NotOpened,
+    /// The interface opened, but INIT timed out, the reply was malformed
+    /// (too short, too long, wrong command, out of sequence) or it was
+    /// another device error. An INIT answer carrying another program's
+    /// nonce is skipped, not counted.
+    NoProperAnswer,
+}
+
+/// Classify one INIT attempt: `open` is whether the interface could be
+/// opened at all ([`keyroost_ctap::CtapHidDevice::check_access`]), and
+/// `init` opens it and sends INIT, called only when `open` succeeded.
+pub fn init_answer_from(
+    open: Result<(), keyroost_ctap::hid::HidTransportError>,
+    init: impl FnOnce()
+        -> Result<keyroost_ctap::hid::InitResponse, keyroost_ctap::hid::HidTransportError>,
+) -> InitAnswer {
+    use keyroost_ctap::hid::HidTransportError as E;
+    if open.is_err() {
+        return InitAnswer::NotOpened;
     }
+    match init() {
+        Ok(init) => InitAnswer::Cbor(init.supports_cbor()),
+        // A "not now" error says nothing about the key; any other error code
+        // is its answer, and not a proper one.
+        Err(e @ E::DeviceError(_)) => match ctaphid_error_answer::<()>(&e) {
+            KeyAnswer::NoAnswer => InitAnswer::NotOpened,
+            _ => InitAnswer::NoProperAnswer,
+        },
+        Err(
+            E::Timeout
+            | E::InitResponseTooShort
+            | E::UnexpectedCommand { .. }
+            | E::OutOfSequence { .. }
+            | E::PayloadTooLarge(_),
+        ) => InitAnswer::NoProperAnswer,
+        // I/O on the interface failed (the open for INIT, or a read or
+        // write): no exchange took place.
+        Err(_) => InitAnswer::NotOpened,
+    }
+}
+
+/// Whether the FIDO interface at `path` speaks CBOR (CTAP2), from the
+/// capability byte of its CTAPHID INIT answer (see [`InitAnswer`]). INIT is
+/// the only command sent, and only to an interface that opens.
+pub fn ctaphid_speaks_cbor(path: &Path, debug: bool) -> InitAnswer {
+    let shown = path.display().to_string();
+    let note = |body: String| {
+        trace::line(debug, || {
+            format_line(Dir::Note, "identity", &format!("{shown} {body}"))
+        })
+    };
+    let open = keyroost_ctap::CtapHidDevice::check_access(path)
+        .inspect_err(|e| note(format!("open failed: {e}")));
+    let answer = init_answer_from(open, || {
+        keyroost_ctap::CtapHidDevice::open(path)
+            .map(|(_, init)| init)
+            .inspect(|init| note(format!("ctaphid init caps=0x{:02x}", init.capabilities)))
+            .inspect_err(|e| note(format!("ctaphid init failed: {e}")))
+    });
+    if answer == InitAnswer::NoProperAnswer {
+        note("no proper init answer".into());
+    }
+    answer
 }
 
 /// Send one CTAPHID vendor command on a fresh channel and return the reply.
@@ -172,7 +223,7 @@ pub fn ccid_applet_read(
     if keyroost_proto::is_molto2_reader(reader) {
         return None;
     }
-    let ctx = Context::establish(Scope::User).ok()?;
+    let ctx = crate::establish_context().ok()?;
     let name = std::ffi::CString::new(reader).ok()?;
     let card = match ctx.connect(&name, ShareMode::Shared, Protocols::ANY) {
         Ok(c) => c,
@@ -305,6 +356,87 @@ mod tests {
         assert_eq!(answer(E::Backend("gone".into())), KeyAnswer::NoAnswer);
     }
 
+    fn init_with_caps(capabilities: u8) -> keyroost_ctap::hid::InitResponse {
+        keyroost_ctap::hid::InitResponse {
+            channel_id: 1,
+            protocol_version: 2,
+            device_major: 0,
+            device_minor: 0,
+            device_build: 0,
+            capabilities,
+        }
+    }
+
+    /// An interface that doesn't open is "couldn't ask" and INIT is never
+    /// sent; an answered INIT says CBOR or not; a "not now" error is
+    /// "couldn't ask" too; anything else after a good open is no proper
+    /// answer.
+    #[test]
+    fn init_errors_split_into_not_opened_and_no_proper_answer() {
+        use keyroost_ctap::hid::{HidTransportError as E, *};
+        let denied = || E::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(
+            init_answer_from(Err(denied()), || panic!("INIT sent to a closed interface")),
+            InitAnswer::NotOpened
+        );
+        assert_eq!(
+            init_answer_from(Err(E::Backend("busy".into())), || panic!("INIT sent")),
+            InitAnswer::NotOpened
+        );
+        assert_eq!(
+            init_answer_from(Ok(()), || Ok(init_with_caps(CAPABILITY_CBOR))),
+            InitAnswer::Cbor(true)
+        );
+        assert_eq!(
+            init_answer_from(Ok(()), || Ok(init_with_caps(CAPABILITY_WINK))),
+            InitAnswer::Cbor(false)
+        );
+        for not_now in [
+            CTAPHID_ERR_CHANNEL_BUSY,
+            CTAPHID_ERR_LOCK_REQUIRED,
+            CTAPHID_ERR_MSG_TIMEOUT,
+            CTAPHID_ERR_INVALID_CHANNEL,
+            CTAPHID_ERR_INVALID_SEQ,
+        ] {
+            assert_eq!(
+                init_answer_from(Ok(()), || Err(E::DeviceError(not_now))),
+                InitAnswer::NotOpened,
+                "error 0x{not_now:02x}"
+            );
+        }
+        // The check passed, but the open for INIT failed after all.
+        assert_eq!(
+            init_answer_from(Ok(()), || Err(denied())),
+            InitAnswer::NotOpened
+        );
+        assert_eq!(
+            init_answer_from(Ok(()), || Err(E::Backend("gone".into()))),
+            InitAnswer::NotOpened
+        );
+        for no_proper_answer in [
+            E::Timeout,
+            E::InitResponseTooShort,
+            E::UnexpectedCommand {
+                expected: 0x86,
+                got: 0x83,
+            },
+            E::OutOfSequence {
+                expected: 0,
+                got: 3,
+            },
+            E::PayloadTooLarge(70_000),
+            E::DeviceError(CTAPHID_ERR_INVALID_CMD),
+            E::DeviceError(CTAPHID_ERR_OTHER),
+        ] {
+            let shown = format!("{no_proper_answer:?}");
+            assert_eq!(
+                init_answer_from(Ok(()), || Err(no_proper_answer)),
+                InitAnswer::NoProperAnswer,
+                "{shown}"
+            );
+        }
+    }
+
     #[test]
     fn a_reply_that_cant_be_read_is_declined() {
         let reply = KeyAnswer::Reply(vec![1u8]);
@@ -319,9 +451,13 @@ mod tests {
         );
     }
 
+    // Every test that tries to open a HID path lives here, so no two run at
+    // once: in the macOS nix build, two tests opening HID paths in parallel
+    // crashed the test binary.
     #[test]
     fn unreachable_hid_paths_get_no_answer_and_are_traced() {
         let p = std::path::Path::new("/nonexistent/keyroost-identity-test");
+        assert_eq!(ctaphid_speaks_cbor(p, false), InitAnswer::NotOpened);
         crate::trace::begin();
         assert_eq!(
             ctaphid_vendor_read(p, YUBICO_CTAPHID_READ_CONFIG, &[0x00], false),

@@ -300,6 +300,16 @@ impl Slot {
     }
 }
 
+/// The note both front ends show when a certificate goes into a slot that
+/// holds no key: the slot as its two-hex key reference, then what follows.
+#[must_use]
+pub fn keyless_cert_note(slot: Slot) -> String {
+    format!(
+        "Slot {:02X} has no key. This certificate won't work until a matching key is put in this slot.",
+        slot.key_ref()
+    )
+}
+
 /// CHUID (Card Holder Unique Identifier) data-object tag.
 pub const OBJECT_CHUID: [u8; 3] = [0x5F, 0xC1, 0x02];
 
@@ -2442,6 +2452,18 @@ pub fn read_ber_len(buf: &[u8]) -> Result<(usize, usize), ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyless_cert_note_wording() {
+        assert_eq!(
+            keyless_cert_note(Slot::Authentication),
+            "Slot 9A has no key. This certificate won't work until a matching key is put in this slot."
+        );
+        assert_eq!(
+            keyless_cert_note(Slot::retired(1).unwrap()),
+            "Slot 82 has no key. This certificate won't work until a matching key is put in this slot."
+        );
+    }
 
     #[test]
     fn select_bytes() {

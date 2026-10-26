@@ -383,6 +383,12 @@ impl HidOtpTransport {
 
     /// Open a specific hidraw / platform device path.
     pub fn open_path(path: &Path) -> Result<Self, OtpTransportError> {
+        if keyroost_proto::devices_hidden() {
+            // Same answer as the CTAP HID gate: the device isn't there.
+            return Err(OtpTransportError::TransportUnavailable(
+                std::io::Error::from(std::io::ErrorKind::NotFound).to_string(),
+            ));
+        }
         let io = Self::open_io(path)?;
         Ok(Self {
             io,
@@ -838,7 +844,7 @@ impl PcScOtpTransport {
     /// As [`open_first`](Self::open_first), but with optional tracing of each
     /// reader connect + SELECT so failures are diagnosable.
     pub fn open_first_debug(debug: bool) -> Result<Self, OtpTransportError> {
-        let ctx = pcsc::Context::establish(pcsc::Scope::User)?;
+        let ctx = crate::establish_context()?;
         let mut buf = [0u8; 4096];
         let names: Vec<std::ffi::CString> =
             ctx.list_readers(&mut buf)?.map(|r| r.to_owned()).collect();
@@ -894,7 +900,7 @@ impl PcScOtpTransport {
     /// [`open_first`](Self::open_first) this never scans other readers, so a
     /// caller that resolved a `--device` selection binds to exactly that reader.
     pub fn open_reader_debug(reader_name: &str, debug: bool) -> Result<Self, OtpTransportError> {
-        let ctx = pcsc::Context::establish(pcsc::Scope::User)?;
+        let ctx = crate::establish_context()?;
         let cname = std::ffi::CString::new(reader_name).map_err(|_| {
             OtpTransportError::TransportUnavailable("reader name contained a NUL".into())
         })?;

@@ -34,7 +34,7 @@
 
 use keyroost_ctap::cmd::CtapError;
 use keyroost_ctap::transport::CtapTransport;
-use pcsc::{Card, Context, Protocols, Scope, ShareMode};
+use pcsc::{Card, Protocols, ShareMode};
 
 /// FIDO applet AID — `A0 00 00 06 47 2F 00 01`.
 const FIDO_AID: [u8; 8] = [0xA0, 0x00, 0x00, 0x06, 0x47, 0x2F, 0x00, 0x01];
@@ -84,7 +84,7 @@ impl CtapPcscDevice {
     /// transport. Fails if the reader has no card, or the card has no FIDO
     /// applet (e.g. an OATH-only or PIV-only card).
     pub fn open(reader_name: &str) -> Result<Self, CtapError> {
-        let ctx = Context::establish(Scope::User)
+        let ctx = crate::establish_context()
             .map_err(|e| CtapError::Transport(format!("PC/SC unavailable: {e}")))?;
         let cname = std::ffi::CString::new(reader_name)
             .map_err(|_| CtapError::Transport("reader name contains NUL".into()))?;
@@ -114,7 +114,7 @@ impl CtapPcscDevice {
     /// avoids resetting the card (see the `Drop` impl) because a power cycle
     /// tears down other sessions on the same card.
     pub fn open_after_power_cycle(reader_name: &str) -> Result<Self, CtapError> {
-        let ctx = Context::establish(Scope::User)
+        let ctx = crate::establish_context()
             .map_err(|e| CtapError::Transport(format!("PC/SC unavailable: {e}")))?;
         let cname = std::ffi::CString::new(reader_name)
             .map_err(|_| CtapError::Transport("reader name contains NUL".into()))?;
@@ -140,7 +140,7 @@ impl CtapPcscDevice {
     /// skipped, so a front-end can auto-pick a lone FIDO card or list the
     /// choices — the same shape as the OATH/OpenPGP/PIV listers.
     pub fn list_fido_readers() -> Result<Vec<String>, CtapError> {
-        let ctx = Context::establish(Scope::User)
+        let ctx = crate::establish_context()
             .map_err(|e| CtapError::Transport(format!("PC/SC unavailable: {e}")))?;
         let mut buf = [0u8; 4096];
         let names: Vec<std::ffi::CString> = ctx
@@ -168,6 +168,18 @@ impl CtapPcscDevice {
     /// The applet-select answer string (`U2F_V2` or `FIDO_2_0`).
     pub fn selected_version(&self) -> &[u8] {
         &self.selected_version
+    }
+
+    /// `get_info`, except that a card selected as `U2F_V2` (some cards add
+    /// trailing bytes to that answer) which explicitly rejects the command
+    /// (`6D00`, `6E00` or CTAP2 status `01`) returns `Ok(None)`: it speaks
+    /// U2F only. `U2F_V2` also names dual-protocol cards, so GetInfo is
+    /// always asked first; every other error passes through.
+    pub fn get_info_unless_u2f_only(
+        &mut self,
+    ) -> Result<Option<keyroost_ctap::AuthenticatorInfo>, CtapError> {
+        let u2f = selected_u2f(&self.selected_version);
+        info_unless_u2f_only(self, u2f)
     }
 
     fn select_fido_applet(&mut self) -> Result<(), CtapError> {
@@ -314,9 +326,7 @@ impl CtapPcscDevice {
 
         let (data, sw1, sw2) = last;
         if (sw1, sw2) != (0x90, 0x00) {
-            return Err(CtapError::Transport(format!(
-                "authenticator returned ISO status {sw1:02X}{sw2:02X}"
-            )));
+            return Err(CtapError::Apdu { sw1, sw2 });
         }
         Ok(data)
     }
@@ -339,5 +349,103 @@ impl CtapTransport for CtapPcscDevice {
             )));
         }
         self.send_ctap_message(payload)
+    }
+}
+
+/// Whether the FIDO applet's SELECT answer is `U2F_V2`; some cards add
+/// trailing bytes after it.
+fn selected_u2f(version: &[u8]) -> bool {
+    version.starts_with(b"U2F_V2")
+}
+
+fn info_unless_u2f_only(
+    dev: &mut impl CtapTransport,
+    u2f_selected: bool,
+) -> Result<Option<keyroost_ctap::AuthenticatorInfo>, CtapError> {
+    match keyroost_ctap::get_info(dev) {
+        Ok(info) => Ok(Some(info)),
+        Err(
+            CtapError::Apdu {
+                sw1: 0x6D | 0x6E,
+                sw2: 0x00,
+            }
+            | CtapError::StatusCode(0x01),
+        ) if u2f_selected => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Reply(Result<Vec<u8>, CtapError>);
+
+    impl CtapTransport for Reply {
+        fn transact(&mut self, cmd: u8, payload: &[u8]) -> Result<Vec<u8>, CtapError> {
+            assert_eq!(cmd, keyroost_ctap::hid::CTAPHID_CBOR);
+            assert_eq!(payload, &[keyroost_ctap::cmd::CTAP2_GET_INFO]);
+            std::mem::replace(&mut self.0, Err(CtapError::EmptyResponse))
+        }
+    }
+
+    #[test]
+    fn reader_info_probes_ctap2_after_u2f_select() {
+        // Status OK; {1: ["U2F_V2", "FIDO_2_0"], 3: h'0000...'}.
+        let mut reply = vec![0, 0xa2, 1, 0x82, 0x66];
+        reply.extend_from_slice(b"U2F_V2");
+        reply.push(0x68);
+        reply.extend_from_slice(b"FIDO_2_0");
+        reply.extend_from_slice(&[3, 0x50]);
+        reply.extend_from_slice(&[0; 16]);
+        let info = info_unless_u2f_only(&mut Reply(Ok(reply)), true)
+            .unwrap()
+            .expect("dual-protocol card must expose CTAP2");
+        assert!(info.versions.iter().any(|v| v == "FIDO_2_0"));
+    }
+
+    #[test]
+    fn a_u2f_v2_select_answer_may_carry_trailing_bytes() {
+        assert!(selected_u2f(b"U2F_V2"));
+        assert!(selected_u2f(b"U2F_V2\x00"));
+        assert!(selected_u2f(b"U2F_V2 extra"));
+        assert!(!selected_u2f(b"FIDO_2_0"));
+        assert!(!selected_u2f(b"U2F_V"));
+        assert!(!selected_u2f(b""));
+    }
+
+    #[test]
+    fn reader_info_only_falls_back_on_explicit_unsupported_commands() {
+        let apdu = |sw1, sw2| CtapError::Apdu { sw1, sw2 };
+        for err in [apdu(0x6D, 0x00), apdu(0x6E, 0x00), CtapError::StatusCode(1)] {
+            assert!(info_unless_u2f_only(&mut Reply(Err(err)), true)
+                .unwrap()
+                .is_none());
+        }
+        for err in [
+            apdu(0x69, 0x82),
+            apdu(0x6F, 0x00),
+            CtapError::Transport("card removed".into()),
+            CtapError::EmptyResponse,
+        ] {
+            assert!(info_unless_u2f_only(&mut Reply(Err(err)), true).is_err());
+        }
+        // Not a U2F_V2 selection: the error passes through.
+        for err in [apdu(0x6D, 0x00), apdu(0x6E, 0x00), CtapError::StatusCode(1)] {
+            assert!(info_unless_u2f_only(&mut Reply(Err(err)), false).is_err());
+        }
+        assert!(info_unless_u2f_only(&mut Reply(Ok(vec![0, 0xff])), true).is_err());
+    }
+
+    #[test]
+    fn apdu_error_names_the_refusal() {
+        assert_eq!(
+            CtapError::Apdu {
+                sw1: 0x6D,
+                sw2: 0x00
+            }
+            .to_string(),
+            "the card refused the FIDO request (6D00)"
+        );
     }
 }

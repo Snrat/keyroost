@@ -2610,16 +2610,21 @@ enum MoltoCustomerKeyCmd {
     },
 }
 
-/// FIDO2 / CTAP2 subcommands. These talk to the key over USB HID (`fido reset
-/// --reader` can use a smart-card reader instead).
+/// FIDO2 / CTAP2 subcommands. These talk to the key over USB HID (`fido info
+/// --reader` and `fido reset --reader` can use a smart-card reader instead).
 #[derive(Subcommand)]
 enum FidoCmd {
     /// Show the key's FIDO2 capabilities and settings.
     ///
-    /// Runs authenticatorGetInfo.
+    /// Runs authenticatorGetInfo. Over a smart-card reader, `--json` has only
+    /// `device` (the reader name) and `ctap2`.
     Info {
-        #[arg(long, value_name = "PATH", help = PATH_HELP)]
+        #[arg(long, value_name = "PATH", conflicts_with = "reader", help = PATH_HELP)]
         path: Option<std::path::PathBuf>,
+        /// Smart-card reader holding the card (name contains this text); talks
+        /// over the smart-card interface instead of USB.
+        #[arg(long, value_name = "SUBSTR")]
+        reader: Option<String>,
     },
     /// Factory-reset FIDO2: wipe every credential (passkeys and security-key
     /// sign-ins) and the PIN. Irreversible: asks first (`--yes` to skip).
@@ -6595,6 +6600,42 @@ const HID_PERMISSION_HINT: &str = " — install the udev rules (see README) and 
 #[cfg(not(target_os = "linux"))]
 const HID_PERMISSION_HINT: &str = "";
 
+/// What `doctor` says about a plugged-in key whose smart-card interface has
+/// no reader listed for it (Linux; see
+/// [`keyroost_resolve::smart_cards_without_reader`]).
+// Used on Linux and by the tests.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn no_reader_hint(card: &keyroost_hid::UsbSmartCard) -> String {
+    let ids = format!("{:04x}:{:04x}", card.vendor_id, card.product_id);
+    let who = if card.product_name.trim().is_empty() {
+        ids
+    } else {
+        format!("{} ({ids})", sanitize_terminal(&card.product_name))
+    };
+    format!(
+        "– {who} has a smart-card interface, but the smart-card service lists no reader for it.\n  \
+         Its PIV/OpenPGP features can't be reached on this system. The usual cause is a smart-card\n  \
+         driver (libccid) that doesn't recognize this model yet."
+    )
+}
+
+/// Linux: one [`no_reader_hint`] per plugged-in key whose smart-card
+/// interface has no reader listed. Reads sysfs and each reader's USB position
+/// (no APDU, never a Molto2); says nothing when any reader's position can't
+/// be read.
+#[cfg(target_os = "linux")]
+fn print_no_reader_hints() {
+    let cards = keyroost_hid::usb_smart_cards();
+    if cards.is_empty() {
+        return;
+    }
+    if let Ok(readers) = keyroost_transport::reader_usb_devices() {
+        for card in keyroost_resolve::smart_cards_without_reader(&cards, &readers) {
+            println!("{}", no_reader_hint(&card));
+        }
+    }
+}
+
 /// Environment diagnosis: each check prints one ✓/✗/– line with the fix
 /// inline. Never touches card state and always exits 0 — it's a flashlight,
 /// not a gate.
@@ -6619,6 +6660,8 @@ fn run_doctor() {
                     println!("    {}{}", sanitize_terminal(r), tag);
                 }
             }
+            #[cfg(target_os = "linux")]
+            print_no_reader_hints();
         }
         Err(e) => {
             println!("✗ PC/SC unavailable: {}", e);
@@ -6732,6 +6775,9 @@ const ADMIN_ONLY_FIDO_NOTE: &str = "note: a FIDO key is plugged in, but Windows 
 /// open. Seen through the HID usage page alone, without opening the device.
 /// Always false elsewhere.
 fn admin_only_fido_key_present() -> bool {
+    if keyroost_proto::devices_hidden() {
+        return false;
+    }
     keyroost_winwebauthn::fido_key_present()
 }
 
@@ -9290,6 +9336,14 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
         OpenpgpCmd::Info { reader } => {
             let mut session = open_openpgp(reader.as_deref(), debug)?;
             let status = session.status()?;
+            // Read-only public-key reads (no PIN); any failure is "unknown".
+            let present = |s: &mut keyroost_transport::OpenPgpSession,
+                           crt: keyroost_openpgp::KeyCrt| {
+                s.key_present(crt)
+            };
+            let key_present_sig = present(&mut session, keyroost_openpgp::KeyCrt::Sign);
+            let key_present_dec = present(&mut session, keyroost_openpgp::KeyCrt::Decrypt);
+            let key_present_aut = present(&mut session, keyroost_openpgp::KeyCrt::Auth);
 
             if json_output() {
                 // An all-zero fingerprint means "no key in that slot" — mirror the
@@ -9310,6 +9364,9 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                     fingerprint_sig: fpr(&status.fingerprint_sig),
                     fingerprint_dec: fpr(&status.fingerprint_dec),
                     fingerprint_aut: fpr(&status.fingerprint_aut),
+                    key_present_sig,
+                    key_present_dec,
+                    key_present_aut,
                     user_pin_retries: status.tries_pw1,
                     reset_code_retries: status.tries_rc,
                     admin_pin_retries: status.tries_pw3,
@@ -9332,9 +9389,9 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 status.algorithm_label(keyroost_openpgp::KeyCrt::Decrypt),
                 status.algorithm_label(keyroost_openpgp::KeyCrt::Auth),
             );
-            print_fingerprint("Signature  fpr", &status.fingerprint_sig);
-            print_fingerprint("Decryption fpr", &status.fingerprint_dec);
-            print_fingerprint("Auth       fpr", &status.fingerprint_aut);
+            print_fingerprint("Signature  fpr", &status.fingerprint_sig, key_present_sig);
+            print_fingerprint("Decryption fpr", &status.fingerprint_dec, key_present_dec);
+            print_fingerprint("Auth       fpr", &status.fingerprint_aut, key_present_aut);
             println!(
                 "PIN retries:    PW1={} RC={} PW3={}",
                 status.tries_pw1, status.tries_rc, status.tries_pw3
@@ -9699,6 +9756,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                                 .map(keyroost_piv::format_version_bytes),
                             serial: status.serial.map(keyroost_piv::format_serial_short),
                             pin_retries: status.pin_retries,
+                            pin_verified: status.pin_verified,
                             chuid: status.chuid.as_ref().map(|c| json_out::PivChuidJson {
                                 fasc_n: c.fasc_n_display(),
                                 guid: c.guid_display(),
@@ -9716,6 +9774,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                                     cert_len: if s.cert_present { s.cert_len } else { 0 },
                                     cert_unreadable: s.cert_unreadable.map(|r| r.code()),
                                     cert_compressed: s.cert_compressed,
+                                    key_present: json_out::piv_key_present(s.key),
                                 })
                                 .collect(),
                             applet_fingerprint: status.applet_fingerprint.to_string(),
@@ -9776,7 +9835,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         // `piv info` never verifies the PIN and opens its
                         // own session, so this shows only if the card kept
                         // a verification from elsewhere; still say so.
-                        None if status.pin_verified => println!("PIN retries: (PIN accepted)"),
+                        None if status.pin_verified => println!("PIN retries: (PIN verified)"),
                         None => println!("PIN retries: (unavailable)"),
                     }
                     match &status.chuid {
@@ -10377,6 +10436,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 |s| -> Result<(), Box<dyn std::error::Error>> {
                     let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
                     authenticate_piv(s, &mgmt)?;
+                    // `slot_key_presence` resolves the slot itself (at most one
+                    // GET METADATA), so this is a real answer, not just the cache.
+                    let presence = s.slot_key_presence(slot.to_slot());
                     let choice = compression.choice();
                     let stored = s
                         .import_certificate(slot.to_slot(), &der, choice)
@@ -10389,6 +10451,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         ),
                         &stored,
                     );
+                    if let Some(note) = keyless_import_note(presence, slot.to_slot()) {
+                        output::note(&note);
+                    }
                     Ok(())
                 },
             )?;
@@ -11269,6 +11334,16 @@ fn guard_piv_policy_value(
         "{value_label} is known to be unsupported on this device. Pass --force to run anyway."
     )
     .into())
+}
+
+/// The note after a certificate import, only for a slot confirmed to hold no
+/// key; a present or unreadable key says nothing.
+fn keyless_import_note(
+    presence: keyroost_transport::SlotKeyPresence,
+    slot: keyroost_piv::Slot,
+) -> Option<String> {
+    (presence == keyroost_transport::SlotKeyPresence::NoKey)
+        .then(|| keyroost_piv::keyless_cert_note(slot))
 }
 
 /// The slot as typed on the command line (`9a`, `82`, …).
@@ -12287,11 +12362,22 @@ fn load_pubkey_material(
 }
 
 /// Print a key fingerprint, rendering an all-zero (no key) slot as "(none)".
-fn print_fingerprint(label: &str, fpr: &[u8; 20]) {
+fn print_fingerprint(label: &str, fpr: &[u8; 20], key_present: Option<bool>) {
+    println!("{}: {}", label, fingerprint_text(fpr, key_present));
+}
+
+/// The value half of an `openpgp info` fingerprint line. An all-zero
+/// fingerprint is "(none)"; if the slot's public key read back anyway, say
+/// so. `None` (the read failed, for any reason) never changes the text.
+fn fingerprint_text(fpr: &[u8; 20], key_present: Option<bool>) -> String {
     if fpr.iter().all(|&b| b == 0) {
-        println!("{}: (none)", label);
+        if key_present == Some(true) {
+            "(none), but a key is present".to_string()
+        } else {
+            "(none)".to_string()
+        }
     } else {
-        println!("{}: {}", label, hex_encode(fpr));
+        hex_encode(fpr)
     }
 }
 
@@ -13038,12 +13124,16 @@ fn fido_reverify_with<I: crate::secrets::SecretIo>(
 
 fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        FidoCmd::Info { path } => {
-            run_fido_info(path.as_deref())?;
+        FidoCmd::Info { path, reader } => {
+            let dev = crate::target::select_fido_any(reader.as_deref(), path.as_deref())?;
+            match fido_route(&dev, reader.is_some())? {
+                FidoRoute::Card { reader } => run_fido_info_reader(&reader)?,
+                FidoRoute::Hid { path } => run_fido_info(&path)?,
+            }
             Ok(())
         }
         FidoCmd::Reset { yes, path, reader } => {
-            let dev = crate::target::select(Need::FidoAny, reader.as_deref(), path.as_deref())?;
+            let dev = crate::target::select_fido_any(reader.as_deref(), path.as_deref())?;
             // The USB ids are what a key with no serial is re-found by after
             // the replug; read them now, while the key is surely connected,
             // not after a question the user may answer with it unplugged.
@@ -13052,9 +13142,9 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
                 &keyroost_hid::enumerate().unwrap_or_default(),
             );
             crate::prompt::confirm_on(&dev, *yes, "wipe every FIDO2 credential and the PIN")?;
-            match fido_reset_route(&dev, reader.is_some())? {
-                FidoResetRoute::Card { reader } => run_fido_reset_reader(&reader)?,
-                FidoResetRoute::Replug { path } => fido_reset_after_replug(
+            match fido_route(&dev, reader.is_some())? {
+                FidoRoute::Card { reader } => run_fido_reset_reader(&reader)?,
+                FidoRoute::Hid { path } => fido_reset_after_replug(
                     &path,
                     dev.name.as_deref().unwrap_or(&dev.model),
                     &dev.serial,
@@ -14284,9 +14374,54 @@ fn hex_ascii_dump(bytes: &[u8]) -> String {
     out
 }
 
-fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
-    let path = crate::target::fido_path(path)?;
-    let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(&path)?;
+fn ctap2_json(info: &keyroost_ctap::AuthenticatorInfo) -> json_out::Ctap2InfoJson {
+    json_out::Ctap2InfoJson {
+        versions: info.versions.clone(),
+        extensions: info.extensions.clone(),
+        aaguid: format_aaguid(&info.aaguid),
+        options: info
+            .options
+            .iter()
+            .map(|(k, v)| json_out::OptionJson {
+                name: k.clone(),
+                value: *v,
+            })
+            .collect(),
+        max_msg_size: info.max_msg_size,
+        pin_uv_auth_protocols: info.pin_uv_auth_protocols.clone(),
+        transports: info.transports.clone(),
+        min_pin_length: info.min_pin_length,
+        force_pin_change: info.force_pin_change,
+        firmware_version: info.firmware_version,
+    }
+}
+
+/// `fido info` for a card in a smart-card reader: no CTAPHID facts exist
+/// there, so the output is the reader name and the CTAP2 block.
+fn run_fido_info_reader(reader: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut dev = keyroost_transport::CtapPcscDevice::open(reader)?;
+    let ctap2 = dev.get_info_unless_u2f_only()?;
+    if json_output() {
+        emit_json(&json_out::FidoReaderInfoJson {
+            device: reader.to_owned(),
+            ctap2: ctap2.as_ref().map(ctap2_json),
+        })?;
+        return Ok(());
+    }
+    println!(
+        "{}",
+        output::kv_block(&[("Device", sanitize_terminal(reader))])
+    );
+    println!();
+    match ctap2 {
+        Some(info) => println!("{}", output::kv_block(&fido_info_rows(&info))),
+        None => println!("(device is U2F-only; CTAP2 GetInfo not available)"),
+    }
+    Ok(())
+}
+
+fn run_fido_info(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(path)?;
     let json = json_output();
     let mut caps = Vec::new();
     if init.supports_wink() {
@@ -14359,25 +14494,7 @@ fn run_fido_info(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::erro
             ),
             hid_caps: caps,
             hid_caps_raw: init.capabilities,
-            ctap2: Some(json_out::Ctap2InfoJson {
-                versions: info.versions.clone(),
-                extensions: info.extensions.clone(),
-                aaguid: format_aaguid(&info.aaguid),
-                options: info
-                    .options
-                    .iter()
-                    .map(|(k, v)| json_out::OptionJson {
-                        name: k.clone(),
-                        value: *v,
-                    })
-                    .collect(),
-                max_msg_size: info.max_msg_size,
-                pin_uv_auth_protocols: info.pin_uv_auth_protocols.clone(),
-                transports: info.transports.clone(),
-                min_pin_length: info.min_pin_length,
-                force_pin_change: info.force_pin_change,
-                firmware_version: info.firmware_version,
-            }),
+            ctap2: Some(ctap2_json(&info)),
         })?;
         return Ok(());
     }
@@ -14431,30 +14548,27 @@ fn fido_info_rows(info: &keyroost_ctap::AuthenticatorInfo) -> Vec<(&'static str,
     rows
 }
 
-/// How `fido reset` reaches the selected key's FIDO2 applet.
+/// How `fido info` and `fido reset` reach the selected key's FIDO2 applet.
 #[derive(Debug, PartialEq, Eq)]
-enum FidoResetRoute {
-    /// Over USB HID: the key is replugged to open the reset window.
-    Replug { path: std::path::PathBuf },
-    /// A card in a PC/SC reader: power-cycled in place instead.
+enum FidoRoute {
+    /// Over USB HID (a reset replugs the key to open its window).
+    Hid { path: std::path::PathBuf },
+    /// A card in a PC/SC reader (a reset power-cycles it in place instead).
     Card { reader: String },
 }
 
-/// Pick the route for a FIDO2 reset of `dev`: HID with a replug when the key
-/// has a FIDO HID node, unless `--reader` asked for the card interface (or
-/// there is no HID node, as for a card in a reader).
-fn fido_reset_route(
-    dev: &keyroost_resolve::Device,
-    reader_given: bool,
-) -> Result<FidoResetRoute, String> {
+/// Pick the route to `dev`'s FIDO2 applet: HID when the key has a FIDO HID
+/// node, unless `--reader` asked for the card interface (or there is no HID
+/// node, as for a card in a reader).
+fn fido_route(dev: &keyroost_resolve::Device, reader_given: bool) -> Result<FidoRoute, String> {
     match (&dev.hid_path, &dev.reader) {
-        (Some(path), _) if !reader_given => Ok(FidoResetRoute::Replug { path: path.clone() }),
-        (_, Some(reader)) => Ok(FidoResetRoute::Card {
+        (Some(path), _) if !reader_given => Ok(FidoRoute::Hid { path: path.clone() }),
+        (_, Some(reader)) => Ok(FidoRoute::Card {
             reader: reader.clone(),
         }),
-        (Some(path), None) => Ok(FidoResetRoute::Replug { path: path.clone() }),
+        (Some(path), None) => Ok(FidoRoute::Hid { path: path.clone() }),
         (None, None) => Err(format!(
-            "'{}' has neither a FIDO HID interface nor a smart-card reader to reset it over",
+            "'{}' has neither a FIDO HID interface nor a smart-card reader to reach it over",
             sanitize_terminal(dev.name.as_deref().unwrap_or(&dev.model))
         )),
     }
@@ -15369,6 +15483,43 @@ mod human_style_tests {
                 "Serial:     T2M-0001\nDevice UTC: {} (epoch)\n",
                 info.utc_time
             )
+        );
+    }
+
+    fn smart_card(name: &str) -> keyroost_hid::UsbSmartCard {
+        keyroost_hid::UsbSmartCard {
+            vendor_id: 0x349e,
+            product_id: 0x0024,
+            product_name: name.into(),
+            usb_device: keyroost_hid::UsbDeviceKey::BusAddr(1, 7),
+        }
+    }
+
+    #[test]
+    fn doctor_no_reader_hint_text() {
+        assert_eq!(
+            no_reader_hint(&smart_card("PIN+ Key")),
+            "– PIN+ Key (349e:0024) has a smart-card interface, but the smart-card \
+             service lists no reader for it.\n  \
+             Its PIV/OpenPGP features can't be reached on this system. The usual \
+             cause is a smart-card\n  \
+             driver (libccid) that doesn't recognize this model yet."
+        );
+    }
+
+    #[test]
+    fn doctor_no_reader_hint_neutralizes_the_product_name() {
+        let hint = no_reader_hint(&smart_card("Evil\x1b[2J\nKey"));
+        assert!(!hint.contains('\x1b'), "{hint:?}");
+        assert_eq!(hint.lines().count(), 3, "{hint:?}");
+    }
+
+    #[test]
+    fn doctor_no_reader_hint_without_a_product_name() {
+        let hint = no_reader_hint(&smart_card(""));
+        assert!(
+            hint.starts_with("– 349e:0024 has a smart-card interface"),
+            "{hint:?}"
         );
     }
 }
@@ -18159,6 +18310,7 @@ mod cli_tests {
             reader: None,
             hid_serial: None,
             naming: Default::default(),
+            smart_card_unlisted: false,
         }
     }
 
@@ -18239,7 +18391,7 @@ mod cli_tests {
     }
 
     #[test]
-    fn fido_reset_route_prefers_replug_unless_a_reader_was_asked_for() {
+    fn fido_route_prefers_hid_unless_a_reader_was_asked_for() {
         use keyroost_resolve::{Caps, Device, DeviceKind};
         let mut caps = Caps::default();
         caps.insert(Caps::FIDO2);
@@ -18258,30 +18410,31 @@ mod cli_tests {
             reader: Some("R 00".into()),
             hid_serial: None,
             naming: Default::default(),
+            smart_card_unlisted: false,
         };
         assert_eq!(
-            fido_reset_route(&both, false),
-            Ok(FidoResetRoute::Replug {
+            fido_route(&both, false),
+            Ok(FidoRoute::Hid {
                 path: "/dev/hidraw3".into()
             })
         );
         assert_eq!(
-            fido_reset_route(&both, true),
-            Ok(FidoResetRoute::Card {
+            fido_route(&both, true),
+            Ok(FidoRoute::Card {
                 reader: "R 00".into()
             })
         );
         let mut card = both.clone();
         card.hid_path = None;
         assert_eq!(
-            fido_reset_route(&card, false),
-            Ok(FidoResetRoute::Card {
+            fido_route(&card, false),
+            Ok(FidoRoute::Card {
                 reader: "R 00".into()
             })
         );
         let mut none = card;
         none.reader = None;
-        assert!(fido_reset_route(&none, false).is_err());
+        assert!(fido_route(&none, false).is_err());
     }
 
     /// Run `wait_for_replug` against scripted HID scans (the last one repeats)
@@ -19733,6 +19886,7 @@ mod cli_tests {
                 reader: reader.map(str::to_owned),
                 hid_serial: None,
                 naming: keyroost_resolve::Naming::local(Some(name)),
+                smart_card_unlisted: false,
             }
         }
 
@@ -19792,6 +19946,7 @@ mod cli_tests {
             reader: Some("Some Reader".to_string()),
             hid_serial: None,
             naming: Default::default(),
+            smart_card_unlisted: false,
         };
         match otp_target_for(&row, OtpTransportArg::Auto) {
             Ok(OtpTarget::Reader(r)) => assert_eq!(r, "Some Reader"),
@@ -23279,6 +23434,33 @@ mod cli_tests {
     }
 
     #[test]
+    fn fido_info_reader_json_shape() {
+        let v = serde_json::to_value(json_out::FidoReaderInfoJson {
+            device: "Test reader".into(),
+            ctap2: None,
+        })
+        .unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["ctap2", "device"]);
+        assert!(v["ctap2"].is_null());
+    }
+
+    #[test]
+    fn fido_info_reader_conflicts_with_path() {
+        assert!(Cli::try_parse_from([
+            "keyroostctl",
+            "fido",
+            "info",
+            "--reader",
+            "X",
+            "--path",
+            "Y"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["keyroostctl", "fido", "info", "--reader", "X"]).is_ok());
+    }
+
+    #[test]
     fn fido_info_json_serializes() {
         // CTAP2 device: ctap2 present.
         let f = json_out::FidoInfoJson {
@@ -23354,6 +23536,7 @@ mod cli_tests {
             version: Some("5.4.3".into()),
             serial: Some("12345678".into()),
             pin_retries: Some(3),
+            pin_verified: false,
             chuid: Some(json_out::PivChuidJson {
                 fasc_n: "d4e739da...".into(),
                 guid: "aabbccdd-eeff-1122-3344-556677889900".into(),
@@ -23368,6 +23551,7 @@ mod cli_tests {
                 cert_len: 800,
                 cert_unreadable: None,
                 cert_compressed: false,
+                key_present: None,
             }],
             applet_fingerprint: "YubiKey".into(),
             applet_name: "YubiKey".into(),
@@ -23379,6 +23563,7 @@ mod cli_tests {
                 "version",
                 "serial",
                 "pin_retries",
+                "pin_verified",
                 "chuid",
                 "slots",
                 "applet_fingerprint",
@@ -23500,6 +23685,7 @@ mod cli_tests {
             cert_len: 6164,
             cert_unreadable: None,
             cert_compressed,
+            key_present: None,
         };
         let v = serde_json::to_value(slot(true)).expect("serialize");
         assert_eq!(v["cert_compressed"], true);
@@ -23516,6 +23702,7 @@ mod cli_tests {
             cert_len: 0,
             cert_unreadable,
             cert_compressed: false,
+            key_present: None,
         };
         let v = serde_json::to_value(slot(Some("damaged"))).expect("serialize");
         assert_eq!(v["cert_unreadable"], "damaged");
@@ -23560,6 +23747,20 @@ mod cli_tests {
     }
 
     #[test]
+    fn fingerprint_text_notes_a_key_without_a_fingerprint() {
+        let zero = [0u8; 20];
+        let some = [0xABu8; 20];
+        assert_eq!(
+            fingerprint_text(&zero, Some(true)),
+            "(none), but a key is present"
+        );
+        assert_eq!(fingerprint_text(&zero, None), "(none)");
+        assert_eq!(fingerprint_text(&zero, Some(false)), "(none)");
+        assert_eq!(fingerprint_text(&some, Some(true)), hex_encode(&some));
+        assert_eq!(fingerprint_text(&some, None), hex_encode(&some));
+    }
+
+    #[test]
     fn openpgp_status_json_serializes() {
         let o = json_out::OpenpgpStatusJson {
             aid: "d2760001240103040006...".into(),
@@ -23570,6 +23771,9 @@ mod cli_tests {
             fingerprint_sig: Some("aabb...".into()),
             fingerprint_dec: None,
             fingerprint_aut: None,
+            key_present_sig: Some(true),
+            key_present_dec: None,
+            key_present_aut: None,
             user_pin_retries: 3,
             reset_code_retries: 0,
             admin_pin_retries: 3,
@@ -24056,6 +24260,7 @@ mod cli_tests {
             reader: Some("Yubico 00".into()),
             hid_serial: None,
             naming: Default::default(),
+            smart_card_unlisted: false,
         };
         let hid = keyroost_hid::HidDevice {
             path: "/dev/hidraw16".into(),
@@ -24116,6 +24321,7 @@ mod cli_tests {
             reader: None,
             hid_serial: None,
             naming: Default::default(),
+            smart_card_unlisted: false,
         };
         // A normal detected row with a serial is nameable.
         assert!(nameable(&base).is_ok());
@@ -24155,6 +24361,7 @@ mod cli_tests {
                 reader: Some(reader.into()),
                 hid_serial: None,
                 naming: keyroost_resolve::Naming::local(Some(name)),
+                smart_card_unlisted: false,
             }
         }
         let devs = [
@@ -24370,6 +24577,18 @@ mod cli_tests {
     }
 
     #[test]
+    fn keyless_import_note_only_for_no_key() {
+        use keyroost_transport::SlotKeyPresence as P;
+        let slot = keyroost_piv::Slot::Authentication;
+        assert_eq!(
+            keyless_import_note(P::NoKey, slot),
+            Some(keyroost_piv::keyless_cert_note(slot))
+        );
+        assert_eq!(keyless_import_note(P::Present, slot), None);
+        assert_eq!(keyless_import_note(P::Unknown, slot), None);
+    }
+
+    #[test]
     fn slot_name_is_the_value_typed_on_the_command_line() {
         assert_eq!(slot_name(CliPivSlot::Auth), "9a");
         assert_eq!(slot_name(CliPivSlot::CardAuth), "9e");
@@ -24517,6 +24736,7 @@ mod cli_tests {
             reader: reader.map(str::to_owned),
             hid_serial: None,
             naming: keyroost_resolve::Naming::local(name),
+            smart_card_unlisted: false,
         };
         let devs = [
             mk(Some("yubi-test"), "2", Some("Y 00")),
@@ -24597,6 +24817,7 @@ mod cli_tests {
             reader: reader.map(str::to_owned),
             hid_serial: None,
             naming: keyroost_resolve::Naming::local(name),
+            smart_card_unlisted: false,
         };
         let devs = [
             mk(Some("yubi-test"), "2", Some("Y 00")),
@@ -24651,6 +24872,7 @@ mod prop_tests {
             reader: reader.map(String::from),
             hid_serial: None,
             naming: keyroost_resolve::Naming::local(name),
+            smart_card_unlisted: false,
         }
     }
 

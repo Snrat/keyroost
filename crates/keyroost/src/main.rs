@@ -376,14 +376,16 @@ fn open_fido(target: &FidoTarget) -> Result<OpenFido, String> {
             Ok((Box::new(dev), cbor, Some(init)))
         }
         FidoTarget::Pcsc(reader) => {
-            let dev =
+            let mut dev =
                 keyroost_transport::CtapPcscDevice::open(reader).map_err(|e| e.to_string())?;
-            // After a successful FIDO applet SELECT we attempt CTAP2 regardless of
-            // the exact version string (keys answer U2F_V2, FIDO_2_0, FIDO_2_1,
-            // sometimes with trailing bytes). A genuinely U2F-only card will make
-            // get_info return a clean CTAP error, which the caller surfaces —
-            // rather than silently reporting "no CBOR" and leaving the UI idle.
-            Ok((Box::new(dev), true, None))
+            // A card selected as U2F_V2 (some add trailing bytes to that
+            // answer) may still speak CTAP2, so GetInfo is asked; only an
+            // explicit "unsupported" answer means U2F-only, which takes the
+            // same path as a U2F-only key over USB. On any other error `cbor`
+            // stays set, so PIN changes still work and the later call
+            // reports it.
+            let cbor = !matches!(dev.get_info_unless_u2f_only(), Ok(None));
+            Ok((Box::new(dev), cbor, None))
         }
     }
 }
@@ -443,6 +445,9 @@ struct SecurityKeysState {
     /// The firmware read from the key's admin application, when its INIT
     /// reports none (version 0.0.0, as the Nitrokey 3 does).
     admin_firmware: Option<String>,
+    /// The last read found no CTAP2 interface (U2F only), so GetInfo was
+    /// never asked: the pane says so instead of "Reading key…".
+    u2f_only: bool,
     /// User-facing error from the last enumeration / open / GetInfo call.
     error: Option<String>,
     /// Live PIN entry field (cleared after submit).
@@ -955,12 +960,23 @@ impl Drop for OathAddDialog {
     }
 }
 
+/// One OpenPGP card read: status, supported algorithms, per-slot key presence.
+type OpenPgpRead = (
+    keyroost_transport::OpenPgpStatus,
+    Option<keyroost_transport::AlgorithmInformation>,
+    [Option<bool>; 3],
+);
+
 /// State for the OpenPGP pane. Like OATH, the applet is driven over PC/SC, so a
 /// reader name identifies the card.
 #[derive(Default)]
 struct OpenPgpState {
     /// Last status read from the selected card.
     status: Option<keyroost_transport::OpenPgpStatus>,
+    /// Per slot (sign, decrypt, auth): `Some(true)` when the public key read
+    /// back, `None` when unknown. Set with a fresh status read and cleared
+    /// whenever a write replaces `status`.
+    key_present: [Option<bool>; 3],
     /// User-facing error from the last operation.
     error: Option<String>,
     /// Success/info line from the last write operation.
@@ -2554,6 +2570,20 @@ fn pin_support(info: Option<&AuthenticatorInfo>) -> PinSupport {
     }
 }
 
+/// What the FIDO2 pane says while it has no getInfo answer: a key that
+/// showed no CTAP2 interface gets the CLI's `fido info` line word for word,
+/// shown muted (it isn't an error); else a failed read, else a read still
+/// under way.
+fn fido_unread_line(u2f_only: bool, read_failed: bool) -> &'static str {
+    if u2f_only {
+        "(device is U2F-only; CTAP2 GetInfo not available)"
+    } else if read_failed {
+        "Couldn't read this key."
+    } else {
+        "Reading key\u{2026}"
+    }
+}
+
 /// Decide whether a freshly appeared FIDO HID device may receive an armed
 /// reset. `target_*` describe the key the user armed; `cand_*` the device
 /// that just appeared. Vendor/product ids must match when known, and then a
@@ -2674,6 +2704,15 @@ enum OpenPgpSlotSel {
 }
 
 impl OpenPgpSlotSel {
+    /// Position in per-key arrays (`key_present`): signature, decryption,
+    /// authentication.
+    fn index(self) -> usize {
+        match self {
+            OpenPgpSlotSel::Sign => 0,
+            OpenPgpSlotSel::Decrypt => 1,
+            OpenPgpSlotSel::Auth => 2,
+        }
+    }
     fn to_crt(self) -> keyroost_transport::KeyCrt {
         match self {
             OpenPgpSlotSel::Sign => keyroost_transport::KeyCrt::Sign,
@@ -5457,6 +5496,7 @@ impl App {
         self.security_keys.info = None;
         self.security_keys.init = None;
         self.security_keys.admin_firmware = None;
+        self.security_keys.u2f_only = false;
         self.security_keys.error = None;
         let Some(target) = self.selected_fido_target() else {
             return;
@@ -5511,14 +5551,10 @@ impl App {
                             }
                             None => {
                                 // CBOR was reported unavailable and we never even
-                                // attempted GetInfo. Record it as an error rather
-                                // than leaving the pane spinning on "Reading key…"
-                                // forever (the spinner re-fires while info is None).
-                                app.security_keys.error = Some(
-                                    "this key did not present a CTAP2 (FIDO2) interface over \
-                                     the reader; only U2F was detected"
-                                        .to_string(),
-                                );
+                                // attempted GetInfo. Record that, so the pane says
+                                // so rather than spinning on "Reading key…" forever
+                                // (the spinner re-fires while info is None).
+                                app.security_keys.u2f_only = true;
                             }
                         }
                         app.apply_key_details();
@@ -8221,7 +8257,9 @@ impl App {
     /// which resolves the reinserted key from the same correlated device
     /// list for exactly this reason. Names stored on keys are not read here
     /// (`skip_key_names`), so the poll never talks CTAP to the key being
-    /// reset.
+    /// reset, and FIDO interfaces aren't asked their protocol
+    /// (`skip_protocol_asks`): this runs every poll on the UI thread, and a
+    /// key that doesn't answer INIT would stall each one for the timeout.
     ///
     /// `None` when the device is gone or the identity can't be read *yet* (a
     /// just-replugged key's CCID interface takes a beat to register with
@@ -8229,6 +8267,7 @@ impl App {
     fn fido_effective_serial(path: &std::path::Path) -> Option<String> {
         keyroost_resolve::enumerate_with(&keyroost_resolve::EnumerateOptions {
             skip_key_names: true,
+            skip_protocol_asks: true,
             ..Default::default()
         })
         .unwrap_or_default()
@@ -8354,25 +8393,25 @@ impl App {
         };
         let for_device = self.selected_device.clone();
         self.spawn_job("Reading OpenPGP status\u{2026}", move || {
-            let result = (|| -> Result<
-                (
-                    keyroost_transport::OpenPgpStatus,
-                    Option<keyroost_transport::AlgorithmInformation>,
-                ),
-                TransportError,
-            > {
+            let result = (|| -> Result<OpenPgpRead, TransportError> {
                 let mut session = keyroost_transport::OpenPgpSession::open(&name)?;
                 let status = session.status()?;
                 let supported = session.supported_algorithms().unwrap_or(None);
-                Ok((status, supported))
+                let present = [
+                    session.key_present(keyroost_transport::KeyCrt::Sign),
+                    session.key_present(keyroost_transport::KeyCrt::Decrypt),
+                    session.key_present(keyroost_transport::KeyCrt::Auth),
+                ];
+                Ok((status, supported, present))
             })();
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     return; // selection changed mid-read; discard
                 }
                 match result {
-                    Ok((status, supported)) => {
+                    Ok((status, supported, present)) => {
                         app.openpgp.status = Some(status);
+                        app.openpgp.key_present = present;
                         app.openpgp.supported = supported;
                         app.openpgp.loaded = true;
                     }
@@ -8394,14 +8433,20 @@ impl App {
     }
 
     /// Re-read status after a write and store it, surfacing `notice` on success.
+    /// `keys_changed`: the write replaced or wiped keys, so what was read about
+    /// key presence no longer holds; other writes (name, URL, PINs) keep it.
     fn apply_openpgp_write(
         app: &mut App,
         result: Result<keyroost_transport::OpenPgpStatus, TransportError>,
         notice: String,
+        keys_changed: bool,
     ) {
         match result {
             Ok(status) => {
                 app.openpgp.status = Some(status);
+                if keys_changed {
+                    app.openpgp.key_present = [None; 3];
+                }
                 app.openpgp.loaded = true;
                 app.openpgp.error = None;
                 app.openpgp.notice = Some(notice);
@@ -8457,7 +8502,7 @@ impl App {
                 s.status()
             })();
             Box::new(move |app: &mut App| {
-                Self::apply_openpgp_write(app, result, "Cardholder name set.".into())
+                Self::apply_openpgp_write(app, result, "Cardholder name set.".into(), false)
             })
         });
     }
@@ -8477,7 +8522,7 @@ impl App {
                 s.status()
             })();
             Box::new(move |app: &mut App| {
-                Self::apply_openpgp_write(app, result, "Public-key URL set.".into())
+                Self::apply_openpgp_write(app, result, "Public-key URL set.".into(), false)
             })
         });
     }
@@ -8506,6 +8551,7 @@ impl App {
                 match result {
                     Ok((status, fpr)) => {
                         app.openpgp.status = Some(status);
+                        app.openpgp.key_present = [None; 3];
                         app.openpgp.loaded = true;
                         app.openpgp.error = None;
                         app.openpgp.notice =
@@ -8615,6 +8661,7 @@ impl App {
                 match result {
                     Ok((status, kind, fpr)) => {
                         app.openpgp.status = Some(status);
+                        app.openpgp.key_present = [None; 3];
                         app.openpgp.loaded = true;
                         app.openpgp.error = None;
                         app.openpgp.notice = Some(format!(
@@ -8764,6 +8811,7 @@ impl App {
                     Ok(status) => {
                         app.openpgp.created = None;
                         app.openpgp.status = Some(status);
+                        app.openpgp.key_present = [None; 3];
                         app.openpgp.loaded = true;
                         app.openpgp.error = None;
                         app.openpgp.notice = Some(format!(
@@ -8895,6 +8943,7 @@ impl App {
                     Ok(status) => {
                         app.openpgp.restore_loaded = None;
                         app.openpgp.status = Some(status);
+                        app.openpgp.key_present = [None; 3];
                         app.openpgp.loaded = true;
                         app.openpgp.error = None;
                         app.openpgp.notice = Some(format!("Loaded {what} from {path}."));
@@ -9108,6 +9157,7 @@ impl App {
                     app,
                     result,
                     "OpenPGP applet reset; keys wiped, PINs back to defaults.".into(),
+                    true,
                 )
             })
         })
@@ -9131,7 +9181,7 @@ impl App {
             Box::new(move |app: &mut App| {
                 wipe(&mut app.openpgp.user_pin_old);
                 wipe(&mut app.openpgp.user_pin_new);
-                Self::apply_openpgp_write(app, result, "User PIN (PW1) changed.".into());
+                Self::apply_openpgp_write(app, result, "User PIN (PW1) changed.".into(), false);
             })
         });
     }
@@ -9153,7 +9203,7 @@ impl App {
             Box::new(move |app: &mut App| {
                 wipe(&mut app.openpgp.admin_pin_old);
                 wipe(&mut app.openpgp.admin_pin_new);
-                Self::apply_openpgp_write(app, result, "Admin PIN (PW3) changed.".into());
+                Self::apply_openpgp_write(app, result, "Admin PIN (PW3) changed.".into(), false);
             })
         });
     }
@@ -9175,7 +9225,7 @@ impl App {
             })();
             Box::new(move |app: &mut App| {
                 wipe(&mut app.openpgp.unblock_new);
-                Self::apply_openpgp_write(app, result, "User PIN (PW1) unblocked.".into());
+                Self::apply_openpgp_write(app, result, "User PIN (PW1) unblocked.".into(), false);
             })
         });
     }
@@ -9528,9 +9578,12 @@ impl App {
                     // card for these.
                     #[cfg(windows)]
                     {
-                        let fido_keys =
+                        let fido_keys = if keyroost_proto::devices_hidden() {
+                            Vec::new()
+                        } else {
                             std::panic::catch_unwind(keyroost_winwebauthn::detect_fido_keys)
-                                .unwrap_or_default();
+                                .unwrap_or_default()
+                        };
                         if !fido_keys.is_empty() {
                             if devices.iter().any(|d| d.kind == DeviceKind::Key) {
                                 for d in devices.iter_mut() {
@@ -9563,6 +9616,7 @@ impl App {
                                         reader: None,
                                         hid_serial: None,
                                         naming: Default::default(),
+                                        smart_card_unlisted: false,
                                     });
                                 }
                             }
@@ -9719,6 +9773,7 @@ impl App {
         self.security_keys.info = None;
         self.security_keys.init = None;
         self.security_keys.admin_firmware = None;
+        self.security_keys.u2f_only = false;
         self.security_keys.session = None;
         self.security_keys.session_device = None;
         self.security_keys.error = None;
@@ -9760,6 +9815,7 @@ impl App {
         self.oath.notice = None;
         self.oath.unlocked_password = None;
         self.openpgp.status = None;
+        self.openpgp.key_present = [None; 3];
         self.openpgp.loaded = false;
         self.openpgp.error = None;
         self.openpgp.notice = None;
@@ -13028,14 +13084,16 @@ fn piv_import_not_written(e: impl std::fmt::Display) -> String {
     format!("{} Nothing was written.", sentence(e))
 }
 
-/// The PIN part of the PIV header: the tries left, or "PIN accepted" when the
+/// The PIN part of the PIV header: the tries left, or "PIN verified" when the
 /// card reported the PIN verified in the session that read this status
-/// instead of a count. "Accepted", not "verified": the snapshot outlives that
-/// session, which resets the card when it ends.
+/// instead of a count. After any PIV write the app starts a background status
+/// read on a new connection (`apply_piv_write` -> `load_piv_status`), which
+/// replaces that in-session reading, so "PIN verified" shows only while it is
+/// true.
 fn piv_header_pin(st: &keyroost_transport::PivStatus) -> String {
     match st.pin_retries {
         Some(n) => format!("PIN retries {n}"),
-        None if st.pin_verified => "PIN accepted".to_string(),
+        None if st.pin_verified => "PIN verified".to_string(),
         None => "PIN retries \u{2014}".to_string(),
     }
 }
@@ -13059,29 +13117,20 @@ fn piv_move_dest_note(occupancy: PivOccupancy, slot: &str) -> Option<String> {
         .then(|| format!("keyroost can't tell whether {slot} holds a key; the card decides."))
 }
 
-/// Whether a slot-emptiness-sensitive button should dim specifically because
-/// the active slot is confirmed empty — the narrower criterion
-/// `keyroost_piv::compat::PivExtension::GetSlotKeyStatus` unlocks. Shared by
-/// "Delete key" (distinct from "Delete certificate"'s `selected_has_cert`
-/// check — a different object, gated by a different extension) and "Import
-/// certificate" (which has no separate firmware gate of its own to check
-/// first, unlike "Delete key" — see that button's call site for why this is
-/// only meaningful there once `delete_key_gate` itself isn't
-/// `FeatureGate::Unsupported`).
+/// Whether the active slot is confirmed empty — the narrower criterion
+/// `keyroost_piv::compat::PivExtension::GetSlotKeyStatus` unlocks. "Delete
+/// key" dims on it, and the certificate-import dialog adds its keyless note
+/// on it.
 ///
 /// `true` only when `get_slot_key_status_gate` resolves
 /// [`FeatureGate::Supported`](keyroost_piv::compat::FeatureGate::Supported)
-/// *and* `selected_has_key` is `false` — this device has a confirmed,
+/// *and* `selected_has_key` is `false`: this device has a confirmed,
 /// device-reported way to know slot occupancy (GET METADATA, or HID
 /// Crescendo's own GET PIV PROPERTIES), and it says this slot has no key.
-/// Every other combination — the gate isn't `Supported`, or it is and the
-/// slot does hold a key — leaves the button enabled: without a reliable
-/// device signal, a `None` algorithm reading could just as easily mean
-/// "this device can't tell us" as "genuinely empty" (see
-/// [`keyroost_piv::compat::PivExtension::GetSlotKeyStatus`]'s doc), and
-/// hiding a real capability on a guess is worse than occasionally offering a
-/// delete that fails deep with "slot has no key", or an import that a
-/// key loaded out-of-band this session can't see would in fact have matched.
+/// Every other combination leaves the button enabled and the note off:
+/// without a reliable device signal, a `None` algorithm reading could just as
+/// easily mean "this device can't tell us" as "genuinely empty" (see
+/// [`keyroost_piv::compat::PivExtension::GetSlotKeyStatus`]'s doc).
 #[must_use]
 fn slot_confirmed_empty(
     get_slot_key_status_gate: keyroost_piv::compat::FeatureGate,
@@ -13089,6 +13138,20 @@ fn slot_confirmed_empty(
 ) -> bool {
     use keyroost_piv::compat::FeatureGate;
     get_slot_key_status_gate == FeatureGate::Supported && !selected_has_key
+}
+
+/// The note the certificate-import dialog shows for a slot that holds no key:
+/// `Some` only when this device confirms the slot is empty (the same
+/// [`slot_confirmed_empty`] gate as "Delete key"), so a slot that merely
+/// can't be read never gets a claim about it.
+#[must_use]
+fn cert_import_note(
+    get_slot_key_status_gate: keyroost_piv::compat::FeatureGate,
+    selected_has_key: bool,
+    slot: keyroost_piv::Slot,
+) -> Option<String> {
+    slot_confirmed_empty(get_slot_key_status_gate, selected_has_key)
+        .then(|| keyroost_piv::keyless_cert_note(slot))
 }
 
 fn move_key_eligible_destinations(
@@ -14175,6 +14238,15 @@ fn device_row(ui: &mut egui::Ui, p: &Palette, dev: &Device, selected: bool) -> b
 
 /// Height of one device card in the full list.
 const DEVICE_CARD_H: f32 = 68.0;
+
+/// The muted line in the key's Overview "Smart cards" card when its smart-card
+/// part has no reader listed (Linux; [`Device::smart_card_unlisted`]). Held back while the scan
+/// burst after a plug-in runs (`pending_scans`), since a key's reader can
+/// register a beat after the key itself.
+fn no_reader_line(dev: &Device, pending_scans: u8) -> Option<&'static str> {
+    (dev.smart_card_unlisted && pending_scans == 0)
+        .then_some("Smart-card features unavailable: no reader is listed for this key.")
+}
 
 /// The key's square tile: an amber clock for programmable tokens, else the
 /// first letter of the vendor. Shared by the card and the rail.
@@ -17262,6 +17334,7 @@ impl App {
                     // "Reading key…". The Manage → jump opens the full card.
                     #[cfg(windows)]
                     let non_admin = self.security_keys.info.is_none()
+                        && !keyroost_proto::devices_hidden()
                         && keyroost_winwebauthn::fido_key_present();
                     #[cfg(not(windows))]
                     let non_admin = false;
@@ -17301,9 +17374,12 @@ impl App {
                             }
                             None => {
                                 ui.label(
-                                    egui::RichText::new("Reading key\u{2026}")
-                                        .font(theme::f_reg(13.0))
-                                        .color(p.txt3),
+                                    egui::RichText::new(fido_unread_line(
+                                        self.security_keys.u2f_only,
+                                        false,
+                                    ))
+                                    .font(theme::f_reg(13.0))
+                                    .color(p.txt3),
                                 );
                             }
                         }
@@ -17362,7 +17438,11 @@ impl App {
                                 ui,
                                 &format!(
                                     "Signature \u{00B7} {}",
-                                    slot_summary(&st.sig_attrs, &st.fingerprint_sig)
+                                    slot_summary(
+                                        &st.sig_attrs,
+                                        &st.fingerprint_sig,
+                                        self.openpgp.key_present[0]
+                                    )
                                 ),
                                 p.txt2,
                                 p.raised2,
@@ -17371,7 +17451,11 @@ impl App {
                                 ui,
                                 &format!(
                                     "Encryption \u{00B7} {}",
-                                    slot_summary(&st.dec_attrs, &st.fingerprint_dec)
+                                    slot_summary(
+                                        &st.dec_attrs,
+                                        &st.fingerprint_dec,
+                                        self.openpgp.key_present[1]
+                                    )
                                 ),
                                 p.txt2,
                                 p.raised2,
@@ -17380,7 +17464,11 @@ impl App {
                                 ui,
                                 &format!(
                                     "Auth \u{00B7} {}",
-                                    slot_summary(&st.aut_attrs, &st.fingerprint_aut)
+                                    slot_summary(
+                                        &st.aut_attrs,
+                                        &st.fingerprint_aut,
+                                        self.openpgp.key_present[2]
+                                    )
                                 ),
                                 p.txt2,
                                 p.raised2,
@@ -17473,6 +17561,18 @@ impl App {
                                 .color(p.txt3),
                         );
                     }
+                });
+            }
+            if let Some(line) = no_reader_line(dev, self.pending_scans) {
+                ui.add_space(14.0);
+                theme::card_frame(p).show(ui, |ui| {
+                    head_row(ui, p, "Smart cards", theme::f_sb(14.5), None, |_| {});
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(line)
+                            .font(theme::f_reg(13.0))
+                            .color(p.txt3),
+                    );
                 });
             }
             // Whole-device factory reset — offered only for a Key (Molto2 keeps
@@ -17620,7 +17720,10 @@ impl App {
         #[cfg(windows)]
         {
             let no_access = self.security_keys.info.is_none();
-            if no_access && keyroost_winwebauthn::fido_key_present() {
+            if no_access
+                && !keyroost_proto::devices_hidden()
+                && keyroost_winwebauthn::fido_key_present()
+            {
                 self.fido2_non_admin_card(ui, p);
                 return;
             }
@@ -17720,19 +17823,16 @@ impl App {
                     });
                 }
                 PinSupport::Unknown => {
-                    let msg = if self.security_keys.error.is_some() {
-                        "Couldn't read this key."
-                    } else {
-                        // The initial read can be dropped if the worker was
-                        // busy at selection time; retry rather than showing
-                        // "Reading key…" forever.
-                        if self.security_keys.info.is_none() && !self.busy() {
-                            self.fetch_selected_info();
-                        }
-                        "Reading key\u{2026}"
-                    };
+                    let u2f_only = self.security_keys.u2f_only;
+                    let failed = self.security_keys.error.is_some();
+                    // The initial read can be dropped if the worker was busy
+                    // at selection time; retry rather than showing "Reading
+                    // key…" forever.
+                    if !u2f_only && !failed && self.security_keys.info.is_none() && !self.busy() {
+                        self.fetch_selected_info();
+                    }
                     ui.label(
-                        egui::RichText::new(msg)
+                        egui::RichText::new(fido_unread_line(u2f_only, failed))
                             .font(theme::f_reg(13.0))
                             .color(p.txt3),
                     );
@@ -20636,6 +20736,33 @@ impl App {
         // and (set by its fields below) whether the file is open and this key
         // can take it, which enables Import.
         let selected_has_cert = self.piv_selected_test_target().1;
+        let cert_note = {
+            let (fp, ver, fw_ver) = self.piv.status.as_ref().map_or(
+                (
+                    keyroost_piv::fingerprint::AppletFingerprint::Generic,
+                    None,
+                    None,
+                ),
+                |s| {
+                    (
+                        s.applet_fingerprint,
+                        s.version.as_deref(),
+                        s.version_firmware.as_deref(),
+                    )
+                },
+            );
+            let gate = self.piv_gate(
+                keyroost_piv::compat::PivExtension::GetSlotKeyStatus,
+                fp,
+                ver,
+                fw_ver,
+            );
+            cert_import_note(
+                gate,
+                self.piv_selected_occupied(),
+                self.piv.selected_slot.to_slot(),
+            )
+        };
         let mut import_ready = true;
 
         // Move-key flow: precompute the source slot and the eligible destination
@@ -20876,6 +21003,9 @@ impl App {
                                     p,
                                     &format!("This replaces the certificate currently in {slot}."),
                                 );
+                            }
+                            if let Some(note) = &cert_note {
+                                card_note(ui, p, note);
                             }
                             card_note(ui, p, "Authorizes writing the certificate to the slot.");
                         }
@@ -22766,7 +22896,11 @@ impl App {
             Some(st) => {
                 let (attrs, fpr) = selected.status_fields(st);
                 if fpr.iter().all(|&b| b == 0) {
-                    "no key".to_string()
+                    if self.openpgp.key_present[selected.index()] == Some(true) {
+                        key_without_fingerprint(attrs)
+                    } else {
+                        "no key".to_string()
+                    }
                 } else {
                     format!(
                         "{} \u{00B7} fpr {}",
@@ -23714,15 +23848,6 @@ impl App {
             "This slot has no key to move \u{2014} generate one in this slot first.";
         let no_del_cert_hint = "This slot holds no certificate to delete.";
         let no_del_key_hint = "This slot holds no key to delete.";
-        // "Import certificate" dims only when this device *confirms* the
-        // slot is empty (same `slot_confirmed_empty` gate as "Delete key" —
-        // see its doc): a certificate can't possibly match a key this slot
-        // doesn't hold. When occupancy can't be confirmed, the button stays
-        // enabled — a matching key may have been loaded out of band and this
-        // session just can't see it; `PivSession::import_certificate` itself
-        // still compares against whatever key it *can* find before writing.
-        let no_import_cert_hint = "This slot has no key for a certificate to match \u{2014} \
-             generate or move one into this slot first.";
         // --- Slot sub-tab strip ---------------------------------------------
         // Each PIV slot is a tab (the same strip as FIDO2 and OpenPGP).
         // Clicking a tab selects that slot; every action card below targets
@@ -24307,10 +24432,8 @@ impl App {
                 // file picker then the management-key modal; Export opens a save
                 // dialog and writes straight to the chosen path — no secret (see
                 // `drain_file_dialogs`). Export dims when the slot holds no cert.
-                // Import dims only when the slot is *confirmed* empty
-                // (`slot_confirmed_empty`, same gate "Delete key" uses) — an
-                // unconfirmed reading leaves it enabled, since a matching key may
-                // have been loaded out of band this session can't see.
+                // Import stays enabled whatever the slot holds: a slot with no
+                // key is allowed, and gets a note saying so.
                 self.adaptive_row(
                     ui,
                     |app, ui| {
@@ -24336,16 +24459,8 @@ impl App {
                                 .on_hover_text(no_slot_cert_hint);
                         }
                         ui.add_space(8.0);
-                        if slot_confirmed_empty(get_slot_key_status_gate, selected_has_key) {
-                            theme::button_disabled(ui, p, "Import certificate\u{2026}")
-                                .on_hover_text(no_import_cert_hint);
-                        } else if theme::button(
-                            ui,
-                            p,
-                            BtnKind::Default,
-                            "Import certificate\u{2026}",
-                        )
-                        .clicked()
+                        if theme::button(ui, p, BtnKind::Default, "Import certificate\u{2026}")
+                            .clicked()
                         {
                             open_import = true;
                         }
@@ -25891,10 +26006,25 @@ fn editor_row(ui: &mut egui::Ui, p: &Palette, label: &str, add: impl FnOnce(&mut
     ui.add_space(8.0);
 }
 
-/// Summarize an OpenPGP key slot: its algorithm label, or "empty" when no key.
-fn slot_summary(attrs: &[u8], fpr: &[u8; 20]) -> String {
+/// What a key with no fingerprint is called, matching `openpgp info`:
+/// "{algorithm} \u{00B7} fpr (none), but a key is present".
+fn key_without_fingerprint(attrs: &[u8]) -> String {
+    format!(
+        "{} \u{00B7} fpr (none), but a key is present",
+        keyroost_transport::describe_algorithm_attributes(attrs)
+    )
+}
+
+/// Summarize an OpenPGP key slot: its algorithm label, "empty" when there is
+/// no fingerprint, or [`key_without_fingerprint`] when there is none but the
+/// slot's public key read back. `None` (unknown) never changes the text.
+fn slot_summary(attrs: &[u8], fpr: &[u8; 20], key_present: Option<bool>) -> String {
     if fpr.iter().all(|&b| b == 0) {
-        "empty".to_string()
+        if key_present == Some(true) {
+            key_without_fingerprint(attrs)
+        } else {
+            "empty".to_string()
+        }
     } else {
         keyroost_transport::describe_algorithm_attributes(attrs)
     }
@@ -25913,6 +26043,26 @@ mod tests {
         assert!(dir.starts_with(&tmp), "{dir:?} is outside {tmp:?}");
         assert!(keyroost_keyring::config_path().unwrap().starts_with(&tmp));
         assert!(settings::config_path().unwrap().starts_with(&tmp));
+    }
+
+    #[test]
+    fn slot_summary_notes_a_key_without_a_fingerprint() {
+        let attrs = keyroost_transport::OpenPgpKeyAlg::Ed25519
+            .attributes(keyroost_transport::KeyCrt::Sign)
+            .unwrap();
+        let algo = keyroost_transport::describe_algorithm_attributes(&attrs);
+        let zero = [0u8; 20];
+        let some = [0xABu8; 20];
+        assert_eq!(
+            slot_summary(&attrs, &zero, Some(true)),
+            format!("{algo} \u{00B7} fpr (none), but a key is present")
+        );
+        assert_eq!(slot_summary(&attrs, &zero, None), "empty");
+        assert_eq!(
+            key_without_fingerprint(&attrs),
+            slot_summary(&attrs, &zero, Some(true))
+        );
+        assert_eq!(slot_summary(&attrs, &some, Some(true)), algo);
     }
 
     /// A `period/` prefix is shown as the period, not as part of the issuer.
@@ -27977,6 +28127,19 @@ mod tests {
         assert_eq!(app.cap_tab, CapTab::Piv);
     }
 
+    /// A key that showed no CTAP2 interface gets the CLI's `fido info` line
+    /// word for word, as a muted note; a failed read and a read still under
+    /// way keep their own lines.
+    #[test]
+    fn unread_fido_info_line_names_a_u2f_only_key_like_the_cli() {
+        assert_eq!(
+            fido_unread_line(true, false),
+            "(device is U2F-only; CTAP2 GetInfo not available)"
+        );
+        assert_eq!(fido_unread_line(false, true), "Couldn't read this key.");
+        assert_eq!(fido_unread_line(false, false), "Reading key\u{2026}");
+    }
+
     /// getInfo with no `clientPin` option means the key has no PIN feature —
     /// distinct from "info not read yet", which the pane used to conflate
     /// with it (permanent "Reading key…" on PIN-less authenticators).
@@ -29198,6 +29361,23 @@ mod tests {
         assert!(!slot_confirmed_empty(FeatureGate::Unsupported, false));
     }
 
+    #[test]
+    fn cert_import_note_only_for_a_confirmed_empty_slot() {
+        use keyroost_piv::compat::FeatureGate;
+        let slot = keyroost_piv::Slot::Authentication;
+        let note = cert_import_note(FeatureGate::Supported, false, slot);
+        assert_eq!(
+            note.as_deref(),
+            Some(keyroost_piv::keyless_cert_note(slot).as_str())
+        );
+        assert_eq!(cert_import_note(FeatureGate::Supported, true, slot), None);
+        assert_eq!(cert_import_note(FeatureGate::Unverified, false, slot), None);
+        assert_eq!(
+            cert_import_note(FeatureGate::Unsupported, false, slot),
+            None
+        );
+    }
+
     /// Given occupancy (slot -> has_key), the eligible move destinations are the
     /// empty slots that aren't the source — across standard *and* retired slots.
     #[test]
@@ -29662,7 +29842,7 @@ mod tests {
         use keyroost_piv::fingerprint::{AppletFingerprint, TrussedVariant};
         let mut app = App::default();
         let mut status =
-            piv_status_with(AppletFingerprint::Trussed(TrussedVariant::NitroKey), None);
+            piv_status_with(AppletFingerprint::Trussed(TrussedVariant::Nitrokey), None);
         status.version_firmware = Some(vec![1, 9, 1]);
         app.piv.status = Some(status);
         app.piv.selected_slot = PivSlotSel::Sign;
@@ -29737,7 +29917,7 @@ mod tests {
         use keyroost_piv::fingerprint::{AppletFingerprint, TrussedVariant};
         let mut app = App::default();
         let mut status =
-            piv_status_with(AppletFingerprint::Trussed(TrussedVariant::NitroKey), None);
+            piv_status_with(AppletFingerprint::Trussed(TrussedVariant::Nitrokey), None);
         status.version_firmware = Some(vec![1, 9, 1]);
         app.piv.status = Some(status);
         app.piv.selected_slot = PivSlotSel::Auth;
@@ -29817,14 +29997,14 @@ mod tests {
     /// After a PIN-using operation the card reports "verified" instead of a
     /// count; the header says so rather than showing a dash.
     #[test]
-    fn piv_header_says_pin_accepted_instead_of_a_dash() {
+    fn piv_header_says_pin_verified_instead_of_a_dash() {
         let mut st = keyroost_transport::PivStatus::default();
         assert_eq!(piv_header_pin(&st), "PIN retries \u{2014}");
         st.pin_retries = Some(3);
         assert_eq!(piv_header_pin(&st), "PIN retries 3");
         st.pin_retries = None;
         st.pin_verified = true;
-        assert_eq!(piv_header_pin(&st), "PIN accepted");
+        assert_eq!(piv_header_pin(&st), "PIN verified");
     }
 
     /// The Generate and Import dialogs' policy rows follow the compat rows,
@@ -29844,7 +30024,7 @@ mod tests {
         let palette = Palette::new(Mode::Dark, Palette::ACCENTS[0], false);
         let nitrokey = || {
             let mut st = piv_status_with(
-                AppletFingerprint::Trussed(TrussedVariant::NitroKey),
+                AppletFingerprint::Trussed(TrussedVariant::Nitrokey),
                 Some(vec![6, 6, 6]),
             );
             st.version_firmware = Some(vec![1, 9, 1]);
@@ -30210,7 +30390,20 @@ mod tests {
             reader: None,
             hid_serial: None,
             naming: keyroost_resolve::Naming::local(name),
+            smart_card_unlisted: false,
         }
+    }
+
+    #[test]
+    fn no_reader_line_waits_for_the_scan_burst() {
+        let mut dev = test_key("k", "1", None);
+        assert_eq!(no_reader_line(&dev, 0), None, "reader listed");
+        dev.smart_card_unlisted = true;
+        assert_eq!(no_reader_line(&dev, 2), None, "burst still running");
+        assert_eq!(
+            no_reader_line(&dev, 0),
+            Some("Smart-card features unavailable: no reader is listed for this key.")
+        );
     }
 
     /// Issue #84: a FIDO2 card in a reader must take the in-place reset route,
@@ -31111,6 +31304,7 @@ mod tests {
                 }),
                 ..Default::default()
             },
+            smart_card_unlisted: false,
         }
     }
 

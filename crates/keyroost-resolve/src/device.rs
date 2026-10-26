@@ -5,9 +5,10 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use keyroost_hid::{same_usb_device, HidDevice, UsbDeviceKey};
+use keyroost_hid::{same_usb_device, HidDevice, UsbDeviceKey, UsbSmartCard};
 use keyroost_keyring::Keyring;
 use keyroost_proto::trace::{format_line, Dir};
+use keyroost_transport::identity::InitAnswer;
 use keyroost_transport::{ReaderProbe, YubiKeyCcid};
 
 use crate::names::{KeyLabel, Naming};
@@ -15,7 +16,7 @@ use crate::names::{KeyLabel, Naming};
 /// Capability bit-set. Hand-rolled (no `bitflags` dep). Each physical key
 /// advertises the union of the applets it answers.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub struct Caps(u8);
+pub struct Caps(u16);
 
 impl Caps {
     pub const FIDO2: Caps = Caps(1 << 0);
@@ -31,12 +32,22 @@ impl Caps {
     /// pairing and selection; what needs CTAP2 (the badge, the FIDO2 tab, the
     /// FIDO2 reset step) checks this bit.
     pub const U2F_ONLY: Caps = Caps(1 << 7);
+    /// Not an applet: a FIDO HID interface whose protocol isn't known. The
+    /// key opened but gave no proper answer to CTAPHID INIT. `FIDO2` stays
+    /// set and is marked unverified ("FIDO2?"); no name is read from the key
+    /// and there is no FIDO2 reset step until it answers. A reader-only row
+    /// whose FIDO SELECT didn't name CTAP2 is only marked unverified, not
+    /// this: it keeps its FIDO2 reset step.
+    pub const FIDO_PROTOCOL_UNKNOWN: Caps = Caps(1 << 8);
 
     pub fn has(self, c: Caps) -> bool {
         self.0 & c.0 != 0
     }
     pub fn insert(&mut self, c: Caps) {
         self.0 |= c.0;
+    }
+    pub fn remove(&mut self, c: Caps) {
+        self.0 &= !c.0;
     }
     pub fn is_empty(self) -> bool {
         self.0 == 0
@@ -64,10 +75,13 @@ pub enum CapState {
     /// label-grade reason to offer the surface. Never derived from a
     /// product-id table (standing decision: no device→capability matrix).
     Absent,
-    /// Nothing was asked of the device, but the surface is offered anyway on
-    /// a label-grade hint (today: the Token2 vendor id offering OTP, exactly
-    /// as `has_otp = is_token2` always did). Rendered distinctly so an offer
-    /// is never mistaken for verified presence.
+    /// The surface is offered, but the device didn't confirm it: an applet
+    /// offered on a label-grade hint (the Token2 vendor id offering OTP,
+    /// exactly as `has_otp = is_token2` always did), or a FIDO interface
+    /// whose protocol isn't known ([`Caps::FIDO_PROTOCOL_UNKNOWN`]), or a
+    /// reader-only FIDO row whose applet `SELECT` did not name FIDO2 (no
+    /// `FIDO_PROTOCOL_UNKNOWN` there; it keeps its reset step). Rendered
+    /// distinctly so an offer is never mistaken for verified presence.
     Unverified,
 }
 
@@ -96,11 +110,15 @@ pub struct Device {
     pub transport: String,
     pub firmware: String,
     pub caps: Caps,
-    /// The subset of `caps` that keyroost could not verify against the device
-    /// (no card channel answered a `SELECT` for it) — offered on a label-grade
-    /// hint only. Invariant: `unverified` ⊆ `caps`, so every `caps.has(..)`
-    /// caller keeps today's fail-open behaviour untouched; consult
-    /// [`Device::cap_state`] for the honest per-capability answer.
+    /// The subset of `caps` that keyroost could not verify against the device:
+    /// no card channel answered a `SELECT` for it (offered on a label-grade
+    /// hint only), or FIDO2 whose protocol isn't known
+    /// ([`Caps::FIDO_PROTOCOL_UNKNOWN`]), or a reader-only FIDO row whose
+    /// applet `SELECT` did not name FIDO2 (no `FIDO_PROTOCOL_UNKNOWN`; it
+    /// keeps its reset step). Invariant: `unverified` ⊆ `caps`,
+    /// so every `caps.has(..)` caller keeps today's fail-open behaviour
+    /// untouched; consult [`Device::cap_state`] for the honest
+    /// per-capability answer.
     pub unverified: Caps,
     pub kind: DeviceKind,
     pub hid_path: Option<PathBuf>,
@@ -111,6 +129,10 @@ pub struct Device {
     /// How the row is named (see [`crate::names::apply_names`]); `name` is
     /// the text to show.
     pub naming: Naming,
+    /// The key has a smart-card interface, but the smart-card service lists
+    /// no reader for it (Linux only; see [`smart_cards_without_reader`]).
+    /// `false` whenever that can't be shown, including when PC/SC is down.
+    pub smart_card_unlisted: bool,
 }
 
 impl Device {
@@ -673,6 +695,7 @@ pub fn correlate_with(
             reader: Some(p.reader_name.clone()),
             hid_serial: None,
             naming: Naming::default(),
+            smart_card_unlisted: false,
         });
     }
 
@@ -700,6 +723,7 @@ pub fn correlate_with(
             reader: Some(p.reader_name.clone()),
             hid_serial: None,
             naming: Naming::default(),
+            smart_card_unlisted: false,
         });
     }
 
@@ -715,8 +739,15 @@ pub fn correlate_with(
         if p.has_piv {
             caps.insert(Caps::PIV);
         }
+        let mut unverified = Caps::default();
         if p.has_fido {
             caps.insert(Caps::FIDO2);
+            // A SELECT answered `U2F_V2` (or a continuation) doesn't say
+            // whether the key also speaks CTAP2: FIDO2?, but the reset step
+            // stays (`FIDO_PROTOCOL_UNKNOWN` is the HID INIT's verdict).
+            if !p.fido_ctap2_confirmed {
+                unverified.insert(Caps::FIDO2);
+            }
         }
         if p.has_otp {
             caps.insert(Caps::OTP);
@@ -761,14 +792,15 @@ pub fn correlate_with(
             transport: "USB · PC/SC".into(),
             firmware: String::new(),
             // Every capability on this row came from a real SELECT over the
-            // reader — ground truth, nothing unverified.
+            // reader, ground truth; only which FIDO protocol can be unknown.
             caps,
-            unverified: Caps::default(),
+            unverified,
             kind: DeviceKind::Key,
             hid_path: None,
             reader: Some(p.reader_name.clone()),
             hid_serial: None,
             naming: Naming::default(),
+            smart_card_unlisted: false,
         });
     }
 
@@ -850,8 +882,12 @@ pub fn correlate_with(
                         && d.serial == serial))
         });
         if let Some(dev) = existing {
-            // The HID node itself is the evidence for FIDO2 — verified.
+            // The HID node itself is the evidence for FIDO2 — verified; its
+            // own INIT answer, not the reader's SELECT, says which protocol
+            // (see `mark_fido_protocol`).
             dev.caps.insert(Caps::FIDO2);
+            dev.caps.remove(Caps::FIDO_PROTOCOL_UNKNOWN);
+            dev.unverified.remove(Caps::FIDO2);
             // OTP: if the reader already answered the applet's SELECT it is
             // verified present and stays so. If the probe did NOT answer for
             // it, the vendor hint still offers the surface (insert-only, a
@@ -920,6 +956,7 @@ pub fn correlate_with(
                 reader: reader_name,
                 hid_serial: None,
                 naming: Naming::default(),
+                smart_card_unlisted: false,
             });
         }
     }
@@ -988,13 +1025,27 @@ fn apply_test_switch(_opts: &mut MatchOptions) {}
 /// then correlate. Linux with topology sends no identity reads, and a HID
 /// interface that already answered is not asked again until it is
 /// replugged (reader-side reads are sent every scan). Each FIDO
-/// interface is also asked once per plug-in whether it speaks only U2F (a
-/// CTAPHID INIT, nothing else), to mark it [`Caps::U2F_ONLY`].
+/// interface is also asked which protocol it speaks (a CTAPHID INIT,
+/// nothing else), to mark it [`Caps::U2F_ONLY`] or
+/// [`Caps::FIDO_PROTOCOL_UNKNOWN`] (a key that opened but gave no proper
+/// answer, asked again on the next scan).
 pub fn correlate_live(
     hids: &[HidDevice],
     probes: &[ReaderProbe],
     keyring: &Keyring,
     debug: bool,
+) -> Vec<Device> {
+    correlate_live_asking(hids, probes, keyring, debug, true)
+}
+
+/// [`correlate_live`], asking FIDO interfaces their protocol only when
+/// `may_ask` (else using the answers already known).
+fn correlate_live_asking(
+    hids: &[HidDevice],
+    probes: &[ReaderProbe],
+    keyring: &Keyring,
+    debug: bool,
+    may_ask: bool,
 ) -> Vec<Device> {
     let mut opts = MatchOptions {
         trace: debug,
@@ -1012,7 +1063,8 @@ pub fn correlate_live(
     let plan = crate::identity::plan_identity_reads(h, p, registry);
     let ids = crate::identity::read_identities_once(&plan, h, p, registry, debug);
     let mut devices = correlate_with(h, p, keyring, &ids, &opts);
-    mark_u2f_only(&mut devices, &u2f_only_paths(hids, true, debug));
+    let (u2f_only, unknown) = fido_protocol_paths(hids, may_ask, debug);
+    mark_fido_protocol(&mut devices, &u2f_only, &unknown);
     devices
 }
 
@@ -1028,6 +1080,19 @@ pub struct EnumerateOptions {
     pub skip_identity_reads: bool,
     /// Don't read names stored on keys (local names only).
     pub skip_key_names: bool,
+    /// Don't ask FIDO interfaces which protocol they speak (CTAPHID INIT);
+    /// use the answers already known. For a scan repeated in a tight loop
+    /// that needs no badges, where a key that doesn't answer would cost every
+    /// scan the INIT timeout. Implied by `skip_identity_reads`.
+    pub skip_protocol_asks: bool,
+}
+
+impl EnumerateOptions {
+    /// Whether a scan with these options may ask FIDO interfaces their
+    /// protocol.
+    fn may_ask_protocol(&self) -> bool {
+        !self.skip_identity_reads && !self.skip_protocol_asks
+    }
 }
 
 /// Warnings already given in this process, and those a front end hasn't
@@ -1153,14 +1218,21 @@ fn cache_label(
 }
 
 /// For every row with FIDO2 and a HID path: open it, ask getInfo, and read
-/// the name stored on the key (no PIN). A failed read is
+/// the name stored on the key (no PIN). A U2F-only key has no getInfo or
+/// name store, and a key that gave no proper INIT answer
+/// ([`Caps::FIDO_PROTOCOL_UNKNOWN`]) isn't asked until it answers. A failed
+/// read is
 /// [`KeyLabel::ReadFailed`], traced under `debug` (never a serial). Reads
 /// are reused for [`LABEL_CACHE_TTL`].
 fn read_key_labels(devices: &[Device], debug: bool) -> HashMap<DeviceId, KeyLabel> {
     use keyroost_ctap::device_label::{read_label, LabelState};
     let now = std::time::Instant::now();
     let mut labels = HashMap::new();
-    for d in devices.iter().filter(|d| d.caps.has(Caps::FIDO2)) {
+    for d in devices.iter().filter(|d| {
+        d.caps.has(Caps::FIDO2)
+            && !d.caps.has(Caps::U2F_ONLY)
+            && !d.caps.has(Caps::FIDO_PROTOCOL_UNKNOWN)
+    }) {
         let Some(path) = d.hid_path.as_deref() else {
             continue;
         };
@@ -1371,58 +1443,146 @@ pub fn add_key_names(devices: &mut [Device], debug: bool) {
     name_from_keys(devices, &keyring, may_save, debug);
 }
 
+/// The USB smart cards (see [`keyroost_hid::usb_smart_cards`]) that no
+/// listed reader belongs to, given each listed reader's USB device. Empty
+/// when any reader's device is unknown (`None`): that reader might be any of
+/// the cards, so nothing is proven.
+#[must_use]
+pub fn smart_cards_without_reader(
+    cards: &[UsbSmartCard],
+    readers: &[Option<UsbDeviceKey>],
+) -> Vec<UsbSmartCard> {
+    if readers.iter().any(Option::is_none) {
+        return Vec::new();
+    }
+    cards
+        .iter()
+        .filter(|c| {
+            !readers
+                .iter()
+                .any(|r| same_usb_device(r.as_ref(), Some(&c.usb_device)))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Set [`Device::smart_card_unlisted`] on each row whose FIDO HID node is on
+/// the same USB device as a smart card no reader belongs to. `readers` is
+/// each listed reader's USB device, or `None` when PC/SC couldn't be asked:
+/// then no row is marked.
+fn mark_smart_card_unlisted(
+    devices: &mut [Device],
+    hids: &[HidDevice],
+    cards: &[UsbSmartCard],
+    readers: Option<&[Option<UsbDeviceKey>]>,
+) {
+    let unlisted = match readers {
+        Some(readers) => smart_cards_without_reader(cards, readers),
+        None => Vec::new(),
+    };
+    for d in devices {
+        let hid = d
+            .hid_path
+            .as_ref()
+            .and_then(|path| hids.iter().find(|h| &h.path == path));
+        d.smart_card_unlisted = hid.is_some_and(|h| {
+            unlisted
+                .iter()
+                .any(|c| same_usb_device(h.usb_device.as_ref(), Some(&c.usb_device)))
+        });
+    }
+}
+
+/// [`mark_smart_card_unlisted`] for a live scan: the readers' USB devices
+/// come from the probe the scan already ran (no second connection), and the
+/// smart cards from sysfs (Linux only; elsewhere none, so nothing is marked).
+fn mark_live_smart_cards(
+    devices: &mut [Device],
+    hids: &[HidDevice],
+    probes: &[ReaderProbe],
+    pcsc_up: bool,
+) {
+    let readers: Vec<Option<UsbDeviceKey>> = probes.iter().map(|p| p.usb_device.clone()).collect();
+    mark_smart_card_unlisted(
+        devices,
+        hids,
+        &keyroost_hid::usb_smart_cards(),
+        pcsc_up.then_some(readers.as_slice()),
+    );
+}
+
 /// Build the unified device list (see [`enumerate`]) with options.
 pub fn enumerate_with(opts: &EnumerateOptions) -> Result<Vec<Device>, String> {
     let hids = keyroost_hid::enumerate().map_err(|e| format!("HID enumeration failed: {e}"))?;
-    let probes = keyroost_transport::probe_readers().unwrap_or_default();
+    let probed = keyroost_transport::probe_readers();
+    let pcsc_up = probed.is_ok();
+    let probes = probed.unwrap_or_default();
     let (keyring, may_save) = load_keyring_for_scan(opts.debug);
     if opts.skip_identity_reads {
-        // A quick re-check scan uses U2F answers already known; it asks no key.
+        // A quick re-check scan uses INIT answers already known; it asks no
+        // key.
         let mut devices = correlate(&hids, &probes, &keyring);
-        mark_u2f_only(&mut devices, &u2f_only_paths(&hids, false, opts.debug));
+        let (u2f_only, unknown) = fido_protocol_paths(&hids, opts.may_ask_protocol(), opts.debug);
+        mark_fido_protocol(&mut devices, &u2f_only, &unknown);
+        mark_live_smart_cards(&mut devices, &hids, &probes, pcsc_up);
         return Ok(devices);
     }
-    let mut devices = correlate_live(&hids, &probes, &keyring, opts.debug);
+    let mut devices = correlate_live_asking(
+        &hids,
+        &probes,
+        &keyring,
+        opts.debug,
+        opts.may_ask_protocol(),
+    );
+    mark_live_smart_cards(&mut devices, &hids, &probes, pcsc_up);
     if !opts.skip_key_names {
         name_from_keys(&mut devices, &keyring, may_save, opts.debug);
     }
     Ok(devices)
 }
 
-/// Each FIDO interface's answer to "do you speak only U2F?", by plug-in: its
-/// path, USB position and IDs. A replug (new position, or a reused path with
-/// a different key) asks again. `None` is "couldn't ask" (Windows without
-/// administrator rights, a key that didn't answer) and is kept too, so an
-/// unanswering key doesn't cost every scan the open timeout.
-type U2fCache = Vec<((PathBuf, Option<UsbDeviceKey>, u16, u16), Option<bool>)>;
-static U2F_ONLY_CACHE: std::sync::Mutex<U2fCache> = std::sync::Mutex::new(Vec::new());
+/// Each FIDO interface's last answer to CTAPHID INIT, by plug-in: its path,
+/// USB position and IDs. A replug (new position, or a reused path with a
+/// different key) asks again. An answer ([`InitAnswer::Cbor`]) is kept
+/// until unplug; a failed ask is asked again on the next scan that may ask.
+type FidoProtocolCache = Vec<((PathBuf, Option<UsbDeviceKey>, u16, u16), InitAnswer)>;
+static FIDO_PROTOCOL_CACHE: std::sync::Mutex<FidoProtocolCache> = std::sync::Mutex::new(Vec::new());
 
-/// The FIDO interfaces among `hids` that speak only U2F, from each key's
-/// CTAPHID INIT answer (asked at most once per plug-in, and only when
-/// `may_ask`). One open of the interface; nothing is sent beyond INIT.
-fn u2f_only_paths(
+/// The FIDO interfaces among `hids` that speak only U2F, and those that
+/// opened but gave no proper INIT answer (protocol unknown), from each
+/// key's CTAPHID INIT answer (asked only when `may_ask`). One open of the
+/// interface; nothing is sent beyond INIT. An interface never asked, or
+/// that couldn't be opened, is in neither set and keeps FIDO2.
+fn fido_protocol_paths(
     hids: &[HidDevice],
     may_ask: bool,
     debug: bool,
-) -> std::collections::HashSet<PathBuf> {
-    let Ok(mut cache) = U2F_ONLY_CACHE.lock() else {
-        return std::collections::HashSet::new();
+) -> (
+    std::collections::HashSet<PathBuf>,
+    std::collections::HashSet<PathBuf>,
+) {
+    let Ok(mut cache) = FIDO_PROTOCOL_CACHE.lock() else {
+        return Default::default();
     };
-    u2f_only_from(&mut cache, hids, may_ask, |path| {
-        keyroost_transport::identity::ctaphid_speaks_cbor(path, debug).map(|cbor| !cbor)
+    fido_protocols_from(&mut cache, hids, may_ask, |path| {
+        keyroost_transport::identity::ctaphid_speaks_cbor(path, debug)
     })
 }
 
-/// [`u2f_only_paths`] against `cache`, with `ask` as the question to a
-/// key (`Some(true)`: U2F only). Only FIDO interfaces are asked: on macOS
-/// and Windows `hids` holds every HID device, keyboards and mice too.
-fn u2f_only_from(
-    cache: &mut U2fCache,
+/// [`fido_protocol_paths`] against `cache`, with `ask` as the question to a
+/// key. Only FIDO interfaces are asked: on macOS and Windows `hids` holds
+/// every HID device, keyboards and mice too.
+fn fido_protocols_from(
+    cache: &mut FidoProtocolCache,
     hids: &[HidDevice],
     may_ask: bool,
-    mut ask: impl FnMut(&std::path::Path) -> Option<bool>,
-) -> std::collections::HashSet<PathBuf> {
-    let mut out = std::collections::HashSet::new();
+    mut ask: impl FnMut(&std::path::Path) -> InitAnswer,
+) -> (
+    std::collections::HashSet<PathBuf>,
+    std::collections::HashSet<PathBuf>,
+) {
+    let mut u2f_only = std::collections::HashSet::new();
+    let mut unknown = std::collections::HashSet::new();
     // Forget interfaces that are gone, so the cache can't grow without end.
     cache.retain(|(k, _)| hids.iter().any(|h| h.path == k.0));
     for h in hids.iter().filter(|h| h.is_fido()) {
@@ -1432,28 +1592,62 @@ fn u2f_only_from(
             h.vendor_id,
             h.product_id,
         );
-        let answer = match cache.iter().find(|(k, _)| *k == key) {
-            Some((_, a)) => *a,
+        let cached = cache.iter_mut().find(|(k, _)| *k == key);
+        let answer = match cached {
+            Some((_, a @ InitAnswer::Cbor(_))) => Some(*a),
+            Some((_, a)) if may_ask => {
+                *a = ask(&h.path);
+                Some(*a)
+            }
+            Some((_, a)) => Some(*a),
             None if may_ask => {
                 let a = ask(&h.path);
                 cache.push((key, a));
-                a
+                Some(a)
             }
             None => None,
         };
-        if answer == Some(true) {
-            out.insert(h.path.clone());
+        match answer {
+            Some(InitAnswer::Cbor(false)) => {
+                u2f_only.insert(h.path.clone());
+            }
+            Some(InitAnswer::NoProperAnswer) => {
+                unknown.insert(h.path.clone());
+            }
+            Some(InitAnswer::Cbor(true) | InitAnswer::NotOpened) | None => {}
         }
     }
-    out
+    (u2f_only, unknown)
 }
 
 /// Mark the rows whose FIDO interface is in `u2f_only` with
-/// [`Caps::U2F_ONLY`].
-pub fn mark_u2f_only(devices: &mut [Device], u2f_only: &std::collections::HashSet<PathBuf>) {
+/// [`Caps::U2F_ONLY`], and those in `unknown` with
+/// [`Caps::FIDO_PROTOCOL_UNKNOWN`] and FIDO2 unverified. A row with a HID
+/// path in neither set has FIDO2 as the HID node shows it.
+fn mark_fido_protocol(
+    devices: &mut [Device],
+    u2f_only: &std::collections::HashSet<PathBuf>,
+    unknown: &std::collections::HashSet<PathBuf>,
+) {
     for d in devices.iter_mut() {
-        if d.caps.has(Caps::FIDO2) && d.hid_path.as_ref().is_some_and(|p| u2f_only.contains(p)) {
-            d.caps.insert(Caps::U2F_ONLY);
+        if !d.caps.has(Caps::FIDO2) {
+            continue;
+        }
+        let Some(path) = d.hid_path.as_ref() else {
+            continue;
+        };
+        if unknown.contains(path) {
+            d.caps.remove(Caps::U2F_ONLY);
+            d.caps.insert(Caps::FIDO_PROTOCOL_UNKNOWN);
+            d.unverified.insert(Caps::FIDO2);
+        } else {
+            d.caps.remove(Caps::FIDO_PROTOCOL_UNKNOWN);
+            d.unverified.remove(Caps::FIDO2);
+            if u2f_only.contains(path) {
+                d.caps.insert(Caps::U2F_ONLY);
+            } else {
+                d.caps.remove(Caps::U2F_ONLY);
+            }
         }
     }
 }
@@ -1515,10 +1709,12 @@ impl ResetStep {
 ///
 /// Callers pass [`Device::caps`], the *offered* set, so an unverified
 /// capability (see [`CapState::Unverified`]) gets its reset step too:
-/// unverified always behaves as "offer it", and the attempt itself reports
-/// whether the applet is really there. [`ResetStep::Piv`] is the one
-/// exception this doesn't itself resolve: `Caps::PIV` says the applet is
-/// there, not that it can be reset at all — call
+/// unverified behaves as "offer it", and the attempt itself reports
+/// whether the applet is really there. The exception is a FIDO HID
+/// interface that gave no proper INIT answer
+/// ([`Caps::FIDO_PROTOCOL_UNKNOWN`]): no FIDO2 step until the key answers.
+/// [`ResetStep::Piv`] is the one other case this doesn't itself resolve:
+/// `Caps::PIV` says the applet is there, not that it can be reset at all — call
 /// [`exclude_unresettable_piv`] once a live fingerprint confirms it can't.
 pub fn factory_reset_plan(caps: Caps) -> Vec<ResetStep> {
     let mut steps = Vec::new();
@@ -1534,8 +1730,10 @@ pub fn factory_reset_plan(caps: Caps) -> Vec<ResetStep> {
     if caps.has(Caps::PIV) {
         steps.push(ResetStep::Piv);
     }
-    // U2F has no reset command: a U2F-only interface has no FIDO2 step.
-    if caps.has(Caps::FIDO2) && !caps.has(Caps::U2F_ONLY) {
+    // U2F has no reset command: a U2F-only interface has no FIDO2 step, and
+    // neither has a HID interface that gave no proper INIT answer.
+    if caps.has(Caps::FIDO2) && !caps.has(Caps::U2F_ONLY) && !caps.has(Caps::FIDO_PROTOCOL_UNKNOWN)
+    {
         steps.push(ResetStep::Fido);
     }
     steps
@@ -1667,6 +1865,7 @@ mod tests {
             has_openpgp: pgp,
             has_piv: piv,
             has_fido: false,
+            fido_ctap2_confirmed: false,
             has_otp: false,
             is_prog: false,
             prog_serial: None,
@@ -1674,6 +1873,83 @@ mod tests {
             usb_device: UsbDeviceKey::from_bus_addr(bus, addr),
             usb_product: None,
         }
+    }
+
+    fn smart_card(bus: u8, addr: u8) -> UsbSmartCard {
+        UsbSmartCard {
+            vendor_id: 0x349e,
+            product_id: 0x0024,
+            product_name: "PIN+ Key".into(),
+            usb_device: UsbDeviceKey::BusAddr(bus, addr),
+        }
+    }
+
+    #[test]
+    fn a_smart_card_with_a_listed_reader_is_not_unlisted() {
+        let cards = [smart_card(1, 7)];
+        let readers = [Some(UsbDeviceKey::BusAddr(1, 7))];
+        assert!(smart_cards_without_reader(&cards, &readers).is_empty());
+    }
+
+    #[test]
+    fn a_smart_card_no_reader_matches_is_unlisted() {
+        let cards = [smart_card(1, 7), smart_card(1, 9)];
+        let readers = [Some(UsbDeviceKey::BusAddr(1, 7))];
+        assert_eq!(
+            smart_cards_without_reader(&cards, &readers),
+            vec![smart_card(1, 9)]
+        );
+        // No readers at all: every card is unlisted.
+        assert_eq!(
+            smart_cards_without_reader(&cards, &[]),
+            cards.to_vec(),
+            "no reader listed"
+        );
+    }
+
+    #[test]
+    fn a_reader_of_unknown_device_suppresses_every_hint() {
+        // That reader might be either card, so nothing is proven.
+        let cards = [smart_card(1, 7), smart_card(1, 9)];
+        let readers = [Some(UsbDeviceKey::BusAddr(1, 7)), None];
+        assert!(smart_cards_without_reader(&cards, &readers).is_empty());
+    }
+
+    #[test]
+    fn the_key_row_of_an_unlisted_smart_card_is_marked() {
+        let hids = [
+            hid(0x349e, 0x0024, "/dev/hidraw0", None, Some(1), Some(9)),
+            hid(0x1050, 0x0407, "/dev/hidraw1", None, Some(1), Some(7)),
+        ];
+        let mut devs = correlate(&hids, &[], &Keyring::default());
+        assert!(devs.iter().all(|d| !d.smart_card_unlisted), "default off");
+        let cards = [smart_card(1, 7), smart_card(1, 9)];
+        let readers = [Some(UsbDeviceKey::BusAddr(1, 7))];
+        mark_smart_card_unlisted(&mut devs, &hids, &cards, Some(&readers));
+        let marked: Vec<_> = devs
+            .iter()
+            .filter(|d| d.smart_card_unlisted)
+            .map(|d| d.hid_path.clone())
+            .collect();
+        assert_eq!(marked, vec![Some(PathBuf::from("/dev/hidraw0"))]);
+    }
+
+    #[test]
+    fn no_smart_card_hint_when_pcsc_is_down() {
+        let hids = [hid(0x349e, 0x0024, "/dev/hidraw0", None, Some(1), Some(9))];
+        let mut devs = correlate(&hids, &[], &Keyring::default());
+        let cards = [smart_card(1, 9)];
+        mark_smart_card_unlisted(&mut devs, &hids, &cards, None);
+        assert!(!devs[0].smart_card_unlisted);
+    }
+
+    #[test]
+    fn no_smart_card_hint_when_a_reader_device_is_unknown() {
+        let hids = [hid(0x349e, 0x0024, "/dev/hidraw0", None, Some(1), Some(9))];
+        let mut devs = correlate(&hids, &[], &Keyring::default());
+        let cards = [smart_card(1, 9)];
+        mark_smart_card_unlisted(&mut devs, &hids, &cards, Some(&[None]));
+        assert!(!devs[0].smart_card_unlisted);
     }
 
     #[test]
@@ -3510,8 +3786,8 @@ mod tests {
 
     /// Only FIDO interfaces are ever asked: the HID list on macOS and Windows
     /// holds every HID device (keyboards, mice), and an INIT must never be
-    /// sent to those. Each interface is asked once per plug-in, and a scan
-    /// that may not ask uses only earlier answers.
+    /// sent to those. An interface that answered is asked once per plug-in,
+    /// and a scan that may not ask uses only earlier answers.
     #[test]
     fn u2f_check_asks_fido_interfaces_only_and_once() {
         let fido = hid(0x1050, 0x0116, "/dev/hidraw3", None, Some(1), Some(2));
@@ -3519,21 +3795,26 @@ mod tests {
         keyboard.usage_page = 0x0001;
         keyboard.usage = 0x0006;
         let hids = [keyboard, fido];
-        let mut cache = U2fCache::new();
+        let mut cache = FidoProtocolCache::new();
         let mut asked = Vec::new();
-        let found = u2f_only_from(&mut cache, &hids, true, |p| {
+        let (found, unknown) = fido_protocols_from(&mut cache, &hids, true, |p| {
             asked.push(p.to_path_buf());
-            Some(true) // the INIT answer has no CBOR bit: U2F only
+            InitAnswer::Cbor(false) // the INIT answer has no CBOR bit: U2F only
         });
         assert_eq!(asked, vec![PathBuf::from("/dev/hidraw3")]);
         assert!(found.contains(&PathBuf::from("/dev/hidraw3")));
+        assert!(unknown.is_empty());
         // Known now: not asked again, and the answer still counts.
-        let found = u2f_only_from(&mut cache, &hids, true, |_| panic!("asked twice"));
+        let (found, unknown) =
+            fido_protocols_from(&mut cache, &hids, true, |_| panic!("asked twice"));
         assert!(found.contains(&PathBuf::from("/dev/hidraw3")));
-        // A scan that may not ask never does.
-        let mut empty = U2fCache::new();
-        let found = u2f_only_from(&mut empty, &hids, false, |_| panic!("asked"));
+        assert!(unknown.is_empty());
+        // A scan that may not ask never does, and a key never asked keeps
+        // FIDO2: it is in neither set.
+        let mut empty = FidoProtocolCache::new();
+        let (found, unknown) = fido_protocols_from(&mut empty, &hids, false, |_| panic!("asked"));
         assert!(found.is_empty());
+        assert!(unknown.is_empty());
     }
 
     /// A FIDO interface that speaks only U2F (its CTAPHID INIT answer has no
@@ -3546,7 +3827,7 @@ mod tests {
         let mut devs = correlate(&hids, &[], &Keyring::default());
         let mut u2f = std::collections::HashSet::new();
         u2f.insert(PathBuf::from("/dev/hidraw3"));
-        mark_u2f_only(&mut devs, &u2f);
+        mark_fido_protocol(&mut devs, &u2f, &std::collections::HashSet::new());
         let key = &devs[0];
         assert!(key.caps.has(Caps::FIDO2), "still a FIDO interface");
         assert!(key.caps.has(Caps::U2F_ONLY));
@@ -3555,8 +3836,278 @@ mod tests {
 
         // Any other FIDO key keeps its FIDO2 badge.
         let mut other = correlate(&hids, &[], &Keyring::default());
-        mark_u2f_only(&mut other, &std::collections::HashSet::new());
+        mark_fido_protocol(
+            &mut other,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(other[0].cap_badges(), vec!["FIDO2"]);
+    }
+
+    /// A reader SELECT of the FIDO applet answering `U2F_V2` doesn't tell a
+    /// U2F-only card from one that also speaks CTAP2, so a reader-only row
+    /// shows FIDO2 unverified but keeps its FIDO2 reset step (only a HID
+    /// interface that gave no proper INIT answer loses it); the HID node's
+    /// own INIT answer decides a merged row.
+    #[test]
+    fn reader_select_does_not_prove_u2f_exclusivity() {
+        let mut card = probe(
+            "Test reader",
+            false,
+            true,
+            true,
+            true,
+            None,
+            Some(1),
+            Some(2),
+        );
+        card.has_fido = true;
+        // U2F_V2 is returned by both U2F-only and dual-protocol cards.
+        card.fido_ctap2_confirmed = false;
+        let reader_only = correlate(&[], &[card.clone()], &Keyring::default());
+        assert!(!reader_only[0].caps.has(Caps::U2F_ONLY));
+        assert_eq!(reader_only[0].cap_state(Caps::FIDO2), CapState::Unverified);
+        assert_eq!(
+            reader_only[0].cap_badge_states().first(),
+            Some(&("FIDO2", CapState::Unverified))
+        );
+        assert!(factory_reset_plan(reader_only[0].caps).contains(&ResetStep::Fido));
+        // A FIDO-only card in a reader is still a factory-reset target.
+        let mut fido_only = card.clone();
+        (fido_only.has_oath, fido_only.has_openpgp, fido_only.has_piv) = (false, false, false);
+        let fido_only = correlate(&[], &[fido_only], &Keyring::default());
+        assert_eq!(fido_only[0].cap_state(Caps::FIDO2), CapState::Unverified);
+        assert_eq!(factory_reset_plan(fido_only[0].caps), vec![ResetStep::Fido]);
+        let picked = crate::select::resolve_target(
+            &fido_only,
+            &crate::select::Selector::default(),
+            crate::select::Need::FactoryReset,
+            &mut crate::select::NoPicker,
+        )
+        .expect("a FIDO-only reader card can be factory-reset");
+        assert_eq!(picked.device.id, fido_only[0].id);
+
+        // A SELECT that answered FIDO_2_0 proves CTAP2.
+        let mut ctap2 = card.clone();
+        ctap2.fido_ctap2_confirmed = true;
+        let confirmed = correlate(&[], &[ctap2], &Keyring::default());
+        assert_eq!(confirmed[0].cap_state(Caps::FIDO2), CapState::Present);
+        assert!(factory_reset_plan(confirmed[0].caps).contains(&ResetStep::Fido));
+
+        let hids = [hid(0x1050, 0x0116, "/dev/neo", None, Some(1), Some(2))];
+        let mut devs = correlate(&hids, &[card], &Keyring::default());
+        let paths = [PathBuf::from("/dev/neo")].into();
+        let empty = std::collections::HashSet::new();
+        mark_fido_protocol(&mut devs, &empty, &paths);
+        assert_eq!(devs[0].cap_state(Caps::FIDO2), CapState::Unverified);
+        assert!(!devs[0].caps.has(Caps::U2F_ONLY));
+        // The HID interface gave no proper answer: no FIDO2 reset step.
+        assert!(!factory_reset_plan(devs[0].caps).contains(&ResetStep::Fido));
+
+        // A later successful CTAP2 INIT clears *both* unknown markers.
+        mark_fido_protocol(&mut devs, &empty, &empty);
+        assert_eq!(devs[0].cap_state(Caps::FIDO2), CapState::Present);
+        assert!(!devs[0].caps.has(Caps::FIDO_PROTOCOL_UNKNOWN));
+        assert_eq!(devs[0].cap_badges().first(), Some(&"FIDO2"));
+        assert!(factory_reset_plan(devs[0].caps).contains(&ResetStep::Fido));
+
+        mark_fido_protocol(&mut devs, &paths, &empty);
+        assert!(devs[0].caps.has(Caps::U2F_ONLY));
+        assert!(!factory_reset_plan(devs[0].caps).contains(&ResetStep::Fido));
+    }
+
+    #[test]
+    fn u2f_only_scan_does_not_try_to_read_a_ctap2_name() {
+        let hids = [hid(
+            0x1050,
+            0x0116,
+            "/nonexistent/keyroost-test/neo-no-ctap2",
+            None,
+            Some(1),
+            Some(2),
+        )];
+        let mut devices = correlate(&hids, &[], &Keyring::default());
+        let mut u2f = std::collections::HashSet::new();
+        u2f.insert(PathBuf::from("/nonexistent/keyroost-test/neo-no-ctap2"));
+        mark_fido_protocol(&mut devices, &u2f, &std::collections::HashSet::new());
+
+        assert!(read_key_labels(&devices, false).is_empty());
+    }
+
+    /// A key that opened but gave no proper INIT answer: FIDO2?, no name
+    /// read, no FIDO2 reset step.
+    #[test]
+    fn unanswered_fido_probe_does_not_claim_ctap2_or_read_a_name() {
+        let hids = [hid(
+            0x1050,
+            0x0116,
+            "/nonexistent/keyroost-test/neo-unanswered",
+            None,
+            Some(1),
+            Some(2),
+        )];
+        let mut cache = FidoProtocolCache::new();
+        let (u2f, unknown) =
+            fido_protocols_from(&mut cache, &hids, true, |_| InitAnswer::NoProperAnswer);
+        let mut devices = correlate(&hids, &[], &Keyring::default());
+        mark_fido_protocol(&mut devices, &u2f, &unknown);
+
+        assert_eq!(
+            devices[0].cap_badge_states(),
+            vec![("FIDO2", CapState::Unverified)]
+        );
+        assert!(!factory_reset_plan(devices[0].caps).contains(&ResetStep::Fido));
+        assert!(read_key_labels(&devices, false).is_empty());
+    }
+
+    /// A key keyroost couldn't open at all (no admin rights, no udev rule,
+    /// busy in a browser) keeps FIDO2 as before: the badge, the name read
+    /// and the FIDO2 reset step.
+    #[test]
+    fn not_opened_keeps_fido2_and_reset() {
+        let path = "/nonexistent/keyroost-test/not-opened";
+        let hids = [hid(0x1050, 0x0407, path, None, Some(1), Some(2))];
+        let mut cache = FidoProtocolCache::new();
+        let (u2f, unknown) =
+            fido_protocols_from(&mut cache, &hids, true, |_| InitAnswer::NotOpened);
+        assert!(u2f.is_empty());
+        assert!(unknown.is_empty());
+        let mut devices = correlate(&hids, &[], &Keyring::default());
+        mark_fido_protocol(&mut devices, &u2f, &unknown);
+
+        assert_eq!(
+            devices[0].cap_badge_states(),
+            vec![("FIDO2", CapState::Present)]
+        );
+        assert!(factory_reset_plan(devices[0].caps).contains(&ResetStep::Fido));
+        // The name read is still tried (this path doesn't exist, so it fails).
+        assert_eq!(
+            read_key_labels(&devices, false).get(&devices[0].id),
+            Some(&KeyLabel::ReadFailed)
+        );
+    }
+
+    /// Unplugging forgets an interface's answer, and the same path at a new
+    /// USB position (a replug) is asked again.
+    #[test]
+    fn unplug_or_replug_forgets_the_answer() {
+        let at = |addr| {
+            [hid(
+                0x1050,
+                0x0407,
+                "/dev/hidraw7",
+                None,
+                Some(1),
+                Some(addr),
+            )]
+        };
+        let mut cache = FidoProtocolCache::new();
+        fido_protocols_from(&mut cache, &at(2), true, |_| InitAnswer::Cbor(false));
+        assert_eq!(cache.len(), 1);
+
+        // Unplugged: the scan sees no interface, and the answer is gone.
+        fido_protocols_from(&mut cache, &[], true, |_| panic!("nothing to ask"));
+        assert!(cache.is_empty());
+
+        // Back at a new position after an answer: asked again.
+        fido_protocols_from(&mut cache, &at(2), true, |_| InitAnswer::Cbor(false));
+        let mut asked = 0;
+        let (u2f, unknown) = fido_protocols_from(&mut cache, &at(3), true, |_| {
+            asked += 1;
+            InitAnswer::Cbor(true)
+        });
+        assert_eq!(asked, 1);
+        assert!(u2f.is_empty() && unknown.is_empty());
+    }
+
+    /// A key that couldn't be opened last time keeps FIDO2 on a scan that may
+    /// not ask: its cached answer is in neither set.
+    #[test]
+    fn cached_not_opened_is_in_neither_set_when_not_asking() {
+        let hids = [hid(0x1050, 0x0407, "/dev/hidraw7", None, Some(1), Some(2))];
+        let mut cache = FidoProtocolCache::new();
+        fido_protocols_from(&mut cache, &hids, true, |_| InitAnswer::NotOpened);
+        let (u2f, unknown) = fido_protocols_from(&mut cache, &hids, false, |_| panic!("asked"));
+        assert!(u2f.is_empty() && unknown.is_empty());
+    }
+
+    /// A scan with `skip_protocol_asks` (the app's reset-arm poll) or
+    /// `skip_identity_reads` never asks, even an interface whose last
+    /// answer was no proper answer; a default scan does ask.
+    #[test]
+    fn a_may_not_ask_scan_never_asks() {
+        let hids = [hid(0x1050, 0x0407, "/dev/hidraw7", None, Some(1), Some(2))];
+        let mut cache = FidoProtocolCache::new();
+        fido_protocols_from(&mut cache, &hids, true, |_| InitAnswer::NoProperAnswer);
+        for opts in [
+            EnumerateOptions {
+                skip_protocol_asks: true,
+                skip_key_names: true,
+                ..Default::default()
+            },
+            EnumerateOptions {
+                skip_identity_reads: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(!opts.may_ask_protocol());
+            let (_, unknown) =
+                fido_protocols_from(&mut cache, &hids, opts.may_ask_protocol(), |_| {
+                    panic!("asked on a may-not-ask scan")
+                });
+            assert!(unknown.contains(&PathBuf::from("/dev/hidraw7")));
+        }
+        assert!(EnumerateOptions::default().may_ask_protocol());
+    }
+
+    /// A failed ask isn't kept until unplug: the next scan that may ask asks
+    /// again, and a scan that may not ask uses the last answer.
+    #[test]
+    fn failed_ask_is_retried_next_scan() {
+        let hids = [hid(0x1050, 0x0407, "/dev/hidraw7", None, Some(1), Some(2))];
+        let path = PathBuf::from("/dev/hidraw7");
+        let mut cache = FidoProtocolCache::new();
+        let badge = |u2f: &std::collections::HashSet<PathBuf>,
+                     unknown: &std::collections::HashSet<PathBuf>| {
+            let mut devices = correlate(&hids, &[], &Keyring::default());
+            mark_fido_protocol(&mut devices, u2f, unknown);
+            devices[0].cap_badge_states()
+        };
+
+        let (u2f, unknown) =
+            fido_protocols_from(&mut cache, &hids, true, |_| InitAnswer::NoProperAnswer);
+        assert!(unknown.contains(&path));
+        assert_eq!(badge(&u2f, &unknown), vec![("FIDO2", CapState::Unverified)]);
+
+        // A scan that may not ask keeps the cached unknown.
+        let (u2f, unknown) = fido_protocols_from(&mut cache, &hids, false, |_| panic!("asked"));
+        assert!(unknown.contains(&path));
+        assert_eq!(badge(&u2f, &unknown), vec![("FIDO2", CapState::Unverified)]);
+
+        // The next scan that may ask asks again, and the answer counts.
+        let mut asked = 0;
+        let (u2f, unknown) = fido_protocols_from(&mut cache, &hids, true, |_| {
+            asked += 1;
+            InitAnswer::Cbor(true)
+        });
+        assert_eq!(asked, 1);
+        assert!(u2f.is_empty() && unknown.is_empty());
+        assert_eq!(badge(&u2f, &unknown), vec![("FIDO2", CapState::Present)]);
+
+        // An answer is kept until unplug.
+        let (u2f, unknown) =
+            fido_protocols_from(&mut cache, &hids, true, |_| panic!("asked twice"));
+        assert!(u2f.is_empty() && unknown.is_empty());
+
+        // Couldn't open: asked again next time too.
+        let mut cache = FidoProtocolCache::new();
+        fido_protocols_from(&mut cache, &hids, true, |_| InitAnswer::NotOpened);
+        let mut asked = 0;
+        fido_protocols_from(&mut cache, &hids, true, |_| {
+            asked += 1;
+            InitAnswer::NotOpened
+        });
+        assert_eq!(asked, 1);
     }
 }
 

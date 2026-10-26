@@ -33,6 +33,7 @@ pub(crate) fn enumerate() -> Result<Vec<Device>, Box<dyn Error>> {
         debug: debug_on(),
         skip_identity_reads: false,
         skip_key_names: false,
+        skip_protocol_asks: false,
     })?)
 }
 
@@ -44,6 +45,7 @@ pub(crate) fn enumerate_without_key_names() -> Result<Vec<Device>, Box<dyn Error
         debug: debug_on(),
         skip_identity_reads: false,
         skip_key_names: true,
+        skip_protocol_asks: false,
     })?)
 }
 
@@ -55,6 +57,7 @@ pub(crate) fn enumerate_without_identity_reads() -> Result<Vec<Device>, Box<dyn 
         debug: debug_on(),
         skip_identity_reads: true,
         skip_key_names: true,
+        skip_protocol_asks: true,
     })?)
 }
 
@@ -109,6 +112,7 @@ fn typed_device(reader: Option<String>, hid_path: Option<PathBuf>, typed: &str) 
         reader,
         hid_serial: None,
         naming: Default::default(),
+        smart_card_unlisted: false,
     }
 }
 
@@ -274,6 +278,18 @@ pub(crate) fn select_fido(path: Option<&Path>) -> Result<Device, Box<dyn Error>>
     })
 }
 
+/// Select a FIDO key over USB or a smart-card reader, adding the bootloader
+/// hint when none is found.
+pub(crate) fn select_fido_any(
+    reader: Option<&str>,
+    path: Option<&Path>,
+) -> Result<Device, Box<dyn Error>> {
+    select(Need::FidoAny, reader, path).map_err(|e| {
+        let bl = keyroost_hid::bootloader_device_present().map(|b| b.to_string());
+        add_bootloader_hint(e, bl.as_deref())
+    })
+}
+
 /// The HID path of the selected FIDO key.
 pub(crate) fn fido_path(path: Option<&Path>) -> Result<PathBuf, Box<dyn Error>> {
     hid_path_of(&select_fido(path)?)
@@ -407,6 +423,7 @@ mod tests {
             reader: Some("Yubico YubiKey OTP+FIDO+CCID 00 00".into()),
             hid_serial: None,
             naming: keyroost_resolve::Naming::local(name),
+            smart_card_unlisted: false,
         }
     }
 

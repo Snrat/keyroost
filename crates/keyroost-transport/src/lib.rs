@@ -31,6 +31,16 @@ use pcsc::{
     PNP_NOTIFICATION,
 };
 
+/// The one place a PC/SC context is established. Under the test-only
+/// `KEYROOST_DEVICE_TEST=none` switch there is no PC/SC service to talk to, so
+/// no key can be reached.
+pub(crate) fn establish_context() -> Result<Context, PcscError> {
+    if keyroost_proto::devices_hidden() {
+        return Err(PcscError::NoService);
+    }
+    Context::establish(Scope::User)
+}
+
 mod oath;
 pub use oath::OathSession;
 
@@ -807,7 +817,7 @@ impl Session {
 
     /// Find the first Molto2 reader and open a card connection.
     pub fn open() -> Result<Self, TransportError> {
-        let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+        let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
         let mut readers_buf = [0u8; 2048];
         let mut readers = ctx
             .list_readers(&mut readers_buf)
@@ -826,7 +836,7 @@ impl Session {
     /// Open a session against a specific reader name (useful when the user has
     /// multiple Token2 devices plugged in).
     pub fn open_named(reader_name: &str) -> Result<Self, TransportError> {
-        let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+        let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
         let cstring = std::ffi::CString::new(reader_name)
             .map_err(|_| TransportError::MalformedResponse("reader name contained NUL"))?;
         let card = ctx.connect(&cstring, ShareMode::Shared, Protocols::ANY)?;
@@ -839,7 +849,7 @@ impl Session {
 
     /// List the names of all connected PC/SC readers, Molto2 or not. Useful for diagnostics.
     pub fn list_readers() -> Result<Vec<String>, TransportError> {
-        let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+        let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
         let mut buf = [0u8; 4096];
         Ok(ctx
             .list_readers(&mut buf)
@@ -1076,7 +1086,7 @@ pub struct YubiKeyCcid {
 /// `serial: None`) so callers can see them. An empty PC/SC reader list yields an
 /// empty vec; only PC/SC-service failures error.
 pub fn yubikey_ccid_serials() -> Result<Vec<YubiKeyCcid>, TransportError> {
-    let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+    let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
     let mut buf = [0u8; 4096];
     let names: Vec<std::ffi::CString> = ctx
         .list_readers(&mut buf)
@@ -1115,6 +1125,43 @@ pub fn yubikey_ccid_serials() -> Result<Vec<YubiKeyCcid>, TransportError> {
     Ok(out)
 }
 
+/// Which physical USB device each listed PC/SC reader belongs to, one entry per
+/// reader, `None` where it can't be told. Sends no APDU: on Linux and macOS
+/// each reader is connected shared, its `CHANNEL_ID` read, and the connection
+/// released with `LeaveCard`; on Windows the device tree answers without a
+/// connection. A Molto2 reader is never connected (see [`probe_readers`]), so
+/// its entry is `None`, as is a reader that can't be connected.
+///
+/// For a caller that doesn't probe the readers anyway (`doctor`); a scan that
+/// runs [`probe_readers`] already has these in [`ReaderProbe::usb_device`].
+/// Only PC/SC-service failures error.
+pub fn reader_usb_devices() -> Result<Vec<Option<UsbDeviceKey>>, TransportError> {
+    let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
+    let mut buf = [0u8; 4096];
+    let names: Vec<std::ffi::CString> = ctx
+        .list_readers(&mut buf)
+        .map_err(TransportError::PcscUnavailable)?
+        .map(|r| r.to_owned())
+        .collect();
+    let tree = reader_devtree_keys(&names);
+    Ok(names
+        .into_iter()
+        .zip(tree)
+        .map(|(name, (tree_key, _))| {
+            if cfg!(windows) || keyroost_proto::is_molto2_reader(&name.to_string_lossy()) {
+                return tree_key;
+            }
+            let card = ctx
+                .connect(name.as_c_str(), ShareMode::Shared, Protocols::ANY)
+                .ok()?;
+            let key = read_channel_id(&card);
+            // Release without resetting (pcsc's `Drop` would reset the card).
+            let _ = card.disconnect(pcsc::Disposition::LeaveCard);
+            key
+        })
+        .collect())
+}
+
 /// One PC/SC reader, probed in a single connection: which applets it answers,
 /// plus YubiKey serial/topology when it is a YubiKey. Molto2 readers are flagged
 /// but deliberately *not* connected.
@@ -1143,6 +1190,10 @@ pub struct ReaderProbe {
     /// reader (NFC or contact). Lets the GUI offer the FIDO2 tab for reader-
     /// attached keys, served by [`CtapPcscDevice`].
     pub has_fido: bool,
+    /// The FIDO applet's SELECT answer named CTAP2 (`FIDO_2_0`). `U2F_V2`
+    /// doesn't settle it: keys that speak both protocols answer it too
+    /// (CTAP 2.1, 11.3.3).
+    pub fido_ctap2_confirmed: bool,
     /// True when the card answers a SELECT of the Token2 on-device OTP applet
     /// (`F00000014F747001`). Detected by actually selecting the applet rather
     /// than guessing from the reader name, so the OTP tab is offered only for
@@ -1214,6 +1265,13 @@ pub fn set_probe_trace(on: bool) {
     PROBE_TRACE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether a FIDO applet SELECT answer names CTAP2: success status and data
+/// starting `FIDO_2_0` (cards may add trailing bytes, as with the `U2F_V2`
+/// prefix rule in `get_info_unless_u2f_only`).
+fn select_names_fido2(data: &[u8], s1: u8, s2: u8) -> bool {
+    sw_ok(s1, s2) && data.starts_with(b"FIDO_2_0")
+}
+
 fn probe_trace_on() -> bool {
     PROBE_TRACE.load(std::sync::atomic::Ordering::Relaxed)
         || std::env::var_os("KEYROOST_PROBE_DEBUG").is_some()
@@ -1238,7 +1296,7 @@ fn probe_note(body: &str) {
 /// PC/SC service failure errors; an individual reader that can't be connected is
 /// returned with all-false capabilities rather than failing the whole scan.
 pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
-    let ctx = Context::establish(Scope::User).map_err(TransportError::PcscUnavailable)?;
+    let ctx = crate::establish_context().map_err(TransportError::PcscUnavailable)?;
     let mut buf = [0u8; 4096];
     let names: Vec<std::ffi::CString> = ctx
         .list_readers(&mut buf)
@@ -1274,6 +1332,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                 has_openpgp: false,
                 has_piv: false,
                 has_fido: false,
+                fido_ctap2_confirmed: false,
                 has_otp: false,
                 is_prog: false,
                 prog_serial: None,
@@ -1293,6 +1352,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             has_openpgp: false,
             has_piv: false,
             has_fido: false,
+            fido_ctap2_confirmed: false,
             has_otp: false,
             is_prog: false,
             prog_serial: None,
@@ -1316,7 +1376,7 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             // is answering. Some keys (e.g. Token2 PIN+ over CCID) reply 61xx to
             // a bare SELECT rather than 9000; without this they'd be misdetected
             // as lacking the applet and the GUI would hide the tab.
-            let answers = |label: &str, apdu: Vec<u8>| {
+            let select = |label: &str, apdu: Vec<u8>| {
                 let r = transmit_apdu(&card, &apdu);
                 if trace {
                     match &r {
@@ -1326,7 +1386,11 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
                         Err(e) => probe_note(&format!("{label} select -> error: {e}")),
                     }
                 }
-                matches!(r, Ok((_, s1, s2)) if sw_ok(s1, s2) || s1 == 0x61 || s1 == 0x6C)
+                r.ok()
+            };
+            let accepted = |s1: u8, s2: u8| sw_ok(s1, s2) || s1 == 0x61 || s1 == 0x6C;
+            let answers = |label: &str, apdu: Vec<u8>| {
+                select(label, apdu).is_some_and(|(_, s1, s2)| accepted(s1, s2))
             };
             probe.has_oath = answers("oath", keyroost_oath::select());
             probe.has_openpgp = answers("openpgp", keyroost_openpgp::select());
@@ -1341,10 +1405,15 @@ pub fn probe_readers() -> Result<Vec<ReaderProbe>, TransportError> {
             // FIDO2/U2F: a SELECT of the FIDO applet that the card accepts means
             // a security key is reachable over this reader (NFC or contact), to
             // be driven by CtapPcscDevice.
-            probe.has_fido = answers(
+            if let Some((data, s1, s2)) = select(
                 "fido",
                 keyroost_token2otp::build_select(&keyroost_token2otp::FIDO_APPLET_AID),
-            );
+            ) {
+                probe.has_fido = accepted(s1, s2);
+                // U2F_V2 doesn't mean U2F only. A continuation or any other
+                // answer leaves CTAP2 unconfirmed.
+                probe.fido_ctap2_confirmed = select_names_fido2(&data, s1, s2);
+            }
             // Token2 on-device OTP applet — select it to confirm presence,
             // rather than inferring from the reader name (which mislabels any
             // key on a "Token2" reader as having OTP).
@@ -1514,7 +1583,7 @@ impl ReaderWatcher {
                 // Outer loop re-establishes the context if the PC/SC service
                 // drops (e.g. pcscd restart).
                 while !stop_thread.load(Ordering::Relaxed) {
-                    let Ok(ctx) = Context::establish(Scope::User) else {
+                    let Ok(ctx) = crate::establish_context() else {
                         std::thread::sleep(Duration::from_secs(2));
                         continue;
                     };
@@ -2122,6 +2191,14 @@ mod reader_poll_tests {
 #[cfg(test)]
 mod redaction_tests {
     use super::*;
+
+    #[test]
+    fn fido_select_names_ctap2_by_prefix() {
+        assert!(select_names_fido2(b"FIDO_2_0", 0x90, 0x00));
+        assert!(select_names_fido2(b"FIDO_2_0_extra", 0x90, 0x00));
+        assert!(!select_names_fido2(b"U2F_V2", 0x90, 0x00));
+        assert!(!select_names_fido2(b"FIDO_2_0", 0x6A, 0x82));
+    }
 
     /// The applet reassembly loop must distinguish `61xx` (more data),
     /// `6Cxx` (wrong Le — reissue with the corrected length; issue #84), and

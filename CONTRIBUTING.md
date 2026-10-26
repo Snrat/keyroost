@@ -42,6 +42,8 @@ python3 packaging/assemble-changelog.py --check
 
 MSRV is Rust 1.87 for the workspace (1.92 for the `keyroost` GUI crate).
 
+The CLI tests run with `KEYROOST_DEVICE_TEST=none`, which makes keyroost act as if no keys are connected, on every system. A new test that runs `keyroostctl` sets it too. It's a test-only setting, not for users.
+
 Two project rules worth knowing up front:
 
 - **Vendor over depend.** Most primitives are implemented in-tree on purpose;
@@ -74,6 +76,33 @@ Look at the nearest existing command first and reuse its words.
 - **Renaming:** keep the old name as a retired name that points to the new one.
 
 `cargo test -p keyroostctl` catches most of these.
+
+## Words in output and JSON
+
+Check a new JSON field or output word against the existing ones first, and
+reuse what is there.
+
+- **Yes/no facts:** a `true`/`false` field named after the thing:
+  `cert_present`, `occupied`, `touch_required`.
+- **Facts keyroost can't always tell:** `true`, `false` or `null`, where
+  `null` means it couldn't tell: `pin_set`, `force_pin_change`. Never a
+  string such as `"unknown"`.
+- **States:** a word from a fixed list, lowercase, with hyphens between
+  words: `not-connected`, `removed-not-added`. Details such as an error go in
+  a separate field: `result` and `detail`, `outcome` and `error`.
+- **OpenPGP keys:** one field per key, ending in `_sig`, `_dec` or `_aut`:
+  `fingerprint_sig`.
+- **Nothing there, or can't read:** in text output, `(none)` means nothing is
+  there and `(unavailable)` means keyroost couldn't read it.
+- **Capabilities keyroost couldn't confirm:** the usual label with a `?`
+  after it, such as `FIDO2?`, and the label listed in JSON's
+  `capabilities_unverified`.
+- **`doctor` lines:** each starts with one mark from a fixed set: `✓` works,
+  `✗` broken, `–` missing or not set up. Don't add new marks.
+- **Error messages:** say what happened in plain words, with any status code
+  in parentheses after it: `FIDO applet not present on this card (SELECT -> 6A82)`.
+- **The app:** uses the same words as the CLI for the same thing, fitted to
+  its layout. A new word in one means the same word in the other.
 
 ## Where to find work
 
