@@ -22184,11 +22184,9 @@ mod cli_tests {
         .is_err());
     }
 
-    const P12_TWO_ENTRIES: &[u8] =
-        include_bytes!("../../keyroost-p12/tests/fixtures/two-entries.p12");
-    const P12_CHAIN: &[u8] = include_bytes!("../../keyroost-p12/tests/fixtures/rsa2048-chain.p12");
-    const P12_EMPTY_PASSWORD: &[u8] =
-        include_bytes!("../../keyroost-p12/tests/fixtures/empty-password.p12");
+    const P12_TWO_ENTRIES: &[u8] = include_bytes!("../tests/fixtures/two-entries.p12");
+    const P12_CHAIN: &[u8] = include_bytes!("../tests/fixtures/rsa2048-chain.p12");
+    const P12_EMPTY_PASSWORD: &[u8] = include_bytes!("../tests/fixtures/empty-password.p12");
     const P12_PASSWORD: &str = "keyroost-test";
 
     #[test]
@@ -22223,7 +22221,7 @@ mod cli_tests {
             "This file uses something keyroost can't import yet: multi-prime RSA."
         );
         // A real file without a MAC takes the same path.
-        let macless = include_bytes!("../../keyroost-p12/tests/fixtures/macless-plain-key.p12");
+        let macless = include_bytes!("../tests/fixtures/macless-plain-key.p12");
         assert!(open_p12(macless, "")
             .unwrap_err()
             .starts_with("This file has no integrity check"));

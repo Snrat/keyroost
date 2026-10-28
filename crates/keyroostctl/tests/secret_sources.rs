@@ -239,7 +239,7 @@ fn fixture_dir() -> common::TempDir {
         ),
         (
             "fixture.p12",
-            include_bytes!("../../keyroost-p12/tests/fixtures/rsa2048-modern.p12"),
+            include_bytes!("fixtures/rsa2048-modern.p12"),
         ),
     ] {
         std::fs::write(dir.join(name), body).unwrap();
@@ -362,8 +362,7 @@ fn import_key_checks_the_key_file_before_selecting_a_key() {
 #[test]
 fn piv_key_import_checks_the_file_before_selecting_a_key() {
     let dir = common::TempDir::new("piv-import");
-    let fixtures =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../keyroost-p12/tests/fixtures");
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     for (file, password, extra, want) in [
         (
             "rsa2048-modern.p12",
