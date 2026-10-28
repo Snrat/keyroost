@@ -180,10 +180,9 @@ keyroostctl oath import -i export.json --file-password env:EXPORT_PW   # encrypt
         2.964 a 128-byte name made the key stop responding until it was unplugged. No
         SHA-512 codes.</li>
       <li><strong>Nitrokey&nbsp;3:</strong> 50 codes. Only 30-second codes, because the key
-        doesn't store the period. No SHA-512 codes. Import into a Nitrokey&nbsp;3 is built
-        from Nitrokey's published secrets-app source; reports from people using one are
-        welcome in the <a href="https://github.com/framefilter/keyroost/issues">issue
-        tracker</a>.</li>
+        doesn't store the period. No SHA-512 codes. The key asks for a touch to reset its
+        Authenticator, to delete any account, and to save or read one that requires a
+        touch; keyroost says so for a reset and for touch accounts.</li>
       <li><strong>Other keys:</strong> keyroost knows no limits up front; the key's own
         refusal is reported.</li>
     </ul>

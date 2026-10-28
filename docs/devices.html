@@ -85,7 +85,8 @@
         <td>FIDO2 with fingerprint enrollment and MDS display, plus on-device OTP
           (TOTP/HOTP) over CCID / NFC / USB-HID — validated on PIN+ hardware,
           contributed by Token2. HID-HOTP applies to the models that carry it; recent
-          releases (R3.2+/R3.3+) ship with the HID channel disabled by design and use
+          releases (R3.2+/R3.3+) ship with that HID channel disabled by design, and
+          keyroost reaches their OTP applet through the FIDO interface over USB, or over
           CCID. Keys running the R3.4+ OTP applet can put codes behind an OTP PIN; keys
           without it answer the capability probe with "no such command" and are
           unaffected. See <a href="otp.html#otp-pin">On-device OTP</a>. The OATH /
@@ -126,7 +127,11 @@
       device may well have shows with a question mark: <code>OTP?</code> in the
       app's badges and in <code>keyroostctl list</code>. The feature is still
       offered and works normally if present; the mark only means "not confirmed
-      by the device yet". A plain badge means the device answered for itself.</p>
+      by the device yet". <code>FIDO2?</code> means a FIDO key opened but didn't
+      properly answer keyroost's first question, or is reached only through a reader
+      whose FIDO applet doesn't report FIDO2; no name is read and no FIDO2 reset is
+      offered until it answers. A plain badge means the device answered for itself
+      (a FIDO key keyroost can't open at all also keeps a plain FIDO2).</p>
   </section>
 
   <section class="kr-section" id="standards">
@@ -139,8 +144,9 @@
       any card exposing those applets over PC/SC. For PIV, keyroost identifies the card's
       applet and dims vendor extensions listed as unsupported for it, with an override —
       see <a href="piv.html#support">what each key supports</a>.</p>
-    <p class="kr-muted">Older U2F-only (CTAP1) keys are detected by <code>list</code> but
-      don't support the CTAP2 management commands.</p>
+    <p class="kr-muted">Older U2F-only (CTAP1) keys, such as the YubiKey NEO, show as
+      U2F in <code>keyroostctl list</code> and the app; they don't support the CTAP2
+      management commands, so the app shows no FIDO2 tab for them.</p>
   </section>
 
   <section class="kr-section" id="canonical">

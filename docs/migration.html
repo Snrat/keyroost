@@ -63,12 +63,24 @@
 
   <section class="kr-section" id="v0-15-0">
     <h2>v0.15.0</h2>
-    <p>No command or flag changes. Two JSON values change: Nitrokey is now
-      spelled with a lowercase k, and <code>fido info</code>'s firmware is
-      the vendor's own string or <code>null</code>. Library consumers: several public structs
+    <p>No command or flag is renamed or removed (<code>piv key import</code>
+      and <code>fido info --reader</code> are additions). A PIN or touch policy
+      on a Nitrokey&nbsp;3 is now refused without <code>--force</code>, and a few
+      JSON values change. The library crates and the CLI now need Rust 1.87 or
+      newer (was 1.85). Library consumers: several public structs
       gain fields, <code>keyroost-piv</code> renames one enum variant to
       match, and <code>keyroost-ctap</code> drops an error variant (see the
       table at the end).</p>
+    <h3>CLI</h3>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Before</th><th>Now</th></tr>
+      <tr><td><code>piv key generate --pin-policy/--touch-policy</code> other
+          than <code>default</code> on a Nitrokey&nbsp;3 with firmware newer than
+          1.8.3, up to 1.9.1: warned, then sent</td>
+        <td>Refused unless <code>--force</code>.</td></tr>
+    </table>
+    </div>
     <h3>JSON output</h3>
     <div class="kr-table-wrap">
     <table class="kr-table">
@@ -83,6 +95,11 @@
           <code>"2.964"</code>, a Token2 PIN+'s <code>"R3.4"</code>), or
           <code>null</code> when the key doesn't say. The CTAP2 getInfo number
           is still in <code>ctap2.firmware_version</code>.</td></tr>
+      <tr><td><code>list --json</code>: a U2F-only key's
+          <code>capabilities</code> held <code>"FIDO2"</code></td>
+        <td><code>"U2F"</code>. <code>"FIDO2"</code> can now also appear in
+          <code>capabilities_unverified</code> (a key that didn't properly
+          answer).</td></tr>
     </table>
     </div>
     <h3>Library (crates.io) API changes</h3>
@@ -113,13 +130,18 @@
         <td><code>Device</code> gains <code>smart_card_unlisted</code> and
           <code>EnumerateOptions</code> gains
           <code>skip_protocol_asks</code> (both <code>bool</code>; struct
-          literals need the new field or
-          <code>..Default::default()</code>). New: the
+          literals need the new field; for <code>EnumerateOptions</code>,
+          <code>..Default::default()</code> also works). New: the
           <code>firmware</code> module (<code>key_firmware</code>, each key's
           firmware the way its vendor states it).</td></tr>
       <tr><td><code>keyroost-transport</code></td>
         <td><code>ReaderProbe</code> gains
-          <code>fido_ctap2_confirmed: bool</code>. New: the
+          <code>fido_ctap2_confirmed: bool</code>.
+          <code>identity::ctaphid_vendor_read</code> and
+          <code>identity::token2_serial_reply_hid</code> return
+          <code>KeyAnswer&lt;Vec&lt;u8&gt;&gt;</code> (a reply, the key
+          declining, or no answer) instead of
+          <code>Option&lt;Vec&lt;u8&gt;&gt;</code>. New: the
           <code>piv_import</code> module (PIV key import from a .p12/.pfx
           file).</td></tr>
       <tr><td>New crates</td>

@@ -90,8 +90,11 @@
       <code>82</code>–<code>95</code>. They hold decryption keys rotated out of
       <code>9D</code> so old mail and archives stay readable, and keyroost treats them as
       first-class slots: every slot-taking command accepts <code>--slot 82</code> …
-      <code>--slot 95</code>, and the desktop app lists them under a collapsible
-      <strong>Retired slots</strong> section that reads each slot's occupancy on demand.</p>
+      <code>--slot 95</code>, the desktop app lists them under the PIV pane's
+      <strong>retired keys (82–95)</strong> tab, which reads each slot's contents when you
+      open it, and <code>piv info</code> lists the retired slots that hold a key or a
+      certificate after the standard four (also in <code>--json</code>'s
+      <code>slots</code>).</p>
     <div class="kr-callout note">
       <div class="kr-callout-title note">PIN &amp; PUK</div>
       <p>PIV has a user PIN plus a PUK that can reset a blocked PIN. Exhaust both retry
@@ -129,11 +132,22 @@
         X25519 — whichever the card accepts), creates a
         <strong>self-signed certificate</strong> in the slot or a <strong>certificate
         request (CSR)</strong> for a certificate authority — signed by the card itself, the
-        private key never leaves it — imports and exports certificates, changes the PIN,
+        private key never leaves it — imports and exports certificates, imports a private
+        key with its certificate from a .p12/.pfx file, changes the PIN,
         PUK, retry counts and management key, moves a key between slots, clears a slot's
         certificate or key, tests that a slot's key still works, writes a fresh CHUID, and
         resets the applet. The same controls are in the desktop app's PIV pane.</p>
     </div>
+    <p><strong>Importing a key from a file.</strong> <code>piv key import --slot 9a --in
+      FILE</code> (in the app, <strong>Import key from file…</strong>) writes a private key
+      and its certificate from a .p12/.pfx file. keyroost opens the file with its password
+      and checks that this key can take it before it asks for the management key; then it
+      checks the PIN, writes the key and the certificate, and tests the slot as
+      <code>piv test</code> does. Legacy-encrypted files open too. A file with several keys
+      is listed so you can pick one with <code>--entry N</code>; the authority
+      certificates in the file are not written to the card, and <code>--chain-out
+      FILE</code> saves them. On a Nitrokey&nbsp;3, keys go into slot 9A only. An imported
+      key can't be attested as generated on the key.</p>
 <pre><code>keyroostctl piv info
 keyroostctl piv key generate --slot 9a --algorithm eccp256    # asks for the management key
 keyroostctl piv cert generate --slot 9a --subject "CN=Alice" --days 365   # asks for the PIN and the management key
@@ -163,7 +177,9 @@ keyroostctl piv pin change                             # asks for the current PI
       no certificate</em> when the card confirms a key, and <em>no certificate (a key may be
       present)</em> when keyroost can't tell. keyroost can't tell on cards where it doesn't
       use GET METADATA's key type, and on cards whose GET METADATA answer neither names a key
-      nor says there is none.</p>
+      nor says there is none. A slot that holds a certificate but, as the card confirms,
+      no key reads <code>…, no key</code> in <code>piv info</code> and <em>certificate
+      present, no key</em> in the app.</p>
     <p><strong>Certificates.</strong> keyroost reads certificates stored gzip-compressed (the
       PIV standard's CertInfo <code>0x01</code> form) and verifies their checksum. A damaged
       one, or one that would decompress past 64&nbsp;KiB, shows as present but unreadable:
@@ -173,7 +189,9 @@ keyroostctl piv pin change                             # asks for the current PI
       choice below, fails with a clear &ldquo;too large&rdquo; message, or &ldquo;no room
       left&rdquo; when the card is full, and leaves the slot's existing certificate
       unchanged. keyroost also refuses a certificate whose public key doesn't match the key
-      already in the slot, when it can read that key. <code>cert export</code> writes the
+      already in the slot, when it can read that key. A certificate can also go into a slot
+      with no key yet; keyroost then notes that it won't work until a matching key is put
+      in the slot. <code>cert export</code> writes the
       certificate as PEM, to stdout or to <code>--out FILE</code>; add <code>--format der</code>
       for the raw DER bytes. <code>cert import</code> reads the certificate from <code>--in
       FILE</code>. When an output file already exists (<code>--out</code> on
