@@ -882,6 +882,9 @@ struct OathState {
     /// the password by design — it is the recovery for a forgotten one — so
     /// this is reachable from the locked view too.
     confirm_reset: Option<DeviceId>,
+    /// The selected key's applet asks for a touch on every delete (a
+    /// Nitrokey 3), not only for touch accounts. Learned by the listing.
+    delete_asks_touch: bool,
 }
 
 /// One credential row in the OATH pane: its stored name and the last code we
@@ -2735,6 +2738,17 @@ static KEY_WANTS_TOUCH: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// What the touch banner says while a job runs, or `None` for no banner: the
 /// job's own label when it asks for a touch, else a plain prompt once the key
 /// itself reports it is waiting for one.
+/// The busy label for deleting an Authenticator account: it asks for a touch
+/// when the applet wants one for every delete (a Nitrokey 3) or the account
+/// requires one.
+fn oath_delete_label(applet_asks: bool, touch_account: bool) -> &'static str {
+    if applet_asks || touch_account {
+        "Deleting credential \u{2014} touch the key if it blinks\u{2026}"
+    } else {
+        "Deleting credential\u{2026}"
+    }
+}
+
 fn touch_prompt(label: Option<&str>, busy: bool, key_wants_touch: bool) -> Option<String> {
     if !busy {
         return None;
@@ -7468,14 +7482,19 @@ impl App {
         let for_device = self.selected_device.clone();
         let touch = self.oath_touch_names();
         self.spawn_job("Reading OATH codes\u{2026}", move || {
-            let result = Self::oath_open_unlock(&name, &password)
-                .and_then(|mut session| Self::oath_list_rows(&mut session, &touch));
+            let result = Self::oath_open_unlock(&name, &password).and_then(|mut session| {
+                let asks = session.asks_touch_to_delete();
+                Self::oath_list_rows(&mut session, &touch).map(|rows| (rows, asks))
+            });
             Box::new(move |app: &mut App| {
                 // Discard if the user switched devices while the read (which
                 // can block on a touch) was in flight — device B's pane must
                 // not show device A's codes.
                 if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                    Self::apply_oath_rows(app, result, password);
+                    if let Ok((_, asks)) = &result {
+                        app.oath.delete_asks_touch = *asks;
+                    }
+                    Self::apply_oath_rows(app, result.map(|(rows, _)| rows), password);
                 }
             })
         });
@@ -7579,12 +7598,9 @@ impl App {
         let password = oath_effective_password(&self.oath);
         let for_device = self.selected_device.clone();
         let touch = self.oath_touch_names();
-        // ... and to delete one.
-        let label = if touch.contains(&cred_name) {
-            "Deleting credential \u{2014} touch the key if it blinks\u{2026}"
-        } else {
-            "Deleting credential\u{2026}"
-        };
+        // A Nitrokey 3 asks for a touch to delete any account; other keys
+        // may for a touch account.
+        let label = oath_delete_label(self.oath.delete_asks_touch, touch.contains(&cred_name));
         self.spawn_job(label, move || {
             let result = (|| -> Result<(Vec<OathRow>, usize), TransportError> {
                 let mut session = Self::oath_open_unlock(&reader, &password)?;
@@ -10405,6 +10421,7 @@ impl App {
         self.oath.error = None;
         self.oath.notice = None;
         self.oath.unlocked_password = None;
+        self.oath.delete_asks_touch = false;
         self.openpgp.status = None;
         self.openpgp.key_present = [None; 3];
         self.openpgp.loaded = false;
@@ -28607,6 +28624,16 @@ mod tests {
         ));
         assert!(!job_waits_for_touch("Reading OATH codes\u{2026}"));
         assert!(!job_waits_for_touch("Resetting card\u{2026}"));
+    }
+
+    /// Deleting asks for a touch on a key whose applet wants one for every
+    /// delete (a Nitrokey 3), and for a touch account on any key.
+    #[test]
+    fn deleting_an_account_asks_for_the_touch_the_key_needs() {
+        assert!(job_waits_for_touch(oath_delete_label(true, false)));
+        assert!(job_waits_for_touch(oath_delete_label(false, true)));
+        assert!(job_waits_for_touch(oath_delete_label(true, true)));
+        assert!(!job_waits_for_touch(oath_delete_label(false, false)));
     }
 
     /// The banner shows for a job that asks for a touch, and for any job once

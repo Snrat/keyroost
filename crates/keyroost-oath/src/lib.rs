@@ -578,6 +578,15 @@ impl SelectInfo {
     pub fn lists_properties(&self) -> bool {
         self.serial.is_some()
     }
+
+    /// True when the applet asks for a touch on every `DELETE`, not only for
+    /// accounts that require one: Nitrokey's secrets app (recognized as in
+    /// [`Self::more_data`]) confirms user presence before each delete, as it
+    /// does before a reset.
+    #[must_use]
+    pub fn asks_touch_to_delete(&self) -> bool {
+        self.serial.is_some()
+    }
 }
 
 /// Parse the SELECT response TLV bag into [`SelectInfo`].
@@ -1705,6 +1714,7 @@ mod tests {
         assert_eq!(info.serial, None);
         assert_eq!(info.more_data(), MoreData::SendRemaining);
         assert!(!info.lists_properties());
+        assert!(!info.asks_touch_to_delete());
 
         // Nitrokey 3 answer (firmware 1.9.0, salt shortened): SERIAL NUMBER
         // (0x8F) present, so ISO GET RESPONSE.
@@ -1716,6 +1726,7 @@ mod tests {
         assert_eq!(info.serial, Some(vec![0x42, 0x68, 0x2E, 0xF7]));
         assert_eq!(info.more_data(), MoreData::GetResponse);
         assert!(info.lists_properties());
+        assert!(info.asks_touch_to_delete());
     }
 
     #[test]

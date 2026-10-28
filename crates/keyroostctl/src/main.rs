@@ -8384,16 +8384,18 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let mut session =
                 open_oath_unlocked(&reader, password.as_deref().map(String::as_str), debug)?;
-            // Some keys (Nitrokey 3) ask for a touch to delete a touch account.
-            // Only a hint: a listing that fails doesn't stop the delete.
+            // A Nitrokey 3 asks for a touch to delete any account; other keys
+            // may for a touch account. Only a hint: a listing that fails
+            // doesn't stop the delete.
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let needs_touch = session.list().ok().is_some_and(|listing| {
-                let all = session.calculate_all(now).ok();
-                oath_needs_touch(&listing, all.as_ref(), name)
-            });
+            let needs_touch = session.asks_touch_to_delete()
+                || session.list().ok().is_some_and(|listing| {
+                    let all = session.calculate_all(now).ok();
+                    oath_needs_touch(&listing, all.as_ref(), name)
+                });
             if needs_touch {
                 crate::prompt::touch("Deleting \u{2014} touch the key if it blinks\u{2026}");
             }

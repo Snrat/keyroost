@@ -105,6 +105,12 @@ impl OathSession {
         self.select_info.password_required()
     }
 
+    /// True when the applet asks for a touch on every delete (Nitrokey's
+    /// secrets app), not only for accounts that require one.
+    pub fn asks_touch_to_delete(&self) -> bool {
+        self.select_info.asks_touch_to_delete()
+    }
+
     /// Authenticate against a password-protected applet (YubiKey OATH). Derives
     /// the access key from the password and the device id, answers the card's
     /// SELECT challenge with VALIDATE, and verifies the card's mutual-auth reply
