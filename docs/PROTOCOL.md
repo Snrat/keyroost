@@ -237,7 +237,10 @@ reassemble, because they run over readers whose T=0 handling differs:
 - `61 XX` — chunk accepted; send `GET RESPONSE` asking for exactly the `XX` bytes
   the card says are pending (`XX == 0` meaning 256, the short-form convention)
   and accumulate. Asking blindly for 256 is what makes a card that validates `Le`
-  answer `6Cxx` mid-read.
+  answer `6Cxx` mid-read. OATH is the exception: the Yubico OATH applet
+  continues with `SEND REMAINING` (INS `A5`) and refuses `GET RESPONSE`, while
+  the Nitrokey 3's OATH applet accepts only `GET RESPONSE`; keyroost uses the
+  one the applet's SELECT answer calls for.
 - `6C XX` — the card returned **no data** and wants the command *currently in
   flight* reissued with `Le = XX`. Whatever has already been accumulated is kept.
 

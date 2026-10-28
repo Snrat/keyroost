@@ -10,7 +10,8 @@ Hardware in play (all on hand): Token2 Molto2 (`349e:0300`), YubiKey 5
 Nothing here is "incoming" any more — the Solo 2 carried the first successful
 FIDO F1–F5 run (`docs/BRINGUP.md`), and the two-YubiKey case is what the
 correlation work was verified against. Token2 PIN+ / FIDO2+ coverage
-comes from the vendor rather than this bench, and the OnlyKey facts from the
+comes mostly from the vendor (PIN+ OTP over USB, #155, was also checked on a
+PIN+ FIDO + PGP key, R3.4), and the OnlyKey facts from the
 vendor and device surveys — see the identity note below; it is the interesting case.
 
 - **Thread A — Device identity** (for local "friendly names"). Narrow, technical,
@@ -145,7 +146,7 @@ two encodings whose relation no real key has confirmed are never equated.
 
 | Vendor | HID side | Smart-card side | Compared as |
 |---|---|---|---|
-| Yubico | management READ CONFIG over CTAPHID (vendor command `0xC2`, config page 0, as yubikit sends it); serial is TLV tag `0x02` | the serial already read by the reader probe (no extra traffic) | decimal serial |
+| Yubico | management READ CONFIG over CTAPHID (vendor command `0xC2`, config page 0, as yubikit sends it); serial is TLV tag `0x02` (not sent to a YubiKey NEO, which doesn't answer it) | the serial already read by the reader probe (no extra traffic) | decimal serial |
 | Solo 2 | USB `iSerialNumber` (the device UUID); fallback: admin UUID over CTAPHID (vendor command `0xE2`) | SELECT the admin applet `A0000008470000 0001`, then `00 62 00 00` → 16-byte UUID | lowercase hex UUID |
 | Token2 | GET_INFO serial request (§6.10 of Token2's public OTP-on-FIDO protocol document) over HID, reply `D1 len …` | the same request after selecting the FIDO applet; if that fails, the OTP applet's reply, which is plain ASCII decimal | the FIDO-format reply with the FIDO-format reply only; the OTP-applet form only with itself |
 
@@ -161,7 +162,8 @@ The Molto2 and the single-profile programmable tokens are never sent an
 identity read.
 
 **Privacy.** Identities are read only to join the two halves of a key, held in
-memory for that scan, and never written to disk: `keys.json` holds only a salted
+memory (an answer over HID is kept while that key stays plugged in, so later
+scans don't ask again; a replug asks again), and never written to disk: `keys.json` holds only a salted
 fingerprint, saved when the user names the key or when a key carrying its own
 name is first seen. Every read is read-only and traced under `--debug`;
 the HID reads give up after 1.5 seconds. Reads are planned only for what USB

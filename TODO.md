@@ -77,9 +77,10 @@ Being worked on right now — check with whoever holds it before starting.
   states, a cue on long ops. Keep it tasteful — over-animation reads as cheap.
   Research what feels alive vs. annoying before building.
 
-- **Firmware version has three JSON names.** `firmware` (`list`),
-  `firmware_version` (`fido info` ctap2), `version_firmware` (`piv info`); pick
-  one name with retired aliases. A decision for later. (S)
+- **Firmware version has three JSON names.** `firmware` (`fido info`, the
+  vendor-stated string since 0.15), `ctap2.firmware_version` (`fido info`, the
+  raw CTAP2 number) and `version_firmware` (`piv info`); pick one name with
+  retired aliases. A decision for later. (S)
 
 - **Research: restoring missing OpenPGP fingerprints** from the user's public
   key file. Investigate only; may be a hornet's nest (key-generation times,
@@ -133,9 +134,10 @@ plan's two-key manual steps were never executed):
   large-blob ops.
 - **Armed FIDO reset:** arm for key A, replug key A → fires; arm for key A,
   insert a same-model key B during the window → must NOT fire; a serial-less key
-  must refuse to arm. *Partly exercised already* — the wrong-key refusal path
-  was hit on hardware and fixed in `55adf2f`; the arm-and-fire and
-  refuse-to-arm paths remain.
+  arms only while it is the only key connected and is refused, naming the keys
+  to unplug, while any other key is connected. *Partly exercised already* — the
+  wrong-key refusal path was hit on hardware and fixed in `55adf2f`; the
+  arm-and-fire and refuse-to-arm paths remain.
 - **CLI targeting:** with two OTP-capable keys, `keyroostctl --device <name> otp
   list` / `molto info` must hit the named key only; ambiguous or duplicate-serial
   setups must fail closed with the ambiguity error.
@@ -204,7 +206,7 @@ plan's two-key manual steps were never executed):
   app under X11, where the marker already works. Revisit when GNOME's Mutter
   supports a data-control protocol. (M)
 
-- **Submit keyroost to Flathub** — deferred, not ruled out; not in v0.14.0.
+- **Submit keyroost to Flathub** — deferred, not ruled out; not scheduled for a release.
   The maintainer submits it himself. Flathub's generative-AI
   policy allows AI-generated app code with full disclosure (parts and extent),
   but the Flathub manifest itself and the submission PR, its description and
@@ -280,9 +282,13 @@ Not tasks. Kept so they are not re-litigated or re-researched.
   and the HID channel ships disabled on purpose (an active HID channel makes
   the OS treat the key as a keyboard, and on Windows it needs admin rights).
   CCID is the intended path, auto-transport prefers it, and the error for a
-  declined HID probe now points at the CCID fix. Do not resurrect "teach the
-  HID path to speak this format" — there is nothing to speak to, and what the
-  dead channel echoes when poked is not worth settling.
+  declined HID probe now points at the CCID fix. OTP management over USB is a
+  separate path: since 0.15 it goes through Token2's documented CTAPHID vendor
+  command `0x41` ([#155](https://github.com/framefilter/keyroost/issues/155)),
+  and the `0x0105` answer turned out to be a CTAPHID error frame replying to
+  keyroost's old report framing. Keys that don't answer `0x41` fall back to
+  that framing, then CCID. Don't re-add the report-framed dialect as a
+  primary path.
 
 - **No device→capability matrix. Ever.** keyroost does not decide what a device
   can do by looking its USB product id up in a table. Capabilities come from

@@ -47,7 +47,7 @@ keyroostctl list
 
 **If it fails:**
 - *"PC/SC service is unavailable"* — start the service (`sudo systemctl start pcscd` on Linux). On macOS this shouldn't happen.
-- *"no Token2 Molto2 reader found"* but other readers shown — keyroost looks for a reader whose name contains "molto". Paste the full output. We can widen the matcher.
+- *The reader is listed but has no `[Molto2 token]` tag* (or `molto info` later says "no Token2 Molto2 reader found") — keyroost looks for a reader whose name contains "molto". Paste the full output. We can widen the matcher.
 - *Empty list* — confirm with `pcsc_scan` (Linux) that PC/SC sees any reader at all. If not, it's a system-level USB / udev problem, not a keyroost one.
 
 **Faster than any of the above:** `keyroostctl doctor` checks the PC/SC service,
@@ -72,7 +72,7 @@ keyroostctl --debug molto info
 
 ```
 Serial:     ABCDEFGH
-Device UTC: 1699999284 (epoch)
+Device UTC: 1699680820 (epoch)
 ```
 
 **Checks:**
@@ -232,6 +232,8 @@ keyroostctl fido info --device N
 
 ```
 Channel:    0x00000001 (CTAPHID protocol v2)
+Firmware:   2.964
+…
 Versions:   U2F_V2, FIDO_2_0, FIDO_2_1_PRE
 Extensions: credProtect, hmac-secret
 Options:    rk=true, up=true, plat=false, credMgmt=true, clientPin=false, …
