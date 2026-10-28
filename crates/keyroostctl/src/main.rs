@@ -7132,6 +7132,11 @@ fn run_factory_reset(
         .map(|s| s.label())
         .collect::<Vec<_>>()
         .join(", ");
+    // Before the question, so a FIDO2 step that would be refused after the
+    // replug stops the run before any card applet is wiped.
+    if plan.contains(&ResetStep::Fido) && dev.hid_path.is_some() {
+        refuse_serial_less_reset_with_others(&dev)?;
+    }
     let asked =
         crate::prompt::confirm_typed_then_read(&dev, yes, "reset", &factory_reset_action(&labels))?;
     // The PIV credential, if one was given, is read now — after the question
@@ -7582,6 +7587,34 @@ fn reinsert_settled(found: &ReinsertMatch, candidates: &[Candidate<'_>]) -> bool
         ReinsertMatch::Found(i) => matches!(candidates.get(i), Some(c) if c.fido),
         ReinsertMatch::Ambiguous => true,
     }
+}
+
+/// Refuse a FIDO2 reset over USB of a key with no serial while anything else
+/// is connected ([`keyroost_resolve::serial_less_reset_blockers`]): after the
+/// replug, [`reinserted_serial_less_target`] would refuse it anyway, so say so
+/// before the question rather than after a replug, or after a factory reset
+/// has already wiped the card applets.
+fn refuse_serial_less_reset_with_others(
+    dev: &keyroost_resolve::Device,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // A path keyroost did not detect is used as typed, with nothing known
+    // about it; the check after the replug still decides that one.
+    if !dev.serial.is_empty() || dev.id.starts_with("override:") {
+        return Ok(());
+    }
+    let present = crate::target::enumerate_without_identity_reads()?;
+    let others = keyroost_resolve::serial_less_reset_blockers(dev, &present);
+    if others.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "'{}' has no serial number, so keyroost can only reset it while it is the \
+         only key plugged in: after the replug, that is how it knows the key that \
+         came back is this one. Unplug {} and run this again.",
+        sanitize_terminal(dev.name.as_deref().unwrap_or(&dev.model)),
+        sanitize_terminal(&others.join(", "))
+    )
+    .into())
 }
 
 /// One post-replug look: the resolved devices reduced to candidates, matched
@@ -9776,6 +9809,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 debug,
                 |session| -> Result<(), Box<dyn std::error::Error>> {
                     let status = session.status()?;
+                    let retired = read_retired_slots(session);
 
                     if json_output() {
                         emit_json(&json_out::PivStatusJson {
@@ -9796,6 +9830,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                             slots: status
                                 .slots
                                 .iter()
+                                .chain(&retired.in_use)
                                 .map(|s| json_out::PivSlotJson {
                                     slot: json_out::piv_slot_token(s.slot),
                                     slot_name: s.slot.label(),
@@ -9884,7 +9919,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                         None => println!("CHUID:       (unavailable)"),
                     }
                     println!("Slots:");
-                    for s in &status.slots {
+                    for s in status.slots.iter().chain(&retired.in_use) {
                         println!(
                             "  {:<26} {}",
                             s.slot.label(),
@@ -9896,6 +9931,11 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                                 s.key,
                             )
                         );
+                    }
+                    // Said only when every retired slot answered: a key
+                    // without them answers none, and then nothing is said.
+                    if retired.in_use.is_empty() && retired.all_read {
+                        println!("  {:<26} all empty", "retired keys (82\u{2013}95)");
                     }
                     Ok(())
                 },
@@ -11395,6 +11435,36 @@ fn piv_metadata_quirky(
     use keyroost_piv::compat::PivQuirk;
     quirks.contains(&PivQuirk::InsF7MetadataAlgorithmInvalid)
         || quirks.contains(&PivQuirk::InsF7MetadataPinTouchPolicyInvalid)
+}
+
+/// What `piv info` read of the twenty retired slots (82–95).
+struct RetiredSlots {
+    /// The retired slots holding a key or a certificate, in slot order.
+    in_use: Vec<keyroost_transport::PivSlotStatus>,
+    /// Whether every retired slot answered.
+    all_read: bool,
+}
+
+/// Read the retired slots for `piv info`, which lists only the ones in use,
+/// as `ykman piv info` does: twenty empty rows would bury the four standard
+/// slots on a key that, like most, has never used them.
+fn read_retired_slots(session: &mut keyroost_transport::PivSession) -> RetiredSlots {
+    let mut in_use = Vec::new();
+    let mut all_read = true;
+    for slot in keyroost_piv::Slot::retired_all() {
+        match session.slot_status(slot) {
+            Ok(st) if piv_slot_in_use(st.cert_present, st.key) => in_use.push(st),
+            Ok(_) => {}
+            Err(_) => all_read = false,
+        }
+    }
+    RetiredSlots { in_use, all_read }
+}
+
+/// Whether a slot holds anything: a certificate (readable or not) or a key
+/// the card says is there.
+fn piv_slot_in_use(cert_present: bool, key: keyroost_transport::SlotKeyPresence) -> bool {
+    cert_present || key == keyroost_transport::SlotKeyPresence::Present
 }
 
 /// The `piv info` words for one slot. A slot without a certificate reads
@@ -13170,8 +13240,18 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
                 dev.hid_path.as_deref(),
                 &keyroost_hid::enumerate().unwrap_or_default(),
             );
+            let route = fido_route(&dev, reader.is_some())?;
+            match &route {
+                FidoRoute::Hid { .. } => refuse_serial_less_reset_with_others(&dev)?,
+                // A reader whose FIDO applet doesn't answer is refused before
+                // the question, with the error `fido info --reader` gives (on
+                // Windows without administrator rights, that one says so).
+                FidoRoute::Card { reader } => {
+                    drop(keyroost_transport::CtapPcscDevice::open(reader)?)
+                }
+            }
             crate::prompt::confirm_on(&dev, *yes, "wipe every FIDO2 credential and the PIN")?;
-            match fido_route(&dev, reader.is_some())? {
+            match route {
                 FidoRoute::Card { reader } => run_fido_reset_reader(&reader)?,
                 FidoRoute::Hid { path } => fido_reset_after_replug(
                     &path,
@@ -23794,6 +23874,18 @@ mod cli_tests {
         let v = serde_json::to_value(slot(None)).expect("serialize");
         assert!(v["cert_unreadable"].is_null(), "{v}");
         assert!(v.as_object().unwrap().contains_key("cert_unreadable"));
+    }
+
+    #[test]
+    fn piv_slot_in_use_needs_a_certificate_or_a_known_key() {
+        use keyroost_transport::SlotKeyPresence as K;
+        assert!(piv_slot_in_use(false, K::Present));
+        assert!(piv_slot_in_use(true, K::NoKey));
+        assert!(piv_slot_in_use(true, K::Unknown));
+        assert!(!piv_slot_in_use(false, K::NoKey));
+        // A card that can't say whether a key is there lists no row for an
+        // empty-looking retired slot, as `ykman piv info` doesn't either.
+        assert!(!piv_slot_in_use(false, K::Unknown));
     }
 
     #[test]

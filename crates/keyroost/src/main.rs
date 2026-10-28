@@ -650,8 +650,9 @@ struct ResetArm {
     /// The armed key's *effective* serial from the resolver (USB serial, else
     /// the CCID-read YubiKey serial shown in the sidebar). In path mode this
     /// is the identity a re-inserted candidate must prove before the reset
-    /// fires; without it (and without a HID serial) arming is refused —
-    /// fail closed rather than reset the first same-model key (KEY-005).
+    /// fires; without it (and without a HID serial) a re-insert proves
+    /// nothing by identity (KEY-005), so the key arms only while it is the
+    /// only device connected ([`ResetArm::serial_less`]).
     target_effective_serial: Option<String>,
     /// The armed key's USB vendor/product ids, captured at arm time. In path
     /// mode a fresh path must match these — so plugging in a *different*
@@ -668,6 +669,10 @@ struct ResetArm {
     /// True once the armed key has been unplugged; the next fresh insertion then
     /// fires the reset.
     saw_removal: bool,
+    /// The key has no serial of either kind, so it was armed only because
+    /// nothing else was connected, and a re-insert fires only while that
+    /// still holds ([`keyroost_resolve::serial_less_reinsert`]).
+    serial_less: bool,
 }
 
 /// One HID device's physical-connection identity at a poll, used to tell a
@@ -2667,6 +2672,34 @@ fn fido_unread_line(u2f_only: bool, read_failed: bool) -> &'static str {
     } else {
         "Reading key\u{2026}"
     }
+}
+
+/// Whether a job's status text asks for a touch on the key. Every job that
+/// waits for one says so in its label, so the label decides when
+/// [`App::touch_banner`] shows.
+fn job_waits_for_touch(label: &str) -> bool {
+    label.to_lowercase().contains("touch")
+}
+
+/// The reset dialogs' note, before anything is confirmed, for a key with no
+/// serial while `others` are connected.
+fn serial_less_reset_note(others: &[String]) -> String {
+    format!(
+        "This key has no serial number, so keyroost can only reset it while it is \
+         the only key plugged in. Unplug {} first.",
+        others.join(", ")
+    )
+}
+
+/// Why a FIDO2 reset of a key with no serial won't go ahead while `others`
+/// are connected ([`keyroost_resolve::serial_less_reset_blockers`]).
+fn serial_less_reset_refusal(others: &[String]) -> String {
+    format!(
+        "not reset \u{2014} this key has no serial number, so keyroost can only reset it \
+         while it is the only key plugged in: after the replug, that is how it knows the \
+         key that came back is this one. Unplug {} and try again.",
+        others.join(", ")
+    )
 }
 
 /// Decide whether a freshly appeared FIDO HID device may receive an armed
@@ -5997,40 +6030,53 @@ impl App {
     }
 
     fn refresh_credentials(&mut self) {
-        // Check busy *before* taking the session — spawn_job would silently
-        // drop the job, destroying the unlocked session (and its PIN token)
-        // and logging the user out for clicking Reload at the wrong moment.
+        // Check busy first — spawn_job would silently drop the job.
         if self.busy() {
             return;
         }
         let Some(target) = self.selected_fido_target() else {
             return;
         };
-        if self.fido_session().is_none() {
+        // The session stays in place while the job runs (busy keeps every
+        // other op off it), so the tab keeps showing the unlocked list
+        // instead of flashing the locked view until the new one lands.
+        let Some(session) = self.fido_session() else {
             return; // no session, or one bound to a different device (KEY-012)
-        }
-        let Some(session) = self.security_keys.session.take() else {
-            return;
         };
-        let token = session.token;
-        let pin = session.pin;
+        let token = session.token.clone();
+        let pin = session.pin.clone();
         let for_device = self.selected_device.clone();
         self.spawn_job("Refreshing credentials\u{2026}", move || {
             let result =
                 Self::refresh_with_token(&target, token, pin).map_err(SessionOpError::from_boxed);
-            Box::new(move |app: &mut App| {
-                if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
-                    return; // selection changed mid-refresh; drop the session + PIN
-                }
-                match result {
-                    Ok(fresh) => {
-                        app.security_keys.session = Some(fresh);
-                        app.security_keys.session_device = for_device.clone();
-                    }
-                    Err(e) => app.fail_session_op(&e, "refresh failed"),
-                }
-            })
+            Box::new(move |app: &mut App| app.apply_refreshed_session(for_device, result))
         });
+    }
+
+    /// The end of a Refresh. The session stayed in place while the job ran,
+    /// so the Lock button (and the idle lock) could end it meanwhile: a fresh
+    /// session lands only on the one it was read for, never re-unlocking a
+    /// key the user just locked.
+    fn apply_refreshed_session(
+        &mut self,
+        for_device: Option<DeviceId>,
+        result: Result<UnlockedSession, SessionOpError>,
+    ) {
+        if !completion_still_valid(for_device.as_ref(), self.selected_device.as_ref()) {
+            // Selection changed mid-refresh; drop the session + PIN.
+            if self.security_keys.session_device == for_device {
+                self.security_keys.session = None;
+                self.security_keys.session_device = None;
+            }
+            return;
+        }
+        if self.security_keys.session.is_none() || self.security_keys.session_device != for_device {
+            return; // locked mid-refresh: the fresh session and its PIN drop here
+        }
+        match result {
+            Ok(fresh) => self.security_keys.session = Some(fresh),
+            Err(e) => self.fail_session_op(&e, "refresh failed"),
+        }
     }
 
     fn refresh_with_token(
@@ -7693,20 +7739,23 @@ impl App {
             self.factory_reset_confirm_typed.clear();
             return;
         }
-        let summary = match self.selected_device() {
+        let (summary, fido_replug) = match self.selected_device() {
             Some(dev) => {
                 let mut plan = keyroost_resolve::factory_reset_plan(dev.caps);
                 if factory_reset_piv_unresettable(piv_preview) {
                     keyroost_resolve::exclude_unresettable_piv(&mut plan);
                 }
-                factory_reset_confirm_summary(
+                let summary = factory_reset_confirm_summary(
                     &dev.serial,
                     &dev.model,
                     &plan,
                     piv_preview,
                     needs_reset_mgmt_auth,
                     reset_long_running,
-                )
+                );
+                let fido_replug = plan.contains(&keyroost_resolve::ResetStep::Fido)
+                    && Self::card_reset_reader(Some(dev)).is_none();
+                (summary, fido_replug)
             }
             None => {
                 self.factory_reset_confirm = None;
@@ -7714,6 +7763,13 @@ impl App {
                 self.factory_reset_confirm_typed.clear();
                 return;
             }
+        };
+        // Checked before anything is wiped: the FIDO2 step comes last, after
+        // the card applets, and would be refused only then.
+        let blockers = if fido_replug {
+            self.serial_less_reset_blockers()
+        } else {
+            Vec::new()
         };
         let mut decision: Option<bool> = None;
         egui::Window::new("Factory reset this key?")
@@ -7730,6 +7786,10 @@ impl App {
                     ui.add_space(6.0);
                     ui.colored_label(p.err, err);
                 }
+                if !blockers.is_empty() {
+                    ui.add_space(6.0);
+                    ui.colored_label(p.warn, serial_less_reset_note(&blockers));
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.label("Type \u{201c}reset\u{201d} to confirm:");
@@ -7739,7 +7799,8 @@ impl App {
                     );
                 });
                 ui.add_space(8.0);
-                let armed = self.factory_reset_confirm_typed.trim() == "reset";
+                let armed =
+                    self.factory_reset_confirm_typed.trim() == "reset" && blockers.is_empty();
                 ui.horizontal(|ui| {
                     ui.add_enabled_ui(armed, |ui| {
                         if theme::button(ui, p, BtnKind::Danger, "Yes, wipe this key").clicked() {
@@ -8164,6 +8225,7 @@ impl App {
         // reset, no replug and no touch. `None` for USB keys, which keep the
         // armed replug ceremony.
         let card_reader = Self::card_reset_reader(self.selected_device());
+        let blockers = self.serial_less_reset_blockers();
         // Device-scoped, not app-global: this dialog may belong to a different
         // key than the armed one, and telling the user to "unplug the key, then
         // plug it back in" under the wrong key's name invites a replug that
@@ -8221,6 +8283,13 @@ impl App {
                     } else {
                         ui.label("A key only accepts a reset within ~10 seconds of being");
                         ui.label("plugged in, so after you confirm you'll re-insert it.");
+                        if !blockers.is_empty() {
+                            ui.add_space(6.0);
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 160, 80),
+                                serial_less_reset_note(&blockers),
+                            );
+                        }
                     }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
@@ -8231,7 +8300,8 @@ impl App {
                         );
                     });
                     ui.add_space(6.0);
-                    let ready = self.security_keys.reset.confirm_input.trim() == "reset";
+                    let ready = self.security_keys.reset.confirm_input.trim() == "reset"
+                        && (card_reader.is_some() || blockers.is_empty());
                     let go_label = if card_reader.is_some() {
                         "Reset card"
                     } else {
@@ -8325,7 +8395,15 @@ impl App {
             .selected_device()
             .map(|d| d.serial.clone())
             .filter(|s| !s.is_empty());
-        if target_serial.is_none() && target_effective_serial.is_none() {
+        let serial_less = target_serial.is_none() && target_effective_serial.is_none();
+        let blockers = self.serial_less_reset_blockers();
+        if serial_less && !blockers.is_empty() {
+            // The dialog says this before Arm is pressed; a key plugged in
+            // since still lands here.
+            self.security_keys.reset = ResetDialog::default();
+            self.reset_arm = None;
+            self.refuse_fido_reset(serial_less_reset_refusal(&blockers));
+        } else if serial_less && (target_ids.is_none() || target_path.is_none()) {
             self.security_keys.reset = ResetDialog::default();
             // Ending the dialog ends the ceremony behind it, exactly as Cancel
             // does. Reaching this branch with an arm already live is possible —
@@ -8342,22 +8420,7 @@ impl App {
                        select the card's reader row and reset there \u{2014} a card resets in \
                        place, no replug."
                 .to_string();
-            self.log(Severity::Err, msg.clone());
-            // The dialog just vanished and the log panel is collapsed by
-            // default, so neither surface is guaranteed to be read. Land the
-            // refusal where the user is looking as well: the report row
-            // (Overview) when this was a factory reset's finale, and
-            // `security_keys.error` (the FIDO2 pane the standalone Reset button
-            // lives on) either way. Leaving the seeded row pending would ask
-            // for a replug-and-touch ceremony that is never coming. Pending-only
-            // for the same reason as the cancel branch: nothing was attempted
-            // here, so an already-answered row is not this refusal's to rewrite.
-            let outcome = keyroost_resolve::StepOutcome::Failed(msg.clone());
-            if resolve_pending_fido_reset_row(&mut self.factory_reset_report, outcome.clone()) {
-                let (severity, line) = factory_reset_fido_finale_log_line(&outcome);
-                self.log(severity, line);
-            }
-            self.security_keys.error = Some(msg);
+            self.refuse_fido_reset(msg);
         } else {
             self.reset_arm = Some(ResetArm {
                 target_serial,
@@ -8367,8 +8430,81 @@ impl App {
                 for_device: self.selected_device.clone(),
                 prev_devices: devices.iter().map(HidIdentity::of).collect(),
                 saw_removal: false,
+                serial_less,
             });
         }
+    }
+
+    /// What stops a FIDO2 reset over USB of the selected key: the other
+    /// connected devices, when it has no serial
+    /// ([`keyroost_resolve::serial_less_reset_blockers`]).
+    fn serial_less_reset_blockers(&self) -> Vec<String> {
+        self.selected_device()
+            .map(|d| keyroost_resolve::serial_less_reset_blockers(d, &self.devices))
+            .unwrap_or_default()
+    }
+
+    /// While the running job waits for a touch on the key, say so over the
+    /// content in the job's own words: the top bar's status line is small,
+    /// gray and the first thing a narrow window cuts off, and a touch nobody
+    /// was told about times out (#218).
+    fn touch_banner(&self, ctx: &egui::Context, p: &Palette) {
+        let Some(label) = self.busy_label.as_deref() else {
+            return;
+        };
+        if !self.busy() || !job_waits_for_touch(label) {
+            return;
+        }
+        egui::Area::new(egui::Id::new("touch_banner"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 64.0])
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame {
+                    inner_margin: egui::Margin::symmetric(18, 12),
+                    corner_radius: egui::CornerRadius::same(10),
+                    fill: p.pop,
+                    stroke: egui::Stroke::new(1.5, p.accent),
+                    shadow: egui::epaint::Shadow {
+                        offset: [0, 8],
+                        blur: 28,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha(90),
+                    },
+                    ..Default::default()
+                }
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(18.0).color(p.accent));
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(label)
+                                .font(theme::f_sb(15.0))
+                                .color(p.txt),
+                        );
+                    });
+                });
+            });
+    }
+
+    /// Report a FIDO2 reset that will not happen, where it will be read.
+    fn refuse_fido_reset(&mut self, msg: String) {
+        self.log(Severity::Err, msg.clone());
+        // The dialog just vanished and the log panel is collapsed by
+        // default, so neither surface is guaranteed to be read. Land the
+        // refusal where the user is looking as well: the report row
+        // (Overview) when this was a factory reset's finale, and
+        // `security_keys.error` (the FIDO2 pane the standalone Reset button
+        // lives on) either way. Leaving the seeded row pending would ask
+        // for a replug-and-touch ceremony that is never coming. Pending-only
+        // for the same reason as the cancel branch: nothing was attempted
+        // here, so an already-answered row is not this refusal's to rewrite.
+        let outcome = keyroost_resolve::StepOutcome::Failed(msg.clone());
+        if resolve_pending_fido_reset_row(&mut self.factory_reset_report, outcome.clone()) {
+            let (severity, line) = factory_reset_fido_finale_log_line(&outcome);
+            self.log(severity, line);
+        }
+        self.security_keys.error = Some(msg);
     }
 
     /// Current FIDO HID devices. No PC/SC. Cheap on Linux (a sysfs read), but
@@ -8437,7 +8573,9 @@ impl App {
     /// been unplugged, fire the reset on its re-insertion (which the user
     /// does), inside the ~10 s window. Matches by HID serial when the key
     /// exposes one, else by the resolver's effective (CCID-read) serial; a
-    /// fresh same-model path alone never fires the reset (KEY-005).
+    /// fresh same-model path alone never fires the reset (KEY-005). A key
+    /// with neither fires only as the one device connected, as the CLI's
+    /// factory reset decides ([`keyroost_resolve::serial_less_reinsert`]).
     fn poll_reset_arm(&mut self) {
         // Defence in depth. `on_device_selected` is the sole owner of ending an
         // armed ceremony, which means every path that moves the selection has
@@ -8462,6 +8600,7 @@ impl App {
         }
         let current = Self::fido_devices();
         let mut fire: Option<std::path::PathBuf> = None;
+        let mut refuse: Option<String> = None;
         if let Some(arm) = self.reset_arm.as_mut() {
             if let Some(target_serial) = arm.target_serial.clone() {
                 // HID-serial mode: identity is port-independent.
@@ -8487,7 +8626,40 @@ impl App {
                     Some(t) if !present(t) => arm.saw_removal = true,
                     _ => {}
                 }
-                if arm.saw_removal {
+                if arm.saw_removal && arm.serial_less {
+                    // Same USB ids, a fresh connection, no serial of its own;
+                    // then it fires only as the one device connected.
+                    let cand = current
+                        .iter()
+                        .filter(|d| arm.target_ids == Some(d.ids) && d.serial.is_none())
+                        .find(|d| {
+                            let id = HidIdentity::of(d);
+                            !arm.prev_devices.iter().any(|p| same_hid_connection(p, &id))
+                        });
+                    if let Some(d) = cand {
+                        let now =
+                            keyroost_resolve::enumerate_with(&keyroost_resolve::EnumerateOptions {
+                                skip_key_names: true,
+                                skip_protocol_asks: true,
+                                ..Default::default()
+                            })
+                            .unwrap_or_default();
+                        match keyroost_resolve::serial_less_reinsert(&d.path, &now) {
+                            keyroost_resolve::SerialLessReinsert::Fire => {
+                                fire = Some(d.path.clone());
+                            }
+                            keyroost_resolve::SerialLessReinsert::Wait => {}
+                            keyroost_resolve::SerialLessReinsert::Refuse => {
+                                let others: Vec<String> = now
+                                    .iter()
+                                    .filter(|r| r.hid_path.as_deref() != Some(d.path.as_path()))
+                                    .map(|r| r.name.clone().unwrap_or_else(|| r.model_title()))
+                                    .collect();
+                                refuse = Some(serial_less_reset_refusal(&others));
+                            }
+                        }
+                    }
+                } else if arm.saw_removal {
                     fire = current
                         .iter()
                         .filter(|d| arm.target_ids.is_none() || arm.target_ids == Some(d.ids))
@@ -8509,6 +8681,12 @@ impl App {
                         .map(|d| d.path.clone());
                 }
             }
+        }
+        if let Some(msg) = refuse {
+            self.reset_arm = None;
+            self.security_keys.reset = ResetDialog::default();
+            self.refuse_fido_reset(msg);
+            return;
         }
         match fire {
             Some(path) => {
@@ -14919,6 +15097,7 @@ impl eframe::App for App {
         self.render_piv_cred_modal(ctx, &p);
         self.molto_dialogs(ctx);
         self.render_import(ctx, &p);
+        self.touch_banner(ctx, &p);
 
         // Help popover, painted last so it sits above everything.
         if let Some(topic) = self.help_open {
@@ -15653,7 +15832,11 @@ impl App {
                             if fit.count_compact {
                                 count.on_hover_text(&count_full);
                             }
-                            if busy {
+                            // A job waiting for a touch says so in the
+                            // banner over the content (`touch_banner`), so
+                            // the bar shows nothing for it.
+                            let touch_wait = busy_label.as_deref().is_some_and(job_waits_for_touch);
+                            if busy && !touch_wait {
                                 ui.add_space(12.0);
                                 ui.spinner();
                                 if let Some(label) = &busy_label {
@@ -27735,6 +27918,7 @@ mod tests {
             for_device: app.selected_device.clone(),
             prev_devices: Vec::new(),
             saw_removal: true,
+            serial_less: false,
         });
 
         app.select_device("serial:BBB".into());
@@ -27765,6 +27949,7 @@ mod tests {
             for_device: Some(for_device.into()),
             prev_devices: Vec::new(),
             saw_removal: true,
+            serial_less: false,
         }
     }
 
@@ -28134,6 +28319,56 @@ mod tests {
         }]);
         assert!(summary.contains("wiped: none"), "{summary}");
         assert!(!summary.contains("skipped"), "{summary}");
+    }
+
+    /// A key with no serial of either kind arms when it is the only device
+    /// connected, and is refused, naming what to unplug, when it isn't.
+    #[test]
+    fn the_touch_banner_follows_the_job_label() {
+        assert!(job_waits_for_touch(
+            "Touch your key to read the code\u{2026}"
+        ));
+        assert!(job_waits_for_touch(
+            "Adding credential \u{2014} touch the key if it blinks\u{2026}"
+        ));
+        assert!(!job_waits_for_touch("Reading OATH codes\u{2026}"));
+        assert!(!job_waits_for_touch("Resetting card\u{2026}"));
+    }
+
+    #[test]
+    fn a_serial_less_key_arms_only_when_it_is_alone() {
+        let path = std::path::PathBuf::from("/dev/hidraw7");
+        let key = Device {
+            vendor: "Token2".into(),
+            model: "PIN+ Series".into(),
+            hid_path: Some(path.clone()),
+            ..test_key("k", "", None)
+        };
+        let hid = || {
+            vec![FidoHid {
+                path: path.clone(),
+                serial: None,
+                ids: (0x349e, 0x0024),
+                usb_device: None,
+            }]
+        };
+        let mut app = App {
+            devices: vec![key.clone()],
+            selected_device: Some("k".into()),
+            ..Default::default()
+        };
+        app.arm_fido_reset_with(hid());
+        assert!(app.reset_arm.as_ref().is_some_and(|a| a.serial_less));
+
+        let mut app = App {
+            devices: vec![key, test_token("m", "ABC", None)],
+            selected_device: Some("k".into()),
+            ..Default::default()
+        };
+        app.arm_fido_reset_with(hid());
+        assert!(app.reset_arm.is_none());
+        let err = app.security_keys.error.unwrap_or_default();
+        assert!(err.contains("Unplug Molto2"), "{err}");
     }
 
     /// Refusing to arm (KEY-005) ends the ceremony, exactly as Cancel does. An
@@ -31223,6 +31458,52 @@ mod tests {
             "a stale dialog must be dropped, not dispatched"
         );
         assert!(app.security_keys.error.is_some(), "the refusal is surfaced");
+    }
+
+    fn unlocked_session(count: u64) -> UnlockedSession {
+        UnlockedSession {
+            token: PinUvAuthToken {
+                protocol: 2,
+                token: vec![7; 32],
+            },
+            metadata: keyroost_ctap::cred_mgmt::CredsMetadata {
+                existing_count: count,
+                max_remaining: 0,
+            },
+            rps: std::sync::Arc::new(Vec::new()),
+            fingerprints: None,
+            pin: zeroize::Zeroizing::new(String::new()),
+        }
+    }
+
+    /// Refresh keeps the session in place while it runs, so a Lock pressed
+    /// meanwhile must win: the fresh session is dropped, not installed.
+    #[test]
+    fn a_refresh_never_unlocks_a_key_locked_while_it_ran() {
+        let key: DeviceId = "serial:AAA".into();
+        let mut app = App {
+            selected_device: Some(key.clone()),
+            ..Default::default()
+        };
+        app.security_keys.session = Some(unlocked_session(1));
+        app.security_keys.session_device = Some(key.clone());
+
+        app.apply_refreshed_session(Some(key.clone()), Ok(unlocked_session(2)));
+        let count = |app: &App| {
+            app.security_keys
+                .session
+                .as_ref()
+                .map(|s| s.metadata.existing_count)
+        };
+        assert_eq!(count(&app), Some(2), "a refresh replaces the list");
+
+        app.lock_session();
+        app.apply_refreshed_session(Some(key.clone()), Ok(unlocked_session(3)));
+        assert!(
+            app.security_keys.session.is_none(),
+            "Lock pressed mid-refresh stays locked"
+        );
+        assert!(app.security_keys.session_device.is_none());
     }
 
     /// Selecting another device closes (and thereby zeroizes) the dialog.
