@@ -779,6 +779,20 @@ struct UnlockedSession {
     pin: zeroize::Zeroizing<String>,
 }
 
+/// Internal unlock outcome: getInfo says the authenticator must complete a PIN
+/// change before it will issue any pinUvAuthToken. This is not a bad-PIN error
+/// and must not be shown as one.
+#[derive(Debug)]
+struct ForcedPinChange;
+
+impl std::fmt::Display for ForcedPinChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the key requires a PIN change before it can be unlocked")
+    }
+}
+
+impl std::error::Error for ForcedPinChange {}
+
 /// One FIDO HID device as the armed-reset poll sees it.
 struct FidoHid {
     path: std::path::PathBuf,
@@ -5665,14 +5679,14 @@ impl App {
         let Some(target) = self.selected_fido_target() else {
             return;
         };
-        let pin = std::mem::take(&mut self.security_keys.pin_input);
+        let pin = zeroize::Zeroizing::new(std::mem::take(&mut self.security_keys.pin_input));
         if pin.is_empty() {
             self.security_keys.error = Some("PIN is empty".into());
             return;
         }
         let for_device = self.selected_device.clone();
         self.spawn_job("Unlocking\u{2026} (enter PIN / touch)", move || {
-            let result = Self::open_and_unlock(&target, &pin).map_err(|e| e.to_string());
+            let result = Self::open_and_unlock(&target, &pin);
             Box::new(move |app: &mut App| {
                 if !completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
                     return; // selection changed mid-unlock; discard (drops the PIN)
@@ -5686,21 +5700,57 @@ impl App {
                         app.security_keys.session_device = for_device.clone();
                         app.security_keys.error = None;
                     }
-                    Err(e) => app.security_keys.error = Some(format!("unlock failed: {}", e)),
+                    Err(e) => app.fail_unlock(e, pin),
                 }
             })
         });
     }
 
+    fn fail_unlock(
+        &mut self,
+        error: Box<dyn std::error::Error + Send + Sync>,
+        mut pin: zeroize::Zeroizing<String>,
+    ) {
+        // CTAP 2.1 §7.4.2: forcePINChange requires a PIN change *before* either
+        // getPinToken variant. Usually getInfo lets open_and_unlock stop before
+        // asking for a token; the 0x37 fallback covers authenticators that only
+        // report the requirement when the token request itself is attempted.
+        let pin_change_required = error.downcast_ref::<ForcedPinChange>().is_some()
+            || matches!(
+                error.downcast_ref::<keyroost_ctap::CtapError>(),
+                Some(keyroost_ctap::CtapError::StatusCode(0x37))
+            );
+        if pin_change_required {
+            if let Some(info) = self.security_keys.info.as_mut() {
+                info.force_pin_change = Some(true);
+            }
+            // Move the current PIN into the change form instead of making the
+            // user type it again. Replacing the form wipes any previous draft;
+            // cancelling or switching keys wipes this PIN through Drop as well.
+            self.security_keys.change_pin = ChangePinDialog {
+                open: true,
+                old: std::mem::take(&mut *pin),
+                new: String::new(),
+                confirm: String::new(),
+            };
+            self.security_keys.error = None;
+            return;
+        }
+        self.security_keys.error = Some(format!("unlock failed: {}", error));
+    }
+
     fn open_and_unlock(
         target: &FidoTarget,
         pin: &str,
-    ) -> Result<UnlockedSession, Box<dyn std::error::Error>> {
+    ) -> Result<UnlockedSession, Box<dyn std::error::Error + Send + Sync>> {
         let (mut dev, cbor, _init) = open_fido(target)?;
         if !cbor {
             return Err("device is U2F-only".into());
         }
         let info = keyroost_ctap::get_info(&mut dev)?;
+        if info.force_pin_change == Some(true) {
+            return Err(Box::new(ForcedPinChange));
+        }
         // Request credential-management permission, plus bio-enrollment when the
         // key supports it, so the one cached session token authorizes both
         // passkey management and fingerprint operations. Permissions are a
@@ -6573,8 +6623,11 @@ impl App {
                 Ok(()) => {
                     app.security_keys.change_pin.open = false;
                     app.security_keys.error = None;
-                    // Force re-unlock with the new PIN.
+                    // Force re-unlock with the new PIN, and clear a cached
+                    // forcePINChange flag so the next unlock isn't diverted
+                    // back into this form after the key has accepted the change.
                     app.lock_session();
+                    app.fetch_selected_info();
                 }
                 Err(e) => app.security_keys.error = Some(format!("change PIN failed: {}", e)),
             })
@@ -17914,22 +17967,42 @@ impl App {
 
             if self.security_keys.change_pin.open {
                 let setting = pin == PinSupport::NotSet;
+                let required = !setting
+                    && self
+                        .security_keys
+                        .info
+                        .as_ref()
+                        .is_some_and(|info| info.force_pin_change == Some(true));
                 ui.add_space(10.0);
                 egui::Frame::NONE
                     .fill(p.raised)
                     .inner_margin(egui::Margin::same(12))
                     .corner_radius(egui::CornerRadius::same(8))
                     .show(ui, |ui| {
+                        let title = if setting {
+                            "Create a PIN"
+                        } else if required {
+                            "PIN change required"
+                        } else {
+                            "Change PIN"
+                        };
                         ui.label(
-                            egui::RichText::new(if setting {
-                                "Create a PIN"
-                            } else {
-                                "Change PIN"
-                            })
-                            .font(theme::f_sb(13.0))
-                            .color(p.txt),
+                            egui::RichText::new(title)
+                                .font(theme::f_sb(13.0))
+                                .color(p.txt),
                         );
                         ui.add_space(8.0);
+                        if required {
+                            ui.label(
+                                egui::RichText::new(
+                                    "This key requires a PIN change before it can be unlocked. \
+                                     Enter your new PIN twice, then choose Change PIN.",
+                                )
+                                .font(theme::f_reg(12.0))
+                                .color(p.warn),
+                            );
+                            ui.add_space(8.0);
+                        }
                         if setting {
                             pin_field(ui, p, "New PIN", &mut self.security_keys.change_pin.new);
                             pin_field(ui, p, "Confirm", &mut self.security_keys.change_pin.confirm);
@@ -28286,6 +28359,74 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(pin_support(Some(&pin_set)), PinSupport::Set);
+    }
+
+    /// A forced-PIN-change rejection during unlock must open the change-PIN
+    /// form with the current PIN preserved, not report a misleading new-PIN
+    /// complexity failure and leave the user at the same unlock prompt.
+    #[test]
+    fn pin_policy_violation_during_unlock_requests_pin_change() {
+        let mut app = App::default();
+        app.fail_unlock(
+            Box::new(keyroost_ctap::CtapError::StatusCode(0x37)),
+            zeroize::Zeroizing::new("current-pin".into()),
+        );
+
+        assert!(app.security_keys.change_pin.open);
+        assert_eq!(app.security_keys.change_pin.old, "current-pin");
+        assert!(app.security_keys.change_pin.new.is_empty());
+        assert!(app.security_keys.change_pin.confirm.is_empty());
+        assert_eq!(app.security_keys.error, None);
+    }
+
+    /// The getInfo-driven early exit reaches the same form and updates the
+    /// cached policy flag used to explain why the form opened.
+    #[test]
+    fn forced_pin_change_state_during_unlock_requests_pin_change() {
+        let mut app = App {
+            security_keys: SecurityKeysState {
+                info: Some(AuthenticatorInfo {
+                    force_pin_change: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        app.fail_unlock(
+            Box::new(ForcedPinChange),
+            zeroize::Zeroizing::new("current-pin".into()),
+        );
+
+        assert!(app.security_keys.change_pin.open);
+        assert_eq!(app.security_keys.change_pin.old, "current-pin");
+        assert_eq!(
+            app.security_keys
+                .info
+                .as_ref()
+                .and_then(|info| info.force_pin_change),
+            Some(true)
+        );
+        assert_eq!(app.security_keys.error, None);
+    }
+
+    /// A genuine wrong-PIN failure keeps the original error path: it must not
+    /// open a change form or carry the rejected PIN into another operation.
+    #[test]
+    fn wrong_pin_during_unlock_does_not_request_pin_change() {
+        let mut app = App::default();
+        app.fail_unlock(
+            Box::new(keyroost_ctap::CtapError::StatusCode(0x31)),
+            zeroize::Zeroizing::new("wrong-pin".into()),
+        );
+
+        assert!(!app.security_keys.change_pin.open);
+        assert!(app.security_keys.change_pin.old.is_empty());
+        assert!(app
+            .security_keys
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("unlock failed: the PIN was incorrect")));
     }
 
     #[test]
