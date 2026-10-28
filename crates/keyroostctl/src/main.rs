@@ -8788,6 +8788,15 @@ fn run_otp(
             let mut session = open_otp(&sel, debug)?;
             ensure_otp_feature(&mut session, OtpFeature::OnDevice)?;
             let now = unix_now() as u64;
+            // Over USB the key says when it waits for its button, and the
+            // session's prompt shows then. A reader gives no such sign, so
+            // there an entry saved with --touch gets the prompt up front.
+            if session.is_pcsc() {
+                let listed = session.enumerate(now).unwrap_or_default();
+                if otp_entry_wants_touch(&listed, app, account) {
+                    eprintln!("touch your key to continue\u{2026}");
+                }
+            }
             let entry = session.read_entry(now, app, account)?;
             match entry.code {
                 Some(code) => {
@@ -9197,6 +9206,15 @@ fn run_otp(
         }
     }
     Ok(())
+}
+
+/// Whether the `(app, account)` entry in `listed` was saved with --touch.
+/// An entry that isn't listed (or a listing that failed, passed as empty)
+/// gets no prompt.
+fn otp_entry_wants_touch(listed: &[keyroost_token2otp::Entry], app: &str, account: &str) -> bool {
+    listed
+        .iter()
+        .any(|e| e.app_name == app && e.account_name == account && e.button_required)
 }
 
 /// `otp list` output for every --unlock mode: JSON `{"accounts": [...]}`
@@ -13133,7 +13151,7 @@ fn run_fido(cmd: &FidoCmd) -> Result<(), Box<dyn std::error::Error>> {
             let dev = crate::target::select_fido_any(reader.as_deref(), path.as_deref())?;
             match fido_route(&dev, reader.is_some())? {
                 FidoRoute::Card { reader } => run_fido_info_reader(&reader)?,
-                FidoRoute::Hid { path } => run_fido_info(&path)?,
+                FidoRoute::Hid { path } => run_fido_info(&path, dev.reader.as_deref())?,
             }
             Ok(())
         }
@@ -14425,8 +14443,27 @@ fn run_fido_info_reader(reader: &str) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-fn run_fido_info(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+/// The firmware version for `fido info`: CTAPHID INIT's, or, when INIT says
+/// 0.0.0 (a Nitrokey 3 does), what the key's admin application reports over
+/// its smart-card `reader`, as the app's header shows.
+fn fido_firmware(init: &keyroost_ctap::InitResponse, reader: Option<&str>) -> String {
+    let (major, minor, build) = (init.device_major, init.device_minor, init.device_build);
+    if (major, minor, build) == (0, 0, 0) {
+        if let Some(v) = reader.and_then(|r| {
+            keyroost_transport::identity::trussed_admin_firmware(r, crate::target::debug_on())
+        }) {
+            return v;
+        }
+    }
+    format!("{major}.{minor}.{build}")
+}
+
+fn run_fido_info(
+    path: &std::path::Path,
+    reader: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (mut dev, init) = keyroost_ctap::CtapHidDevice::open(path)?;
+    let firmware = fido_firmware(&init, reader);
     let json = json_output();
     let mut caps = Vec::new();
     if init.supports_wink() {
@@ -14450,13 +14487,7 @@ fn run_fido_info(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
                         init.channel_id, init.protocol_version
                     ),
                 ),
-                (
-                    "Firmware",
-                    format!(
-                        "{}.{}.{}",
-                        init.device_major, init.device_minor, init.device_build
-                    ),
-                ),
+                ("Firmware", firmware.clone()),
                 (
                     "Caps",
                     format!("{} (raw 0x{:02X})", caps.join("+"), init.capabilities),
@@ -14471,10 +14502,7 @@ fn run_fido_info(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
                 device: path.display().to_string(),
                 channel_id: init.channel_id,
                 ctaphid_protocol_version: init.protocol_version,
-                firmware: format!(
-                    "{}.{}.{}",
-                    init.device_major, init.device_minor, init.device_build
-                ),
+                firmware: firmware.clone(),
                 hid_caps: caps,
                 hid_caps_raw: init.capabilities,
                 ctap2: None,
@@ -14493,10 +14521,7 @@ fn run_fido_info(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error
             device: path.display().to_string(),
             channel_id: init.channel_id,
             ctaphid_protocol_version: init.protocol_version,
-            firmware: format!(
-                "{}.{}.{}",
-                init.device_major, init.device_minor, init.device_build
-            ),
+            firmware,
             hid_caps: caps,
             hid_caps_raw: init.capabilities,
             ctap2: Some(ctap2_json(&info)),
@@ -14616,16 +14641,10 @@ fn fido_reset_at(
 /// reader and the reset is sent the moment the applet answers (issue #84 —
 /// the replug ceremony can never complete for a card).
 fn run_fido_reset_reader(exact_reader: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if !keyroost_transport::CtapPcscDevice::list_fido_readers()?
-        .iter()
-        .any(|r| r == exact_reader)
-    {
-        return Err(format!(
-            "'{}' has no FIDO applet answering over this reader",
-            sanitize_terminal(exact_reader)
-        )
-        .into());
-    }
+    // Check that the FIDO applet answers before power-cycling the card, with
+    // the same error `fido info --reader` gives (on Windows without
+    // administrator rights, that one says so).
+    drop(keyroost_transport::CtapPcscDevice::open(exact_reader)?);
     output::status("Power-cycling the card and sending the reset\u{2026}");
     let mut dev = keyroost_transport::CtapPcscDevice::open_after_power_cycle(exact_reader)?;
     // Names read from keys before or during the write are stale.
@@ -16112,6 +16131,27 @@ mod cli_tests {
                 assert!(!h.contains("hidraw"), "{path}: --{:?}", a.get_long());
             }
         }
+    }
+
+    #[test]
+    fn otp_code_prompts_up_front_only_for_a_listed_touch_entry() {
+        let entry = |app: &str, account: &str, touch| keyroost_token2otp::Entry {
+            otp_type: keyroost_token2otp::OtpType::Totp,
+            algorithm: keyroost_token2otp::Algorithm::Sha1,
+            timestep: 30,
+            code_length: 6,
+            button_required: touch,
+            app_name: app.into(),
+            account_name: account.into(),
+            code: None,
+        };
+        let listed = [entry("kr", "touch", true), entry("kr", "plain", false)];
+        assert!(otp_entry_wants_touch(&listed, "kr", "touch"));
+        assert!(!otp_entry_wants_touch(&listed, "kr", "plain"));
+        // Same account under another app is a different entry.
+        assert!(!otp_entry_wants_touch(&listed, "", "touch"));
+        // A failed listing (empty) never prompts.
+        assert!(!otp_entry_wants_touch(&[], "kr", "touch"));
     }
 
     #[test]

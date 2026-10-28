@@ -870,6 +870,57 @@ struct OathRow {
     /// request: re-reading it every time window would make the key wait for a
     /// touch each time, holding back every other row's fresh code meanwhile.
     touch: bool,
+    /// For a touch code read on request: the end (Unix seconds) of the time
+    /// window it was computed for. It is kept across refreshes until then
+    /// (they never re-read it), and its countdown runs to it. `None` for
+    /// codes the listing computes, which follow the current window.
+    valid_until: Option<u64>,
+}
+
+/// How far ahead a touch read computes its code, as Yubico Authenticator
+/// does: one read in the last seconds of a window gets the next window's
+/// code (services accept it) instead of one that is about to expire.
+const OATH_TOUCH_READ_AHEAD_SECS: u64 = 10;
+
+/// The time a touch read computes its code for, and the end of that code's
+/// window, at `now` (Unix seconds) for a `period`-second credential.
+fn oath_touch_read_window(now: u64, period: u64) -> (u64, u64) {
+    let period = period.max(1);
+    let at = now + OATH_TOUCH_READ_AHEAD_SECS;
+    (at, (at / period + 1) * period)
+}
+
+/// Seconds left on a row's code at `now` and the ring's fill (0 to 1): to
+/// the end of the current window, or of the code's own window for a touch
+/// code read ahead ([`OathRow::valid_until`]).
+fn oath_code_left(now: u64, period: u64, valid_until: Option<u64>) -> (u64, f32) {
+    let period = period.max(1);
+    let secs = match valid_until {
+        Some(end) => end.saturating_sub(now),
+        None => period - now % period,
+    };
+    (secs, (secs as f32 / period as f32).min(1.0))
+}
+
+/// Move each touch code still in its window from `old` rows into the
+/// matching freshly listed `rows` (which never compute one).
+fn carry_touch_codes(rows: &mut [OathRow], old: &mut [OathRow], now: u64) {
+    for row in rows.iter_mut().filter(|r| r.touch && r.code.is_none()) {
+        if let Some(prev) = old
+            .iter_mut()
+            .find(|o| o.name == row.name && o.code_at(now).is_some())
+        {
+            row.code = prev.code.take();
+            row.valid_until = prev.valid_until;
+        }
+    }
+}
+
+/// Seconds until a read-ahead touch code's window begins at `now`, or `None`
+/// once it has (or for a code that follows the current window).
+fn oath_wait_secs(now: u64, period: u64, valid_until: Option<u64>) -> Option<u64> {
+    let start = valid_until?.saturating_sub(period.max(1));
+    (now < start).then(|| start - now)
 }
 
 impl OathRow {
@@ -888,7 +939,15 @@ impl OathRow {
             hotp,
             period,
             touch: false,
+            valid_until: None,
         }
+    }
+
+    /// The code to show at `now`: none once a touch code's window has ended.
+    fn code_at(&self, now: u64) -> Option<&str> {
+        self.code
+            .as_deref()
+            .filter(|_| self.valid_until.is_none_or(|end| now < end))
     }
 }
 
@@ -6898,7 +6957,7 @@ impl App {
             "Reading code\u{2026}"
         };
         self.spawn_job(label, move || {
-            let result = (|| -> Result<String, TransportError> {
+            let result = (|| -> Result<(String, Option<u64>), TransportError> {
                 let mut session = Self::oath_open_unlock(&reader, &password)?;
                 match totp_period {
                     Some(period) => {
@@ -6906,9 +6965,11 @@ impl App {
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
-                        Ok(session.calculate_totp(&cred, now, period)?.code)
+                        let (at, until) = oath_touch_read_window(now, u64::from(period));
+                        let code = session.calculate_totp(&cred, at, period)?.code;
+                        Ok((code, Some(until)))
                     }
-                    None => Ok(session.calculate_hotp(&cred)?.code),
+                    None => Ok((session.calculate_hotp(&cred)?.code, None)),
                 }
             })();
             Box::new(move |app: &mut App| {
@@ -6919,12 +6980,13 @@ impl App {
                 // apply_oath_rows).
                 wipe(&mut app.oath.password_input);
                 match result {
-                    Ok(code) => {
+                    Ok((code, valid_until)) => {
                         // This password worked (or none was needed): retain it,
                         // like a successful listing does.
                         app.oath.unlocked_password = Some(password);
                         if let Some(row) = app.oath.creds.iter_mut().find(|r| r.name == cred) {
                             row.code = Some(code);
+                            row.valid_until = valid_until;
                         }
                     }
                     Err(TransportError::OathPasswordRejected) => {
@@ -6986,6 +7048,14 @@ impl App {
                         row.code = old.code.take();
                     }
                 }
+                // Likewise a touch code read on request, until its own
+                // window ends: the refresh at the window change must not
+                // take a code the user just touched for.
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                carry_touch_codes(&mut rows, &mut app.oath.creds, now);
                 app.oath.creds = rows;
                 app.oath.skipped = skipped;
                 app.oath.loaded = true;
@@ -17402,7 +17472,7 @@ impl App {
                         for row in self.oath.creds.iter().take(2) {
                             let is_copied =
                                 self.copied.as_ref().is_some_and(|(n, _)| n == &row.name);
-                            if let (Some(code), _, _) = oath_row(ui, p, row, is_copied, false) {
+                            if let Some(code) = oath_row(ui, p, row, is_copied, false, false).copy {
                                 copy = Some((row.name.clone(), code));
                             }
                             ui.add_space(6.0);
@@ -22607,19 +22677,24 @@ impl App {
         let mut copy: Option<(String, String)> = None;
         let mut delete: Option<String> = None;
         let mut read: Option<String> = None;
+        let mut wait_help: Option<egui::Response> = None;
+        let wait_help_open = self.help_open == Some(OATH_WAIT_HELP);
         theme::card_frame(p).show(ui, |ui| {
             let n = self.oath.creds.len();
             for (i, row) in self.oath.creds.iter().enumerate() {
                 let is_copied = self.copied.as_ref().is_some_and(|(nm, _)| nm == &row.name);
-                let (c, d, r) = oath_row(ui, p, row, is_copied, true);
-                if let Some(code) = c {
+                let clicks = oath_row(ui, p, row, is_copied, true, wait_help_open);
+                if let Some(code) = clicks.copy {
                     copy = Some((row.name.clone(), code));
                 }
-                if d {
+                if clicks.delete {
                     delete = Some(row.name.clone());
                 }
-                if r {
+                if clicks.read {
                     read = Some(row.name.clone());
+                }
+                if clicks.wait_help.is_some() {
+                    wait_help = clicks.wait_help;
                 }
                 if i + 1 < n {
                     ui.add_space(5.0);
@@ -22633,6 +22708,9 @@ impl App {
                 }
             }
         });
+        if let Some(r) = &wait_help {
+            self.on_help_dot(ui, r, OATH_WAIT_HELP);
+        }
         if let Some((name, code)) = copy {
             self.copied = Some((name, now_secs_f64() + 1.2));
             self.copy_secret(ui.ctx(), code);
@@ -25873,11 +25951,21 @@ fn oath_row(
     row: &OathRow,
     is_copied: bool,
     with_delete: bool,
-) -> (Option<String>, bool, bool) {
-    let (name, code, hotp) = (row.name.as_str(), row.code.as_deref(), row.hotp);
+    wait_help_open: bool,
+) -> OathRowClicks {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (name, code, hotp) = (row.name.as_str(), row.code_at(now), row.hotp);
     let (issuer, account, period) = oath_display_name(name, hotp);
-    let (secs, pct) = theme::totp_window(u64::from(row.period.max(1)));
-    let code_color = if hotp {
+    let (secs, pct) = oath_code_left(now, u64::from(row.period), row.valid_until);
+    // A touch code read ahead whose window hasn't begun: gray, with "wait Ns".
+    let wait =
+        oath_wait_secs(now, u64::from(row.period), row.valid_until).filter(|_| code.is_some());
+    let code_color = if wait.is_some() {
+        p.txt3
+    } else if hotp {
         // HOTP codes don't expire — no about-to-roll warning color.
         p.accent
     } else if secs <= 5 {
@@ -25888,6 +25976,7 @@ fn oath_row(
     let mut copy = None;
     let mut delete = false;
     let mut read = false;
+    let mut wait_help = None;
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
@@ -25952,7 +26041,21 @@ fn oath_row(
                 }
             }
             ui.add_space(10.0);
-            if !hotp {
+            if let Some(left) = wait {
+                // Before the code's window: what to do, and a full gray ring.
+                // The compact overview card has no help dot to click.
+                if with_delete {
+                    wait_help = Some(ui::help_button(ui, p, wait_help_open));
+                    ui.add_space(6.0);
+                }
+                ui.label(
+                    egui::RichText::new(format!("wait {left}s"))
+                        .font(theme::f_reg(11.0))
+                        .color(p.txt3),
+                );
+                ui.add_space(5.0);
+                theme::ring(ui, 1.0, 20.0, code_color, p.line);
+            } else if !hotp {
                 // The countdown is a TOTP concept; an HOTP code stays valid
                 // until used.
                 ui.label(
@@ -25982,8 +26085,27 @@ fn oath_row(
             }
         });
     });
-    (copy, delete, read)
+    OathRowClicks {
+        copy,
+        delete,
+        read,
+        wait_help,
+    }
 }
+
+/// What a click on one [`oath_row`] asked for.
+struct OathRowClicks {
+    /// The code, when its copy icon was clicked.
+    copy: Option<String>,
+    delete: bool,
+    /// "Read code" (HOTP, or a TOTP code that needs a touch).
+    read: bool,
+    /// The "?" by a "wait Ns" code, for the caller to act on.
+    wait_help: Option<egui::Response>,
+}
+
+/// The help topic of the "?" by a touch code whose window hasn't begun.
+const OATH_WAIT_HELP: &str = "oath-wait";
 
 /// Flatten control characters out of a device-provided title before display
 /// (same policy as the CLI's sanitize_cert_field).
@@ -29519,6 +29641,79 @@ mod tests {
     /// `apply_oath_rows` mirrors the provision outcome into the open add modal
     /// (busy clears; success → `Ok`, error → `Err(message)`) and does *not*
     /// double-report into the pane-level `oath.error` while the modal owns the op.
+    #[test]
+    fn a_touch_read_late_in_a_window_gets_the_next_windows_code() {
+        let start = 33_334 * 30; // the start of a 30 s window
+                                 // At :05 the code is for this window, valid until :30.
+        assert_eq!(
+            oath_touch_read_window(start + 5, 30),
+            (start + 15, start + 30)
+        );
+        // At :25 it reads for :35, so the code lasts until :60.
+        assert_eq!(
+            oath_touch_read_window(start + 25, 30),
+            (start + 35, start + 60)
+        );
+    }
+
+    #[test]
+    fn a_read_ahead_code_counts_down_to_its_own_window_end() {
+        let start = 33_334 * 30; // the start of a 30 s window
+                                 // A listed code follows the current window.
+        assert_eq!(oath_code_left(start + 25, 30, None).0, 5);
+        // A touch code read at :25 for the next window has 35 s left; the
+        // ring is full until it is under one period.
+        let (secs, pct) = oath_code_left(start + 25, 30, Some(start + 60));
+        assert_eq!(secs, 35);
+        assert_eq!(pct, 1.0);
+        assert_eq!(oath_code_left(start + 60, 30, Some(start + 60)).0, 0);
+    }
+
+    #[test]
+    fn a_read_ahead_code_says_wait_until_its_window_begins() {
+        let start = 33_334 * 30; // the start of a 30 s window
+                                 // Read at :25 for the window :30 to :60: wait 5 s, then 4 s, ...
+        assert_eq!(oath_wait_secs(start + 25, 30, Some(start + 60)), Some(5));
+        assert_eq!(oath_wait_secs(start + 29, 30, Some(start + 60)), Some(1));
+        // ... and nothing once it has begun.
+        assert_eq!(oath_wait_secs(start + 30, 30, Some(start + 60)), None);
+        // A code read for the window it is in never waits.
+        assert_eq!(oath_wait_secs(start + 5, 30, Some(start + 30)), None);
+        // Nor does a listed code.
+        assert_eq!(oath_wait_secs(start + 25, 30, None), None);
+    }
+
+    #[test]
+    fn a_touch_code_outlives_the_refresh_until_its_window_ends() {
+        let start = 33_334 * 30; // the start of a 30 s window
+        let touched = || {
+            let mut r = OathRow::new("kr-touch".into(), Some("123456".into()), false);
+            r.touch = true;
+            r.valid_until = Some(start + 60);
+            r
+        };
+        let fresh = || {
+            let mut r = OathRow::new("kr-touch".into(), None, false);
+            r.touch = true;
+            vec![
+                r,
+                OathRow::new("kr-plain".into(), Some("654321".into()), false),
+            ]
+        };
+        // The refresh at :30 keeps it, with its window end.
+        let mut rows = fresh();
+        carry_touch_codes(&mut rows, &mut [touched()], start + 30);
+        assert_eq!(rows[0].code_at(start + 30), Some("123456"));
+        assert_eq!(rows[0].valid_until, Some(start + 60));
+        // The refresh at :60 drops it, and the row offers Read code again.
+        let mut rows = fresh();
+        carry_touch_codes(&mut rows, &mut [touched()], start + 60);
+        assert_eq!(rows[0].code, None);
+        // Shown only while its window lasts.
+        assert_eq!(touched().code_at(start + 59), Some("123456"));
+        assert_eq!(touched().code_at(start + 60), None);
+    }
+
     #[test]
     fn apply_oath_rows_mirrors_into_add_modal() {
         // Success path: modal busy → result Ok, busy cleared, rows applied.
