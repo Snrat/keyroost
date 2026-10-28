@@ -6,6 +6,280 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-28
+
+### Added
+- **Import a key and certificate from a .p12/.pfx file.** `keyroostctl piv
+  key import --slot 9a --in FILE` writes a private key and its certificate
+  from a PKCS#12 file into a PIV slot, then tests the slot as `piv test`
+  does; in the app, it's "Import key from file…" on a PIV slot.
+  Legacy-encrypted files (RC2/3DES, the kind some certificate authorities
+  such as Spain's FNMT still issue) open directly. keyroost checks that the
+  key can take the file before it asks for the management key. A file with
+  several keys is listed for `--entry N`, and `--chain-out FILE` saves the
+  authority certificates, which are not written to the card. On a
+  Nitrokey 3, RSA keys go into slot 9A; HID Crescendo cards aren't supported
+  yet. An imported key can't be attested as generated on the key. ([#174])
+- **`fido info --reader` reads a key through a smart-card reader**, as
+  `fido reset --reader` already could. A key that only speaks U2F there gets
+  the same line as over USB, in the app too, instead of an error. On Windows,
+  where only a program running as administrator may reach a key's FIDO2 side
+  through its reader, a refusal says so. With no options, `fido info` now
+  picks the key the same way `fido reset` does, so with several FIDO keys
+  (including one only reachable through a reader) it asks which one. ([#215])
+- **`doctor` and the app say when a key's smart-card part has no reader
+  (Linux).** When a key has a smart-card interface but the smart-card service
+  lists no reader for it, usually because the system's smart-card driver
+  doesn't know the model yet, `doctor` says so and the app adds a line to the
+  key's Overview page. ([#215])
+- **`openpgp info` notices a key whose fingerprint is missing.** It now
+  reads each slot's public key (no PIN) and, when a slot holds a key but no
+  fingerprint, says `(none), but a key is present`; the app's OpenPGP card
+  says the same, `(none), but a key is present`. `--json` gains
+  `key_present_sig`, `key_present_dec` and `key_present_aut` (true, or
+  `null` when the card doesn't tell). ([#215])
+- **`piv --json info` says whether the PIN is verified and whether each slot
+  holds a key.** New `pin_verified` (true/false) and, per slot, `key_present`
+  (true, false, or `null` when the key can't tell). `piv info` and the app's
+  PIV header now say "PIN verified" instead of "PIN accepted", matching
+  `openpgp pin verify`. ([#215])
+- **`piv info` lists the retired key slots that are in use.** Slots 82–95
+  show after the standard four when they hold a certificate or a key, in
+  the text output and in `--json`'s `slots`. ([#221])
+
+### Changed
+- **No PIN or touch policy for new PIV keys on a Nitrokey 3.** On firmware
+  newer than 1.8.3, up to 1.9.1, `piv key generate` and the app's Generate
+  dialog used to warn about a PIN or touch policy and then send it.
+  According to Nitrokey's published PIV source, this firmware doesn't apply
+  those settings and has nowhere to store one; its PIN rule is fixed per
+  slot and it has no touch requirement. keyroost now
+  refuses a policy other than `default` on these keys, as it already did on
+  older firmware; `--force` in the CLI or Enable Anyway in the app still
+  sends it. ([#174])
+- **Authenticator codes come back in one read.** The Authenticator tab now
+  asks the key for every code at once, as Yubico Authenticator does,
+  instead of one account at a time. On a key with accounts that require a
+  touch, the tab no longer waits about 15 seconds per such account before
+  showing anything: those accounts show **Read code** straight away. A
+  Nitrokey 3 has no all-codes command, so keyroost asks for its account
+  list with each account's touch setting instead, with the same result.
+  Accounts with a period other than 30 seconds are still read one by one.
+  ([#199])
+- **One Refresh button.** The top bar's Refresh is now the only one: the
+  sidebar's rescan icon, the Refresh on the Authenticator, PIV and OTP
+  tabs, OpenPGP's Read status, FIDO2's Reload and Load buttons and the
+  Molto2's Refresh slots are gone. Refresh reads again whatever is open,
+  down to the passkey, fingerprint or storage list. The OpenPGP card and the
+  fingerprint list now read themselves when you open them, like the other
+  tabs. The New CHUID dialog's button for a new random ID is now labeled
+  "New GUID". ([#200])
+- **An unplugged key is selected again when it comes back.** Unplugging the
+  selected key used to leave whichever key took its place selected after
+  you plugged it back in. The app now selects the key again, unless you
+  picked another one meanwhile. It recognizes the key by its serial or the
+  name stored on it, never by a guess. ([#202])
+- **A certificate can go into a PIV slot that has no key yet, in the app too.**
+  The app used to disable Import certificate for such a slot; it now allows
+  it, as the CLI and other tools do, and both say the certificate won't work
+  until a matching key is put in the slot. ([#215])
+- **Nitrokey is spelled Nitrokey.** `piv info` and the app's PIV header wrote
+  "NitroKey"; `piv --json info` now reports
+  `"applet_fingerprint": "Trussed::Nitrokey"` (was `Trussed::NitroKey`).
+  ([#215])
+- **A code you touched the key for no longer vanishes at the 30-second
+  mark.** In the app, **Read code** on an account that requires a touch now
+  works out the code for 10 seconds ahead, as Yubico Authenticator does, and
+  the code stays on screen until its own 30 seconds are up. When that is the
+  next 30 seconds, the code shows in gray with **wait 4s** counting down
+  until it starts, and its **?** explains why. ([#217])
+- **A FIDO2 key with no serial number can be reset when it is the only key
+  plugged in.** The app refused such a key outright. The app and
+  `keyroostctl` now follow one rule: with other keys connected, the reset
+  is refused before anything is wiped, naming the keys to unplug. ([#221])
+- **A banner asks for the touch the key is waiting for.** While a job waits
+  for a touch, the request shows in a banner at the top of the window
+  instead of as small gray text in the top bar. ([#221])
+- **The idle lock also wipes secrets left in a form.** A PIN, PUK, password,
+  passphrase, management key or seed typed into any masked box and not yet
+  used now starts the idle clock, and the box is emptied when it runs out.
+  ([#223])
+
+### Fixed
+- **Token2 OTP works over USB on PIN+ keys with firmware 2.1.** On these
+  keys `otp list`, the app's On-device OTP tab and every other OTP command
+  failed with "unexpected status word 0x0105": the key's FIDO interface
+  didn't accept the way keyroost framed OTP commands. keyroost now sends
+  them through the CTAPHID vendor command Token2 documented, and keeps the
+  earlier framing for keys that don't answer it. A code that needs a touch
+  says "touch your key" when the key asks for one. ([#155])
+- **`otp info` and `otp reset` work over USB on the same keys.** Both failed
+  with "unexpected status word 0x6FFB": the key rejects the short form
+  keyroost sent them in over USB. They now go out in the form Token2's
+  protocol document and reference client use; over a smart-card reader
+  nothing changes. ([#155])
+- **A PIV slot holding only a certificate no longer reads as holding a
+  key.** In the app, generating a key into such a slot warned that it
+  "destroys the existing key", and Move key and Delete key were offered
+  for it. It now reads "certificate present, no key", and generating or
+  moving a key into it notes that the certificate stays. Retired slots now
+  show their certificates too. `keyroostctl piv info` adds ", no key" to
+  such a slot's line. ([#174])
+- **TrustKey keys are named TrustKey.** Keys with USB vendor ID 0x311F
+  (registered to eWBM, whose keys now sell as TrustKey) showed as "Security
+  key" in 0.14.0; they now show as TrustKey, with the model from the key
+  (for example "TrustKey B210H"). Reported by @Ephemera42. ([#195])
+- **U2F-only keys are labeled U2F.** A key whose FIDO side speaks only U2F,
+  such as the YubiKey NEO, was labeled FIDO2. keyroost now asks each key's
+  FIDO interface which protocol it speaks and labels it U2F when that is all
+  it does, in `keyroostctl list` (and `list --json`) and in the app, which
+  no longer offers a FIDO2 tab or a FIDO2 reset step for it. ([#201])
+- **Piping a secret in Windows PowerShell 5.1 works.** `"SEED" |
+  keyroostctl oath add NAME --seed stdin` failed there with "the seed is
+  not valid base32 (invalid character in input)": PowerShell 5.1 can start
+  piped text with an invisible byte-order mark, two of them when the
+  console also uses UTF-8, which keyroost took as part of the seed.
+  Byte-order marks at the start of stdin are now ignored for every secret
+  read from it. ([#203])
+- **The key's model and firmware stay in the header.** After a rescan
+  (Refresh, or plugging a key in or out) the selected key's header dropped
+  back from, for example, "YubiKey 5 Series with NFC · fw 5.7.4" to
+  "YubiKey". It now keeps them. ([#204])
+- **Files saved by Windows tools import.** An Aegis or 2FAS export or an
+  otpauth:// list that starts with a byte-order mark (as Windows PowerShell
+  5.1's `Out-File -Encoding utf8` and some editors write) was refused, or
+  lost its first account; UTF-16 text (what PowerShell 5.1's `>` writes)
+  wasn't read at all. Both now import, in the app and with
+  `keyroostctl … import`. ([#205])
+- **Authenticator works on the Nitrokey 3.** On current Nitrokey 3 firmware
+  every Authenticator command failed with "conditions of use not satisfied":
+  the key holds a reply back until it is asked for with the standard
+  GET RESPONSE command, and keyroost only knew the YubiKey's way of asking.
+  keyroost now asks each key the way it expects, so accounts can be listed,
+  added, read and deleted. A Nitrokey 3 asks for a touch to reset its
+  Authenticator app, to delete any account, and to save or read one that
+  requires a touch; the CLI and the app now say so, and a missed touch gets
+  a message that says to try again and touch the key. ([#208])
+- **Authenticator codes no longer drop out while a browser is open.** A
+  browser checking the key for smart-card certificates could slip its own
+  commands in between keyroost's, and the app then showed **Read code** on
+  ordinary accounts. keyroost now keeps the key to itself for the length of
+  each Authenticator read or change. ([#208])
+- **The Nitrokey 3's firmware version shows in the app.** The key header
+  showed "fw 0.0.0", the placeholder the key's FIDO side reports; it now
+  shows the version from the key's admin application. ([#208])
+- **Device scans ask a key for its identity once.** On macOS, the app asked
+  a Yubico key for its serial number over the FIDO connection on every
+  device scan, so a key that doesn't support that question (such as the
+  YubiKey NEO) was asked again and again, and debug logs filled with the
+  same two lines. keyroost now keeps the answer for as long as the key stays
+  plugged in, wherever that can't be mistaken for a different key.
+  ([#211])
+- **PIV, OpenPGP and OATH reads work on a YubiKey NEO.** On macOS, reading
+  a YubiKey NEO's PIV, OpenPGP or OATH applet failed with "no Smart Card is
+  currently in the device" or "an attempt was made to end a non-existent
+  transaction", while ykman read the same key. The reads failed right after
+  keyroost asked the NEO's FIDO side for its serial number, a question it
+  does not answer. keyroost no longer asks it. As an added safeguard,
+  keyroost also waits up to three seconds for a card that has just reset and
+  opens the session once more, before sending anything that could change the
+  key. ([#211])
+- **A FIDO key that doesn't answer properly shows as FIDO2?.** A key that
+  opened but gave no proper answer to keyroost's first question used to
+  show as FIDO2 and get a name read and a FIDO2 reset step; it now shows
+  FIDO2? and gets neither until it answers. A key keyroost can't open at
+  all keeps FIDO2 as before, and a failed question is asked again on the
+  next scan. A key reached only through a smart-card reader now shows
+  FIDO2? unless its FIDO applet reports FIDO2. ([#215])
+- **`doctor` no longer calls a Token2 FIDO key's reader a Molto2.** It tagged
+  every reader with "TOKEN2" in its name "(Molto2)"; only a Molto2's reader
+  gets the tag now. ([#216])
+- **A Nitrokey 3 is called "Nitrokey 3", not "3".** The CLI's target line,
+  the app's key header and the lists that ask which key to use showed only
+  "3". ([#216])
+- **Without administrator rights on Windows, "no key" errors say why.**
+  `fido info` and `otp --transport hid` said no key was connected when a
+  FIDO key was plugged in. Windows only lets a program running as
+  administrator open a key's FIDO USB side, and the error now says so, as
+  `list` already did. ([#216])
+- **`fido info --reader` and `fido reset --reader` name the reader they use.**
+  The target line showed the key's USB path instead. `fido reset --reader`
+  now checks the reader before asking to confirm: it gives the same error
+  as `fido info --reader` when the reader's card has no FIDO side, and on
+  Windows without administrator rights it says administrator rights are
+  needed. ([#217])
+- **`fido info` shows a Nitrokey 3's firmware version.** It printed 0.0.0,
+  the number the key gives over USB; keyroost now reads the real version
+  from the key, as the app already did. ([#217])
+- **`otp code` asks for a touch through a smart-card reader too.** For an
+  entry saved with `--touch`, it waited silently for the touch when it went
+  through the key's reader; it now says to touch the key, as it does over
+  USB. ([#217])
+- **The On-device OTP tab fits a narrow window.** The add-entry form broke
+  its labels mid-word, the secret field ran past the edge, and the tab's
+  buttons covered its title. The buttons now move under the title when there
+  is no room. ([#217])
+- **Importing from a .p12 file names the key by its certificate.** A file
+  exported by Windows showed an internal name such as `te-` followed by a
+  long code; the import now shows the certificate's name instead. ([#217])
+- **A factory reset asks for the touch that erasing OTP entries needs.** On a
+  Token2 key the reset's OTP step waited silently for a button press and then
+  failed with "timed out waiting for a button press on the key". The app's
+  Factory reset card now says to touch the key while the reset runs, and
+  `keyroostctl factory-reset` prints a touch line over a smart-card reader
+  too. ([#218])
+- **Forced PIN changes no longer block unlocking.** When a FIDO key
+  requires a PIN change, the app opens the change-PIN form instead of failing
+  with a PIN policy error. After the change, the key can be unlocked with the
+  new PIN. CLI commands that need a PIN token now ask for a PIN change first
+  instead of reporting a misleading new-PIN complexity error. ([#220])
+- **Idle locking clears every PIN draft.** Current, new, and confirmation
+  PINs left in the change-PIN form are now wiped after inactivity, including
+  when setting a first PIN. ([#222])
+- **"Always require user verification" is only offered on keys that report
+  it.** Pressing Toggle on a key without the `alwaysUv` option failed with
+  "authenticator returned CTAP2 status 0x02". The app now leaves the row
+  out for such keys, and `fido config always-uv` says the key doesn't
+  support it. ([#224])
+- **keyroost asks for a touch wherever the key needs one.** Over USB, the
+  CLI and the app now say "touch your key" whenever the key reports it is
+  waiting for a touch. Over a smart-card connection they say so up front
+  where a touch is known or possible: `oath code` and `oath delete` on a
+  touch account, the factory reset's OATH step, OpenPGP key import and
+  backup restore, and Nitrokey 3 code replacement. The app's banner
+  follows the key, and no longer appears while unlocking. ([#225])
+- **The idle lock also closes what a typed password opened.** A file read
+  for import, an OpenPGP key set made or read from a backup, and a .p12
+  key now start the idle clock, and the dialog holding them closes when it
+  runs out, saying why. The On-device OTP PIN boxes clear their typed
+  history like every other secret box. ([#226])
+- **Enterprise attestation and the minimum PIN length are offered only on
+  keys that support them.** The app's FIDO2 Settings show those rows only
+  where the key lists them, and `keyroostctl` refuses before asking for
+  the PIN, as it already did for Always UV. ([#227])
+- **Each key's firmware is shown the way its maker states it.** A Solo 2
+  showed 2.3.196 for firmware 2.964, and a Token2 PIN+ showed 2.1.2; it now
+  shows its release (for example "R3.4"), named from its serial number as
+  Token2 publishes. In `keyroostctl fido info` and the app's key header;
+  `fido --json info` gives `firmware: null` when a key doesn't say. ([#228])
+
+### Security
+- **Authenticator debug traces no longer show account names or codes.**
+  `keyroostctl --debug` and the app's APDU trace showed the Authenticator's
+  account names (in hex) and current codes when listing or reading codes.
+  Those parts are now hidden, like seeds and passwords already were; the
+  status words stay, which is what a bug report needs. Traces get pasted
+  into public issues, and an account list tells which services someone
+  uses. ([#206])
+- **Newer elliptic-curve crates for P-256, P-384 and secp256k1.** The FIDO2
+  PIN protocol, Token2 OTP seed encryption, OpenPGP key generation and
+  signing, and the PIV self-test now use the RustCrypto elliptic-curve 0.14
+  crates, which clears RUSTSEC-2026-0387, a timing-variability advisory for
+  crypto-bigint 0.5. keyroost behaves the same. Building the libraries and
+  the CLI from source now needs Rust 1.87 or newer (it was 1.85), because
+  the fixed crypto-bigint and ctutils require it; the GUI still needs 1.92.
+  ([#212])
+
 ## [0.14.0] - 2026-10-19
 
 ### Added
@@ -1729,6 +2003,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#151]: https://github.com/framefilter/keyroost/issues/151
 [#152]: https://github.com/framefilter/keyroost/issues/152
 [#154]: https://github.com/framefilter/keyroost/issues/154
+[#155]: https://github.com/framefilter/keyroost/issues/155
 [#157]: https://github.com/framefilter/keyroost/issues/157
 [#160]: https://github.com/framefilter/keyroost/issues/160
 [#161]: https://github.com/framefilter/keyroost/issues/161
@@ -1739,6 +2014,7 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#167]: https://github.com/framefilter/keyroost/issues/167
 [#170]: https://github.com/framefilter/keyroost/issues/170
 [#171]: https://github.com/framefilter/keyroost/issues/171
+[#174]: https://github.com/framefilter/keyroost/issues/174
 [#176]: https://github.com/framefilter/keyroost/issues/176
 [#177]: https://github.com/framefilter/keyroost/issues/177
 [#184]: https://github.com/framefilter/keyroost/issues/184
@@ -1747,7 +2023,32 @@ multi-vendor hardware-security-key manager, then took its neutral name. Highligh
 [#189]: https://github.com/framefilter/keyroost/issues/189
 [#190]: https://github.com/framefilter/keyroost/issues/190
 [#195]: https://github.com/framefilter/keyroost/issues/195
-[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.14.0...HEAD
+[#199]: https://github.com/framefilter/keyroost/issues/199
+[#200]: https://github.com/framefilter/keyroost/issues/200
+[#201]: https://github.com/framefilter/keyroost/issues/201
+[#202]: https://github.com/framefilter/keyroost/issues/202
+[#203]: https://github.com/framefilter/keyroost/issues/203
+[#204]: https://github.com/framefilter/keyroost/issues/204
+[#205]: https://github.com/framefilter/keyroost/issues/205
+[#206]: https://github.com/framefilter/keyroost/issues/206
+[#208]: https://github.com/framefilter/keyroost/issues/208
+[#211]: https://github.com/framefilter/keyroost/issues/211
+[#212]: https://github.com/framefilter/keyroost/issues/212
+[#215]: https://github.com/framefilter/keyroost/issues/215
+[#216]: https://github.com/framefilter/keyroost/issues/216
+[#217]: https://github.com/framefilter/keyroost/issues/217
+[#218]: https://github.com/framefilter/keyroost/issues/218
+[#220]: https://github.com/framefilter/keyroost/issues/220
+[#221]: https://github.com/framefilter/keyroost/issues/221
+[#222]: https://github.com/framefilter/keyroost/issues/222
+[#223]: https://github.com/framefilter/keyroost/issues/223
+[#224]: https://github.com/framefilter/keyroost/issues/224
+[#225]: https://github.com/framefilter/keyroost/issues/225
+[#226]: https://github.com/framefilter/keyroost/issues/226
+[#227]: https://github.com/framefilter/keyroost/issues/227
+[#228]: https://github.com/framefilter/keyroost/issues/228
+[Unreleased]: https://github.com/framefilter/keyroost/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/framefilter/keyroost/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/framefilter/keyroost/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/framefilter/keyroost/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/framefilter/keyroost/compare/v0.11.0...v0.12.0
