@@ -820,6 +820,13 @@ struct ChangePinDialog {
     confirm: String,
 }
 
+impl ChangePinDialog {
+    /// A first-time PIN form has no current PIN, so every draft field counts.
+    fn has_pin_input(&self) -> bool {
+        !self.old.is_empty() || !self.new.is_empty() || !self.confirm.is_empty()
+    }
+}
+
 impl Drop for ChangePinDialog {
     /// Zeroize the typed PINs whenever the dialog is dropped — including the
     /// `= ChangePinDialog::default()` resets on cancel/success — so a typed
@@ -5876,13 +5883,11 @@ impl App {
     }
 
     /// Whether the app holds anything [`Self::idle_lock`] would clear: an
-    /// unlocked FIDO session (with its PIN), a retained OATH password or OTP
-    /// PIN, or displayed OATH / OTP codes.
+    /// unlocked FIDO session (with its PIN), a PIN draft in the change-PIN
+    /// form, a retained OATH password or OTP PIN, or displayed OATH / OTP codes.
     fn holds_unlocked_secrets(&self) -> bool {
         self.security_keys.session.is_some()
-            // The current PIN in an open change-PIN form, also when a forced
-            // PIN change carried it over from the unlock field.
-            || !self.security_keys.change_pin.old.is_empty()
+            || self.security_keys.change_pin.has_pin_input()
             || self.oath.unlocked_password.is_some()
             || self.oath.creds.iter().any(|r| r.code.is_some())
             || self.otp.pin.is_some()
@@ -5937,15 +5942,16 @@ impl App {
 
     /// Lock what [`Self::holds_unlocked_secrets`] reports, after
     /// [`IDLE_LOCK_AFTER`] without input: the FIDO session through the same
-    /// path as the Lock button, the retained OATH password and OTP PIN (a
-    /// protected applet goes back to its unlock prompt, as after a rejected
-    /// password), and every displayed code. Local only — no device I/O.
+    /// path as the Lock button, PIN drafts in the change-PIN form, the
+    /// retained OATH password and OTP PIN (a protected applet goes back to
+    /// its unlock prompt, as after a rejected password), and every displayed
+    /// code. Local only — no device I/O.
     fn idle_lock(&mut self) {
         if self.security_keys.session.is_some() {
             self.lock_session();
             self.security_keys.error = Some(idle_locked_msg());
         }
-        if !self.security_keys.change_pin.old.is_empty() {
+        if self.security_keys.change_pin.has_pin_input() {
             // Replacing the form wipes its PINs (ChangePinDialog's Drop).
             self.security_keys.change_pin = ChangePinDialog::default();
             self.security_keys.error = Some(idle_locked_msg());
@@ -31733,7 +31739,7 @@ mod tests {
     }
 
     /// A forced PIN change carries the typed PIN into the change-PIN form;
-    /// left there, the idle lock closes the form and wipes it.
+    /// left there, the idle lock closes the form and wipes every draft.
     #[test]
     fn idle_lock_wipes_a_pin_left_in_the_change_pin_form() {
         let mut app = App::default();
@@ -31741,14 +31747,47 @@ mod tests {
             Box::new(keyroost_ctap::CtapError::PinChangeRequired),
             zeroize::Zeroizing::new("current-pin".into()),
         );
+        app.security_keys.change_pin.new = "new-pin".into();
+        app.security_keys.change_pin.confirm = "new-pin".into();
         assert!(app.holds_unlocked_secrets());
         let t0 = std::time::Instant::now();
         app.idle_lock_tick(t0, false);
         app.idle_lock_tick(t0 + IDLE_LOCK_AFTER, false);
         assert!(!app.security_keys.change_pin.open);
         assert!(app.security_keys.change_pin.old.is_empty());
+        assert!(app.security_keys.change_pin.new.is_empty());
+        assert!(app.security_keys.change_pin.confirm.is_empty());
         assert_eq!(app.security_keys.error, Some(idle_locked_msg()));
         assert!(!app.holds_unlocked_secrets());
+    }
+
+    /// Any draft field is enough to start the idle clock. In particular, a
+    /// first-time PIN form has only new-PIN fields, not a current PIN.
+    #[test]
+    fn idle_lock_wipes_new_pin_drafts_without_a_current_pin() {
+        for (case, old, new, confirm) in [
+            ("new PIN only", "", "new-pin", ""),
+            ("confirmation only", "", "", "new-pin"),
+            ("first-time PIN", "", "new-pin", "new-pin"),
+        ] {
+            let mut app = App::default();
+            app.security_keys.change_pin = ChangePinDialog {
+                open: true,
+                old: old.into(),
+                new: new.into(),
+                confirm: confirm.into(),
+            };
+            assert!(app.holds_unlocked_secrets(), "{case}");
+            let t0 = std::time::Instant::now();
+            app.idle_lock_tick(t0, false);
+            app.idle_lock_tick(t0 + IDLE_LOCK_AFTER, false);
+            assert!(!app.security_keys.change_pin.open, "{case}");
+            assert!(app.security_keys.change_pin.old.is_empty(), "{case}");
+            assert!(app.security_keys.change_pin.new.is_empty(), "{case}");
+            assert!(app.security_keys.change_pin.confirm.is_empty(), "{case}");
+            assert_eq!(app.security_keys.error, Some(idle_locked_msg()), "{case}");
+            assert!(!app.holds_unlocked_secrets(), "{case}");
+        }
     }
 
     /// A window whose frames stopped while minimized locks on the first
