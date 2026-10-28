@@ -13386,6 +13386,10 @@ fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
             let src = Source::from_flag(pin.as_ref());
             sec.check(&FIDO_PIN, src)?;
             let dev = crate::target::select_fido(path.as_deref())?;
+            let info = fido_info_before_pin(&dev)?;
+            if let Some(refusal) = config_unsupported(&info, ConfigSetting::MinPinLength) {
+                return Err(refusal.into());
+            }
             let pin = confirm_then_read_pin(
                 &mut crate::prompt::RealTerm,
                 &mut sec,
@@ -13412,7 +13416,18 @@ fn run_fido_pin(cmd: &FidoPinCmd) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         FidoPinCmd::ForceChange { pin, path } => {
-            let pin = fido_pin(path.as_deref(), pin.as_ref())?;
+            // As `fido_pin`, with the support check between the source check
+            // (a missing source is refused before any device I/O) and the PIN.
+            let mut sec = Secrets::real();
+            let src = Source::from_flag(pin.as_ref());
+            sec.check(&FIDO_PIN, src)?;
+            let dev = crate::target::select_fido(path.as_deref())?;
+            let info = fido_info_before_pin(&dev)?;
+            if let Some(refusal) = config_unsupported(&info, ConfigSetting::MinPinLength) {
+                return Err(refusal.into());
+            }
+            let pin = sec.read(&FIDO_PIN, src)?;
+            fido_reverify_if_prompted(&sec, &dev)?;
             with_configurator(path.as_deref(), &pin, |cfg, _info| {
                 cfg.force_pin_change()?;
                 println!("A PIN change is now required on next use of this key.");
@@ -13546,13 +13561,7 @@ fn run_fido_always_uv(
     let word = if want_on { "on" } else { "off" };
     // Read the state first (no PIN needed), so a key already in the
     // wanted state is never asked for its PIN.
-    let current = {
-        let (mut hid, init) = open_ctap_hid(&crate::target::hid_path_of(&dev)?)?;
-        if !init.supports_cbor() {
-            return Err("device is U2F-only; CTAP2 authenticatorConfig not supported".into());
-        }
-        keyroost_ctap::get_info(&mut hid)?
-    };
+    let current = fido_info_before_pin(&dev)?;
     let already = || {
         println!("\"Always require user verification\" is already {word}; nothing was changed.");
     };
@@ -13575,6 +13584,51 @@ fn run_fido_always_uv(
     })
 }
 
+/// The key's getInfo, read before any question or PIN (it needs none), so a
+/// setting the key doesn't offer is refused before anything is asked.
+fn fido_info_before_pin(
+    dev: &keyroost_resolve::Device,
+) -> Result<keyroost_ctap::AuthenticatorInfo, Box<dyn std::error::Error>> {
+    let (mut hid, init) = open_ctap_hid(&crate::target::hid_path_of(dev)?)?;
+    if !init.supports_cbor() {
+        return Err("device is U2F-only; CTAP2 authenticatorConfig not supported".into());
+    }
+    Ok(keyroost_ctap::get_info(&mut hid)?)
+}
+
+/// The refusal for a config setting `info` says the key doesn't offer, or
+/// `None`. Enterprise attestation is offered when `ep` is present (on or
+/// off); the minimum PIN length and a forced PIN change when
+/// `setMinPINLength` is true.
+fn config_unsupported(
+    info: &keyroost_ctap::AuthenticatorInfo,
+    setting: ConfigSetting,
+) -> Option<String> {
+    if info.option("authnrCfg") != Some(true) {
+        return Some(
+            "this key does not support authenticatorConfig (authnrCfg); nothing was changed".into(),
+        );
+    }
+    let (offered, what, option) = match setting {
+        ConfigSetting::EnterpriseAttestation => {
+            (info.option("ep").is_some(), "enterprise attestation", "ep")
+        }
+        ConfigSetting::MinPinLength => (
+            info.option("setMinPINLength") == Some(true),
+            "a minimum PIN length or a forced PIN change",
+            "setMinPINLength",
+        ),
+    };
+    (!offered).then(|| format!("this key does not support {what} ({option}); nothing was changed"))
+}
+
+/// The config settings [`config_unsupported`] checks.
+#[derive(Clone, Copy)]
+enum ConfigSetting {
+    EnterpriseAttestation,
+    MinPinLength,
+}
+
 fn run_fido_config(cmd: &FidoConfigCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         FidoConfigCmd::AlwaysUv {
@@ -13590,6 +13644,10 @@ fn run_fido_config(cmd: &FidoConfigCmd) -> Result<(), Box<dyn std::error::Error>
             let src = Source::from_flag(pin.as_ref());
             sec.check(&FIDO_PIN, src)?;
             let dev = crate::target::select_fido(path.as_deref())?;
+            let info = fido_info_before_pin(&dev)?;
+            if let Some(refusal) = config_unsupported(&info, ConfigSetting::EnterpriseAttestation) {
+                return Err(refusal.into());
+            }
             let pin = confirm_then_read_pin(
                 &mut crate::prompt::RealTerm,
                 &mut sec,
@@ -15813,6 +15871,40 @@ mod otp_capability_tests {
 mod cli_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn config_settings_a_key_does_not_offer_are_refused_up_front() {
+        let info = |options: &[(&str, bool)]| keyroost_ctap::AuthenticatorInfo {
+            options: std::iter::once(("authnrCfg".to_string(), true))
+                .chain(options.iter().map(|(k, v)| (k.to_string(), *v)))
+                .collect(),
+            ..Default::default()
+        };
+        // No authenticatorConfig at all: nothing is offered.
+        let bare = keyroost_ctap::AuthenticatorInfo {
+            options: vec![("ep".into(), false), ("setMinPINLength".into(), true)],
+            ..Default::default()
+        };
+        assert!(
+            config_unsupported(&bare, ConfigSetting::EnterpriseAttestation)
+                .is_some_and(|r| r.contains("authnrCfg"))
+        );
+        let ea = ConfigSetting::EnterpriseAttestation;
+        let min = ConfigSetting::MinPinLength;
+        let refusal = config_unsupported(&info(&[]), ea).unwrap();
+        assert!(
+            refusal.contains("does not support enterprise attestation"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("nothing was changed"), "{refusal}");
+        // `ep` present, on or off, is supported.
+        assert!(config_unsupported(&info(&[("ep", false)]), ea).is_none());
+        assert!(config_unsupported(&info(&[("ep", true)]), ea).is_none());
+        // setMinPINLength must be true.
+        assert!(config_unsupported(&info(&[]), min).is_some());
+        assert!(config_unsupported(&info(&[("setMinPINLength", false)]), min).is_some());
+        assert!(config_unsupported(&info(&[("setMinPINLength", true)]), min).is_none());
+    }
 
     #[test]
     fn an_oath_account_needs_a_touch_when_the_listing_or_calculate_all_says_so() {
