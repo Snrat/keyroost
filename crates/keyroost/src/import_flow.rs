@@ -1253,7 +1253,12 @@ impl App {
                             &mut s,
                             OathFamily::from_vendor(&vendor, version),
                         )
-                        .password_hint(OATH_PASSWORD_HINT);
+                        .password_hint(OATH_PASSWORD_HINT)
+                        // Replacing deletes the old entry first; a Nitrokey 3
+                        // asks for a touch on every delete.
+                        .touch_wait(|on| {
+                            crate::KEY_WANTS_TOUCH.store(on, std::sync::atomic::Ordering::Relaxed);
+                        });
                         let report =
                             keyroost_import::run::run(&file, &again, &mut w, &mut on_progress);
                         let line = report.summary(&again);

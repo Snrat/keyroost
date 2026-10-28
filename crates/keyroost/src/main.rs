@@ -2732,12 +2732,10 @@ fn job_waits_for_touch(label: &str) -> bool {
 
 /// Set from the worker when the key reports over USB that it is waiting for
 /// a touch (CTAPHID KEEPALIVE, user presence needed; the Token2 OTP button
-/// wait). Cleared when a job starts and when the last one ends.
+/// wait), or while an import's delete waits on one (a Nitrokey 3). Cleared
+/// when a job starts and when the last one ends.
 static KEY_WANTS_TOUCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// What the touch banner says while a job runs, or `None` for no banner: the
-/// job's own label when it asks for a touch, else a plain prompt once the key
-/// itself reports it is waiting for one.
 /// The busy label for deleting an Authenticator account: it asks for a touch
 /// when the applet wants one for every delete (a Nitrokey 3) or the account
 /// requires one.
@@ -2749,6 +2747,9 @@ fn oath_delete_label(applet_asks: bool, touch_account: bool) -> &'static str {
     }
 }
 
+/// What the touch banner says while a job runs, or `None` for no banner: the
+/// job's own label when it asks for a touch, else a plain prompt once the key
+/// itself reports it is waiting for one.
 fn touch_prompt(label: Option<&str>, busy: bool, key_wants_touch: bool) -> Option<String> {
     if !busy {
         return None;
@@ -7550,8 +7551,10 @@ impl App {
             // Set when YubiKey 4 firmware 4.0–4.3.4 must not get this name
             // (the same check as `oath add` and the import plan).
             let mut refused: Option<String> = None;
+            let mut asks = false;
             let result = (|| -> Result<(Vec<OathRow>, usize), TransportError> {
                 let mut session = Self::oath_open_unlock(&name, &password)?;
+                asks = session.asks_touch_to_delete();
                 let family =
                     keyroost_import::plan::OathFamily::from_vendor(&vendor, session.version());
                 if family.prefix_issue() {
@@ -7578,6 +7581,9 @@ impl App {
             })();
             Box::new(move |app: &mut App| {
                 if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    if result.is_ok() {
+                        app.oath.delete_asks_touch = asks;
+                    }
                     Self::apply_oath_rows(app, result, password);
                     if let Some(why) = refused.filter(|_| app.oath.add.open) {
                         app.oath.add.result = Some(Err(why));
@@ -7602,13 +7608,18 @@ impl App {
         // may for a touch account.
         let label = oath_delete_label(self.oath.delete_asks_touch, touch.contains(&cred_name));
         self.spawn_job(label, move || {
+            let mut asks = false;
             let result = (|| -> Result<(Vec<OathRow>, usize), TransportError> {
                 let mut session = Self::oath_open_unlock(&reader, &password)?;
+                asks = session.asks_touch_to_delete();
                 session.delete(&cred_name)?;
                 Self::oath_list_rows(&mut session, &touch)
             })();
             Box::new(move |app: &mut App| {
                 if completion_still_valid(for_device.as_ref(), app.selected_device.as_ref()) {
+                    if result.is_ok() {
+                        app.oath.delete_asks_touch = asks;
+                    }
                     Self::apply_oath_rows(app, result, password);
                 }
             })

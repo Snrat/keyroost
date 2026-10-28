@@ -80,6 +80,26 @@ pub struct OathImportStore<'a> {
     session: &'a mut OathSession,
     family: OathFamily,
     password_hint: &'static str,
+    touch_wait: Option<TouchWait<'a>>,
+}
+
+/// Told `true` just before a command the key will wait on a touch for, and
+/// `false` once it has answered: a replacing import deletes the old entry,
+/// and a Nitrokey 3 asks for a touch on every delete.
+pub type TouchWait<'a> = Box<dyn FnMut(bool) + 'a>;
+
+/// Run `f`, bracketed by `wait(true)` / `wait(false)` when the key asks for a
+/// touch for it.
+fn waiting_for_touch<T>(asks: bool, wait: Option<&mut TouchWait<'_>>, f: impl FnOnce() -> T) -> T {
+    match wait {
+        Some(w) if asks => {
+            w(true);
+            let out = f();
+            w(false);
+            out
+        }
+        _ => f(),
+    }
 }
 
 /// What [`OathImportStore`] tells a person to do when the applet turns out
@@ -96,7 +116,15 @@ impl<'a> OathImportStore<'a> {
             session,
             family,
             password_hint: DEFAULT_PASSWORD_HINT,
+            touch_wait: None,
         }
+    }
+
+    /// How this front end says "touch the key" while a replacing import's
+    /// delete waits for one (see [`TouchWait`]).
+    pub fn touch_wait(mut self, wait: impl FnMut(bool) + 'a) -> Self {
+        self.touch_wait = Some(Box::new(wait));
+        self
     }
 
     /// How this front end gives the applet password, for the report when
@@ -113,7 +141,11 @@ impl CodeStore for OathImportStore<'_> {
         oath_add(self.session, self.family, self.password_hint, name, entry)
     }
     fn delete(&mut self, name: &StoredName) -> Result<(), StoreError> {
-        oath_delete(self.session, self.password_hint, name)
+        let asks = self.session.asks_touch_to_delete();
+        let (session, hint) = (&mut *self.session, self.password_hint);
+        waiting_for_touch(asks, self.touch_wait.as_mut(), || {
+            oath_delete(session, hint, name)
+        })
     }
 }
 
@@ -697,6 +729,21 @@ mod tests {
     use keyroost_import::run::{run, Outcome};
     use std::collections::VecDeque;
     use zeroize::Zeroizing;
+
+    /// A delete the key waits on a touch for is bracketed by the front end's
+    /// "touch the key" on and off; one it doesn't, or with no front end
+    /// listening, runs as is.
+    #[test]
+    fn a_touch_wait_brackets_only_the_deletes_that_ask() {
+        let mut seen = Vec::new();
+        {
+            let mut wait: TouchWait<'_> = Box::new(|on| seen.push(on));
+            assert_eq!(waiting_for_touch(true, Some(&mut wait), || 7), 7);
+            assert_eq!(waiting_for_touch(false, Some(&mut wait), || 8), 8);
+        }
+        assert_eq!(seen, vec![true, false]);
+        assert_eq!(waiting_for_touch(true, None, || 9), 9);
+    }
 
     #[test]
     fn oath_put_6983_is_exists() {

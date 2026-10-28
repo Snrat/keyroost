@@ -468,7 +468,15 @@ fn to_oath(
     let mut session = open_oath_unlocked(&reader, pw, debug)?;
     let again = plan_for(file, store, read_oath_existing(&mut session)?, replace);
     recheck(&first, &again)?;
-    let mut writer = OathImportStore::new(&mut session, family).password_hint(OATH_PASSWORD_HINT);
+    // Replacing deletes the old entry first; a Nitrokey 3 asks for a touch
+    // on every delete.
+    let mut writer = OathImportStore::new(&mut session, family)
+        .password_hint(OATH_PASSWORD_HINT)
+        .touch_wait(|on| {
+            if on {
+                crate::prompt::touch("Replacing \u{2014} touch the key if it blinks\u{2026}");
+            }
+        });
     write_and_report(file, &again, &mut writer)
 }
 
