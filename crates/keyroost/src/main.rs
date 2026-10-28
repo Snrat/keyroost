@@ -5713,12 +5713,13 @@ impl App {
     ) {
         // CTAP 2.1 §7.4.2: forcePINChange requires a PIN change *before* either
         // getPinToken variant. Usually getInfo lets open_and_unlock stop before
-        // asking for a token; the 0x37 fallback covers authenticators that only
-        // report the requirement when the token request itself is attempted.
+        // asking for a token; the token-request fallback covers authenticators
+        // that only report the requirement when the request itself is attempted.
         let pin_change_required = error.downcast_ref::<ForcedPinChange>().is_some()
             || matches!(
                 error.downcast_ref::<keyroost_ctap::CtapError>(),
-                Some(keyroost_ctap::CtapError::StatusCode(0x37))
+                Some(keyroost_ctap::CtapError::PinChangeRequired)
+                    | Some(keyroost_ctap::CtapError::StatusCode(0x37))
             );
         if pin_change_required {
             if let Some(info) = self.security_keys.info.as_mut() {
@@ -28363,20 +28364,26 @@ mod tests {
 
     /// A forced-PIN-change rejection during unlock must open the change-PIN
     /// form with the current PIN preserved, not report a misleading new-PIN
-    /// complexity failure and leave the user at the same unlock prompt.
+    /// complexity failure and leave the user at the same unlock prompt. Cover
+    /// both the shared typed error and the raw status used by the GUI fallback.
     #[test]
     fn pin_policy_violation_during_unlock_requests_pin_change() {
-        let mut app = App::default();
-        app.fail_unlock(
-            Box::new(keyroost_ctap::CtapError::StatusCode(0x37)),
-            zeroize::Zeroizing::new("current-pin".into()),
-        );
+        for error in [
+            keyroost_ctap::CtapError::PinChangeRequired,
+            keyroost_ctap::CtapError::StatusCode(0x37),
+        ] {
+            let mut app = App::default();
+            app.fail_unlock(
+                Box::new(error),
+                zeroize::Zeroizing::new("current-pin".into()),
+            );
 
-        assert!(app.security_keys.change_pin.open);
-        assert_eq!(app.security_keys.change_pin.old, "current-pin");
-        assert!(app.security_keys.change_pin.new.is_empty());
-        assert!(app.security_keys.change_pin.confirm.is_empty());
-        assert_eq!(app.security_keys.error, None);
+            assert!(app.security_keys.change_pin.open);
+            assert_eq!(app.security_keys.change_pin.old, "current-pin");
+            assert!(app.security_keys.change_pin.new.is_empty());
+            assert!(app.security_keys.change_pin.confirm.is_empty());
+            assert_eq!(app.security_keys.error, None);
+        }
     }
 
     /// The getInfo-driven early exit reaches the same form and updates the

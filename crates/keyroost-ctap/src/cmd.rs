@@ -28,6 +28,10 @@ pub enum CtapError {
     /// commonest cases are `0x30` (CTAP2_ERR_NOT_ALLOWED — e.g. reset
     /// outside the touch window) and `0x2F` (CTAP2_ERR_USER_ACTION_TIMEOUT).
     StatusCode(u8),
+    /// The authenticator requires a PIN change before it will issue a
+    /// pinUvAuthToken. This can be known from GetInfo or reported by a token
+    /// request as CTAP2_ERR_PIN_POLICY_VIOLATION (0x37).
+    PinChangeRequired,
     EmptyResponse,
     InvalidResponseShape(&'static str),
     /// A caller-supplied argument was rejected before anything was sent to
@@ -77,6 +81,9 @@ impl std::fmt::Display for CtapError {
                 ),
                 (None, None) => write!(f, "authenticator returned CTAP2 status 0x{:02X}", c),
             },
+            CtapError::PinChangeRequired => {
+                write!(f, "the key requires a PIN change before this operation")
+            }
             CtapError::EmptyResponse => write!(f, "authenticator returned an empty CBOR response"),
             CtapError::InvalidResponseShape(s) => {
                 write!(f, "authenticator response had wrong shape: {}", s)
