@@ -986,7 +986,9 @@ a script, use `--json` where a command has it.
 Breaking changes are tracked per release on the site's
 [migration notes](https://framefilter.github.io/keyroost/migration.html)
 page, with the exact before → after for scripts and library consumers.
-**v0.15.0** has no command or flag changes; `piv --json info` now reports
+**v0.15.0** renames no command or flag; a PIN or touch policy on a
+Nitrokey 3 is now refused without `--force`, Rust 1.87 is the new floor, and
+`piv --json info` now reports
 `"applet_fingerprint": "Trussed::Nitrokey"` (was `Trussed::NitroKey`), and
 `fido --json info`'s `firmware` is the vendor's own string (a Solo 2's
 `2.964`, a Token2's `R3.4`) or `null`. Library users: see the migration page.
