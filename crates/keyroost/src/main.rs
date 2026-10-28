@@ -5831,6 +5831,9 @@ impl App {
     /// PIN, or displayed OATH / OTP codes.
     fn holds_unlocked_secrets(&self) -> bool {
         self.security_keys.session.is_some()
+            // The current PIN in an open change-PIN form, also when a forced
+            // PIN change carried it over from the unlock field.
+            || !self.security_keys.change_pin.old.is_empty()
             || self.oath.unlocked_password.is_some()
             || self.oath.creds.iter().any(|r| r.code.is_some())
             || self.otp.pin.is_some()
@@ -5891,6 +5894,11 @@ impl App {
     fn idle_lock(&mut self) {
         if self.security_keys.session.is_some() {
             self.lock_session();
+            self.security_keys.error = Some(idle_locked_msg());
+        }
+        if !self.security_keys.change_pin.old.is_empty() {
+            // Replacing the form wipes its PINs (ChangePinDialog's Drop).
+            self.security_keys.change_pin = ChangePinDialog::default();
             self.security_keys.error = Some(idle_locked_msg());
         }
 
@@ -31389,6 +31397,25 @@ mod tests {
             .info
             .as_deref()
             .is_some_and(|m| m.starts_with(&idle_hidden_msg())));
+        assert!(!app.holds_unlocked_secrets());
+    }
+
+    /// A forced PIN change carries the typed PIN into the change-PIN form;
+    /// left there, the idle lock closes the form and wipes it.
+    #[test]
+    fn idle_lock_wipes_a_pin_left_in_the_change_pin_form() {
+        let mut app = App::default();
+        app.fail_unlock(
+            Box::new(keyroost_ctap::CtapError::PinChangeRequired),
+            zeroize::Zeroizing::new("current-pin".into()),
+        );
+        assert!(app.holds_unlocked_secrets());
+        let t0 = std::time::Instant::now();
+        app.idle_lock_tick(t0, false);
+        app.idle_lock_tick(t0 + IDLE_LOCK_AFTER, false);
+        assert!(!app.security_keys.change_pin.open);
+        assert!(app.security_keys.change_pin.old.is_empty());
+        assert_eq!(app.security_keys.error, Some(idle_locked_msg()));
         assert!(!app.holds_unlocked_secrets());
     }
 
