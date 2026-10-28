@@ -18413,16 +18413,14 @@ impl App {
                         });
                     };
 
-                    row(
-                        ui,
-                        "Always require user verification",
-                        match always_uv {
-                            Some(true) => "On".to_string(),
-                            Some(false) => "Off".to_string(),
-                            None => "\u{2014}".to_string(),
-                        },
-                    );
-                    ui.add_space(4.0);
+                    if let Some(always_uv) = always_uv {
+                        row(
+                            ui,
+                            "Always require user verification",
+                            if always_uv { "On" } else { "Off" }.to_string(),
+                        );
+                        ui.add_space(4.0);
+                    }
                     row(
                         ui,
                         "Minimum PIN length",
@@ -19926,37 +19924,38 @@ impl App {
             // Each row: a description + a button that arms the confirm dialog.
             let mut arm: Option<AdvancedAction> = None;
 
-            // Always-UV (reversible toggle).
-            self.adaptive_row(
-                ui,
-                |_, ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new("Always require user verification")
-                                .font(theme::f_sb(13.0))
-                                .color(p.txt),
-                        );
-                        let state = match always_uv {
-                            Some(true) => {
+            // Always-UV (reversible toggle) — only shown when the key
+            // advertises the feature through the `alwaysUv` getInfo option.
+            if let Some(always_uv) = always_uv {
+                self.adaptive_row(
+                    ui,
+                    |_, ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new("Always require user verification")
+                                    .font(theme::f_sb(13.0))
+                                    .color(p.txt),
+                            );
+                            let state = if always_uv {
                                 "Currently on \u{2014} every sign-in needs PIN or biometric."
-                            }
-                            Some(false) => "Currently off.",
-                            None => "State unknown.",
-                        };
-                        ui.label(
-                            egui::RichText::new(state)
-                                .font(theme::f_reg(11.5))
-                                .color(p.txt3),
-                        );
-                    });
-                },
-                |_, ui| {
-                    if theme::button(ui, p, BtnKind::Default, "Toggle").clicked() {
-                        arm = Some(AdvancedAction::ToggleAlwaysUv);
-                    }
-                },
-            );
-            ui.add_space(8.0);
+                            } else {
+                                "Currently off."
+                            };
+                            ui.label(
+                                egui::RichText::new(state)
+                                    .font(theme::f_reg(11.5))
+                                    .color(p.txt3),
+                            );
+                        });
+                    },
+                    |_, ui| {
+                        if theme::button(ui, p, BtnKind::Default, "Toggle").clicked() {
+                            arm = Some(AdvancedAction::ToggleAlwaysUv);
+                        }
+                    },
+                );
+                ui.add_space(8.0);
+            }
 
             // Set minimum PIN length (one-way).
             self.adaptive_row(
@@ -28479,6 +28478,73 @@ mod tests {
             .log
             .iter()
             .any(|l| l.text.contains("no longer the one selected")));
+    }
+
+    #[test]
+    fn always_uv_row_follows_advertised_support() {
+        fn collect_text(shape: &egui::Shape, text: &mut String) {
+            match shape {
+                egui::Shape::Text(text_shape) => {
+                    text.push_str(text_shape.galley.text());
+                    text.push('\n');
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let ctx = egui::Context::default();
+        crate::ui::theme::install_fonts(&ctx);
+        let palette = Palette::new(Mode::Dark, Palette::ACCENTS[0], false);
+        for advertised in [None, Some(false), Some(true)] {
+            let mut options = vec![("authnrCfg".into(), true)];
+            if let Some(enabled) = advertised {
+                options.push(("alwaysUv".into(), enabled));
+            }
+            let mut app = App {
+                security_keys: SecurityKeysState {
+                    info: Some(AuthenticatorInfo {
+                        options,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.render_fido_advanced(ui, &palette);
+                });
+            });
+            let mut text = String::new();
+            for clipped in output.shapes {
+                collect_text(&clipped.shape, &mut text);
+            }
+
+            match advertised {
+                None => assert!(!text.contains("Always require user verification")),
+                Some(enabled) => {
+                    assert!(text.contains("Always require user verification"));
+                    let state = if enabled {
+                        "Currently on"
+                    } else {
+                        "Currently off"
+                    };
+                    assert!(text.contains(state), "missing {state:?} in {text:?}");
+                }
+            }
+        }
     }
 
     /// #81: the Settings tab (home of the only Reset path) must exist for any
