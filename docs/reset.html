@@ -78,7 +78,8 @@
         register a replacement. <a href="fido2.html">FIDO2 →</a></li>
       <li><strong>OATH</strong> — removes all stored TOTP/HOTP seeds and clears the applet
         password. It needs no password to run, which makes it the only way back from a
-        forgotten one. You'll need each service's setup secret/QR again.
+        forgotten one. On a Nitrokey 3 it also asks for a touch on the key. You'll need
+        each service's setup secret/QR again.
         <a href="oath.html">OATH →</a></li>
       <li><strong>OpenPGP</strong> — destroys the on-card sign/encrypt/auth keys and resets
         PINs. Anything encrypted to the card's encryption key becomes undecryptable.
@@ -147,13 +148,16 @@
       Token2 on-device OTP, PIV, then FIDO2 last, because it ends with a ceremony:</p>
 <pre><code>keyroostctl factory-reset                       # asks you to type "reset"
 keyroostctl factory-reset --device my-key --yes  # in a script</code></pre>
-    <p>The card applets run silently; the OTP step wants a confirming button press on the
-      key. What the FIDO2 step asks for depends on the device's shape. A <strong>USB
+    <p>The card applets need nothing from you, except that some keys (a Nitrokey 3) ask
+      for a touch to reset OATH and the Token2 OTP step waits for a confirming button
+      press; keyroost says to touch the key during those steps, in the CLI and on the
+      app's Factory reset card. What the FIDO2 step asks for depends on the device's shape. A <strong>USB
       key</strong> is asked to be unplugged and plugged back in within 60 seconds — keyroost
       notices the replug on its own, no Enter needed — and then touched. keyroost records
       the key's identity before the sweep starts and <strong>verifies the key that comes
-      back after the replug is the one you confirmed</strong>; a key that exposes no serial
-      is accepted only when it is unambiguously the only one connected. If no replug is
+      back after the replug is the one you confirmed</strong>. A key that exposes no serial
+      can only be reset while it is the only device connected; otherwise the reset is
+      refused before anything is wiped, naming the devices to unplug. If no replug is
       seen, nothing is sent and the step is reported as skipped. A <strong>card in a smart-card
       reader</strong> has nothing to unplug and no touch surface, so it is reset in place:
       keyroost resets the card in the reader (which opens the same brief

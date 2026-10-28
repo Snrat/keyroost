@@ -81,7 +81,7 @@
     <p>First check that <code>keyroostctl</code> is installed and that your computer can
       see your key. If it isn't installed yet, see
       <a href="index.html#install">Install keyroost</a>.</p>
-<pre><code>keyroostctl --version   # prints the version, e.g. keyroostctl 0.14.0
+<pre><code>keyroostctl --version   # prints the version, e.g. keyroostctl 0.15.0
 keyroostctl doctor      # checks this computer; never touches a key
 keyroostctl             # shows the keys that are plugged in</code></pre>
     <p>With no command, <code>keyroostctl</code> lists your keys with a number each:</p>
@@ -246,13 +246,14 @@ keyroostctl molto import --in codes.txt --slot 10            # a Molto2, from sl
   <section class="kr-section" id="piv">
     <h2>Certificates and smart-card keys (PIV)</h2>
     <p>PIV turns your key into a smart card: it holds certificates for signing in to
-      computers, VPNs or SSH servers. The private key is made on the card and never
-      leaves it.</p>
+      computers, VPNs or SSH servers. A key made on the card never leaves it; you can
+      also bring a key and its certificate from a .p12/.pfx file.</p>
 <pre><code>keyroostctl piv info                                       # what is in each slot
 keyroostctl piv key generate --slot 9a                     # make a new key in slot 9a
 keyroostctl piv cert generate --slot 9a --subject "CN=Alice"   # give it a certificate
 keyroostctl piv cert import --slot 9a --in alice.pem       # or use one from your company
-keyroostctl piv cert export --slot 9a --out alice.pem      # save a copy of the certificate</code></pre>
+keyroostctl piv cert export --slot 9a --out alice.pem      # save a copy of the certificate
+keyroostctl piv key import --slot 9a --in alice.p12        # or a key + certificate from a .p12/.pfx file</code></pre>
     <p>A slot is a numbered place for one key: <code>9a</code> is for signing in,
       <code>9c</code> for signing documents, <code>9d</code> for decrypting. Changing a
       slot needs the management key, a separate secret. If you never changed it, add
@@ -539,7 +540,7 @@ keyroostctl fido pin status --json</code></pre>
     <p class="kr-muted">Manage the PIV (smart card) applet: info, PIN/PUK, management key, keys, and certificates</p>
     <div class="kr-table-wrap"><table class="kr-table">
       <tr><th>Command</th><th>What it does</th></tr>
-      <tr><td><code>keyroostctl piv info</code></td><td>Show PIV status: version, serial, PIN retries, and which key slots hold a certificate. No PIN or touch required</td></tr>
+      <tr><td><code>keyroostctl piv info</code></td><td>Show PIV status: version, serial, PIN retries, and what each slot holds (certificate, key), including retired slots in use. No PIN or touch required</td></tr>
       <tr><td><code>keyroostctl piv pin</code></td><td>Change the PIV PIN, or unblock it with the PUK</td></tr>
       <tr><td><code>keyroostctl piv pin change</code></td><td>Change the PIV PIN. Each PIN comes from an environment variable, stdin (the current PIN on the first line, the new one on the second) or, with neither, a hidden prompt</td></tr>
       <tr><td><code>keyroostctl piv pin unblock</code></td><td>Unblock a blocked PIN using the PUK, setting a new PIN</td></tr>

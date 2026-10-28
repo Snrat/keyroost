@@ -786,8 +786,8 @@ struct InlineKeyGen {
 /// hex string (48 hex chars for AES-192 / 3DES, 32 for AES-128, 64 for AES-256).
 #[derive(Subcommand)]
 enum PivCmd {
-    /// Show PIV status: version, serial, PIN retries, and which key slots hold a
-    /// certificate. No PIN or touch required.
+    /// Show PIV status: version, serial, PIN retries, and what each slot holds
+    /// (certificate, key), including retired slots in use. No PIN or touch required.
     Info {
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,

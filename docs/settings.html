@@ -84,9 +84,12 @@
       <strong>Settings</strong> tab. Unlocking is a key-level action — it gates passkeys,
       fingerprints, and settings alike — so it lives above the tabs rather than inside any one
       panel. The Settings tab appears on <em>any</em> CTAP2 key — it also hosts the FIDO2
-      reset, which every CTAP2 key supports. The individual policy controls inside it are
-      gated on the key reporting <code>authnrCfg</code> support in its
-      <code>getInfo</code> options.</p>
+      reset, which every CTAP2 key supports. The policy controls inside it appear only on
+      keys that report <code>authnrCfg</code>, and each one only when the key lists it in
+      <code>getInfo</code>: <code>alwaysUv</code> for Always require user verification,
+      <code>setMinPINLength</code> for the minimum length and a forced PIN change, and
+      <code>ep</code> for enterprise attestation. The CLI refuses a setting the key doesn't
+      offer before it asks for the PIN.</p>
   </section>
 
   <section class="kr-section">
@@ -96,10 +99,12 @@
       It can be turned on and off again. Whether it survives a key reset is vendor-specific.
       The CLI has one command for each state, <code>fido config always-uv enable</code> and
       <code>fido config always-uv disable</code>; each does nothing, and says so, when the key is already
-      in that state.</p>
+      in that state. keyroost offers it only on keys that report the <code>alwaysUv</code>
+      option.</p>
     <p><strong>Set minimum PIN length.</strong> Raises the shortest PIN the key will accept.
       It can only be increased — never lowered without a reset — and if the current PIN is now
-      too short, the key requires a new one. An optional flag also forces a PIN change.</p>
+      too short, the key requires a new one. An optional flag also forces a PIN change.
+      Shown only on keys that list <code>setMinPINLength</code>, as is the next one.</p>
     <p><strong>Force PIN change on next use.</strong> Flags the key so the next platform
       interaction must set a new PIN, without otherwise changing the minimum length. Useful
       before handing a key to someone else.</p>
@@ -136,9 +141,9 @@ keyroostctl fido pin min-length set --length 6 --yes --pin env:KR_PIN   # in a s
       recoverable operations first (<code>fido config always-uv enable</code>, which
       <code>fido config always-uv disable</code> undoes, and force
       PIN change, which clears once a new PIN is set) on a given key before relying on the
-      irreversible ones. <strong>If a command is rejected</strong>,
-      the key may not support that sub-command; keyroost reports the CTAP status with a
-      readable hint.</p>
+      irreversible ones. keyroost offers only the settings the key lists, and the CLI
+      refuses any other before it asks for the PIN. <strong>If the key still rejects a
+      command</strong>, keyroost reports the CTAP status with a readable hint.</p>
   </section>
 
   <section class="kr-section kr-res-section">

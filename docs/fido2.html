@@ -141,8 +141,8 @@
       <strong>USB-HID</strong> and over <strong>NFC / PC-SC readers</strong>. Tap an NFC key
       to a contactless reader and the same operations work, so a key with no USB plug (or
       one you'd rather not insert) can still be inspected and managed. On the command line,
-      FIDO2 commands use USB-HID; only <code>fido reset --reader</code> works with a card
-      in a reader.</p>
+      FIDO2 commands use USB-HID; <code>fido info --reader</code> and
+      <code>fido reset --reader</code> also work with a card in a reader.</p>
     <p>In the app, the <strong>FIDO2</strong> tab's management views sit behind one unlock. Once
       you enter the PIN, capability-gated sub-view tabs appear for whatever the key
       advertises: <strong>Passkeys</strong> (resident credentials),
@@ -152,8 +152,9 @@
       doesn't advertise one of those simply gets no tab for it.
       <strong>Settings</strong> is always present on a CTAP2 key: it carries the FIDO2
       reset (a baseline CTAP2 command) as well as the security-policy controls such as
-      Always require user verification and minimum PIN length, which do gate on the key
-      advertising <code>authnrCfg</code> (<a href="settings.html">see Settings</a>). Locking
+      Always require user verification and minimum PIN length, which appear only when
+      the key advertises <code>authnrCfg</code> and lists that setting in its
+      <code>getInfo</code> (<a href="settings.html">see Settings</a>). Locking
       returns to the gate and clears the session for all of them. Until the key is unlocked
       (for example when the PIN is forgotten or blocked), the reset is shown on its own, so
       a key can always be reset without its PIN.</p>
