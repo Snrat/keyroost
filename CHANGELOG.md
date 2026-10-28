@@ -158,8 +158,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keyroost now asks each key the way it expects, so accounts can be listed,
   added, read and deleted. A Nitrokey 3 asks for a touch to reset its
   Authenticator app, to delete any account, and to save or read one that
-  requires a touch; the CLI and the app now say so, and a missed touch gets
-  a message that says to try again and touch the key. ([#208])
+  requires a touch. The CLI and the app say so for a reset and for touch
+  accounts, and a missed touch gets a message that says to try again and
+  touch the key. ([#208])
 - **Authenticator codes no longer drop out while a browser is open.** A
   browser checking the key for smart-card certificates could slip its own
   commands in between keyroost's, and the app then showed **Read code** on
@@ -232,15 +233,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   requires a PIN change, the app opens the change-PIN form instead of failing
   with a PIN policy error. After the change, the key can be unlocked with the
   new PIN. CLI commands that need a PIN token now ask for a PIN change first
-  instead of reporting a misleading new-PIN complexity error. ([#220])
+  instead of reporting a misleading new-PIN complexity error. Contributed by
+  @Snrat. ([#220])
 - **Idle locking clears every PIN draft.** Current, new, and confirmation
   PINs left in the change-PIN form are now wiped after inactivity, including
-  when setting a first PIN. ([#222])
+  when setting a first PIN. Contributed by @Snrat. ([#222])
 - **"Always require user verification" is only offered on keys that report
   it.** Pressing Toggle on a key without the `alwaysUv` option failed with
   "authenticator returned CTAP2 status 0x02". The app now leaves the row
   out for such keys, and `fido config always-uv` says the key doesn't
-  support it. ([#224])
+  support it. Contributed by @Snrat. ([#224])
 - **keyroost asks for a touch wherever the key needs one.** Over USB, the
   CLI and the app now say "touch your key" whenever the key reports it is
   waiting for a touch. Over a smart-card connection they say so up front
@@ -253,8 +255,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   key now start the idle clock, and the dialog holding them closes when it
   runs out, saying why. The On-device OTP PIN boxes clear their typed
   history like every other secret box. ([#226])
-- **Enterprise attestation and the minimum PIN length are offered only on
-  keys that support them.** The app's FIDO2 Settings show those rows only
+- **Enterprise attestation, the minimum PIN length and a forced PIN change
+  are offered only on keys that support them.** The app's FIDO2 Settings show those rows only
   where the key lists them, and `keyroostctl` refuses before asking for
   the PIN, as it already did for Always UV. ([#227])
 - **Each key's firmware is shown the way its maker states it.** A Solo 2

@@ -63,8 +63,9 @@
 
   <section class="kr-section" id="v0-15-0">
     <h2>v0.15.0</h2>
-    <p>No command or flag changes. One JSON value changes: Nitrokey is now
-      spelled with a lowercase k. Library consumers: several public structs
+    <p>No command or flag changes. Two JSON values change: Nitrokey is now
+      spelled with a lowercase k, and <code>fido info</code>'s firmware is
+      the vendor's own string or <code>null</code>. Library consumers: several public structs
       gain fields, <code>keyroost-piv</code> renames one enum variant to
       match, and <code>keyroost-ctap</code> drops an error variant (see the
       table at the end).</p>
@@ -75,6 +76,13 @@
       <tr><td><code>piv --json info</code>:
           <code>"applet_fingerprint": "Trussed::NitroKey"</code></td>
         <td><code>"applet_fingerprint": "Trussed::Nitrokey"</code></td></tr>
+      <tr><td><code>fido --json info</code>: <code>"firmware"</code> always a
+          string, the version from the key's USB handshake (CTAPHID INIT;
+          a Solo 2 showed <code>"2.3.196"</code>)</td>
+        <td>The firmware the way the vendor states it (a Solo 2's
+          <code>"2.964"</code>, a Token2 PIN+'s <code>"R3.4"</code>), or
+          <code>null</code> when the key doesn't say. The CTAP2 getInfo number
+          is still in <code>ctap2.firmware_version</code>.</td></tr>
     </table>
     </div>
     <h3>Library (crates.io) API changes</h3>

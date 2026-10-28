@@ -31,7 +31,8 @@ hardware and has no server component, so updating is the whole story.
 What keyroost defends against:
 
 - **Malicious or malformed input files.** Import parsers (otpauth URIs,
-  Aegis/2FAS exports, encrypted vaults) are bounds-checked, reject
+  Aegis/2FAS exports, encrypted vaults, PKCS#12 .p12/.pfx files) are
+  bounds-checked, reject
   attacker-controlled resource demands (e.g. hostile scrypt parameters),
   and authenticate ciphertexts before use.
 - **Malicious or buggy devices.** Everything read from USB/NFC — APDU
@@ -55,11 +56,13 @@ What keyroost defends against:
   writes, OATH `PUT`/`SET CODE`/`VALIDATE` and every exchange that names an
   account or carries a code (`LIST`, `CALCULATE`, `CALCULATE ALL`, `DELETE`,
   `RENAME`), OpenPGP key import and decipher,
-  PIV `GENERAL AUTHENTICATE`, the Token2 OTP seed writes and code reads, and
+  PIV `GENERAL AUTHENTICATE`, PIN/PUK/management-key commands and private-key
+  import, the Token2 OTP seed writes and code reads, and
   CTAP CBOR exchanges, in both directions where a response is as revealing
   as the request. Secret-typed memory is zeroized on drop where Rust
   allows — PINs, CTAP session secrets and per-credential largeBlob keys,
-  RSA key components, imported TOTP seeds, and the decrypted-vault /
+  RSA key components, private keys read from a .p12/.pfx file, imported TOTP
+  seeds, and the decrypted-vault /
   QR-payload buffers they pass through (buffer reallocations and
   library-internal copies remain out of reach). PINs, passwords, keys,
   seeds and `otpauth://` URIs are accepted via an environment variable,
@@ -101,9 +104,9 @@ What keyroost does **not** defend against:
   `keyroost-resolve` carry no external dependencies at all, and the OATH,
   OpenPGP, PIV and Token2 single-profile byte layers carry nothing but
   `zeroize`. That does not mean no external hash code is in the tree: where
-  the CTAP, Token2-OTP and OpenPGP key-set paths need those primitives
-  inside a larger construction (client-PIN, ECDH, largeBlob, OpenPGP
-  signatures and backups), they use RustCrypto's `sha2`, `hmac` and `aes`
+  the CTAP, Token2-OTP, OpenPGP key-set and PKCS#12 paths need those
+  primitives inside a larger construction (client-PIN, ECDH, largeBlob,
+  OpenPGP signatures and backups, .p12/.pfx decryption and MAC checks), they use RustCrypto's `sha2`, `hmac` and `aes`
   rather than a hand-rolled equivalent. What is pulled in is
   deliberate, confined to the crate that needs it, and
   annotated in the `Cargo.toml` that declares it: the device and OS
@@ -116,12 +119,15 @@ What keyroost does **not** defend against:
   `base64`), and cryptography that would be irresponsible to hand-roll
   under `forbid(unsafe_code)` — RustCrypto (`sha2`, `hmac`, `aes`, `des`,
   `cbc`, `cipher`, `p256`, `aes-gcm`), `getrandom`, `rand_core`, `zeroize`, `scrypt`
-  (Aegis vaults), `rsa` (RSA key-file loading in `keyroost-rsakey`; the
-  PIV self-test's verification in `keyroost-pivtest`; OpenPGP key
-  generation and signing in `keyroost-pgpkey`),
-  `p384`/`p521`/`ed25519-dalek`/`x25519-dalek` (host-side verification of
-  the PIV slot self-test in `keyroost-pivtest`, and OpenPGP key generation
-  and signing in `keyroost-pgpkey`), `k256` (secp256k1 OpenPGP keys,
+  (Aegis vaults), `rc2` and `pbkdf2` (legacy and PBES2 PKCS#12
+  decryption, confined to `keyroost-p12`), `rsa` (RSA key-file loading in
+  `keyroost-rsakey`; the PIV self-test's verification in
+  `keyroost-pivtest`; OpenPGP key generation and signing in
+  `keyroost-pgpkey`; the key-consistency check of a .p12/.pfx import in
+  `keyroost-p12`), `p384`/`p521`/`ed25519-dalek`/`x25519-dalek`
+  (host-side verification of the PIV slot self-test in
+  `keyroost-pivtest`, OpenPGP key generation and signing in
+  `keyroost-pgpkey`, and reading .p12/.pfx keys in `keyroost-p12`), `k256` (secp256k1 OpenPGP keys,
   confined to `keyroost-pgpkey`), and `miniz_oxide` (CTAP large-blob deflate, and
   reading and writing gzip-compressed PIV certificates; decompression is
   size-capped). QR and
@@ -138,7 +144,7 @@ What keyroost does **not** defend against:
   neither fetches nor runs it. No build script in this workspace generates
   code, downloads anything, or reads outside its own package.
 - **Continuously fuzzed and dependency-audited.** The parsers named in the
-  threat model are covered by nineteen `cargo-fuzz` targets
+  threat model are covered by twenty `cargo-fuzz` targets
   (`fuzz/fuzz_targets/`), all run on a weekly schedule; a RUSTSEC scan
   (`cargo audit`) runs weekly and on every change to a manifest or the
   lockfile, and Dependabot proposes monthly updates for the cargo,

@@ -64,8 +64,8 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   cardholder name / URL; change the user / admin PIN and unblock a locked PIN;
   factory-reset the applet.
 - **PIV (SP 800-73-4)** — full management: status (detected applet,
-  applet/firmware version, serial, PIN retries, which slots 9A/9C/9D/9E hold a
-  certificate), on-card key generation (RSA, ECC P-256/384/521, Ed25519,
+  applet/firmware version, serial, PIN retries, which slots hold a certificate
+  or a key, including any retired slots 82–95 in use), on-card key generation (RSA, ECC P-256/384/521, Ed25519,
   X25519), certificate import / export, self-signed certs or a CSR for a CA,
   importing a private key with its certificate from a `.p12` / `.pfx` file
   (`piv key import`; legacy-encrypted files (RC2/3DES, the kind some
@@ -85,7 +85,8 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   Nitrokey, Swissbit, HID Crescendo and others) and offers vendor extensions
   such as `piv key move` and `piv key delete` according to a built-in list of what each
   supports. A feature the list marks unsupported stays visible, and the GUI's
-  **Enable Anyway** or the CLI's `--force` turns it on.
+  **Enable Anyway** or the CLI's `--force` turns it on (except key import
+  from a file, which follows the list strictly).
   Every slot-taking command addresses
   9A/9C/9D/9E *and* the 20 Yubico retired key-management slots (82–95), so keys
   can be archived and rotated. The GUI collects the
@@ -133,8 +134,12 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
   typing `reset`; a script passes `--yes`. On a USB key the FIDO2 step ends
   with an unplug/replug (detected automatically) and a touch; a card in a smart-card reader is instead
   reset in place (no replug, no touch — the card is power-cycled in the
-  reader). Only manufacturer-intended resets are used, and each step reports
-  its own outcome rather than being folded into one "done".
+  reader). The Token2 OTP step, and the OATH step on a Nitrokey 3, ask for a
+  touch on the key. A FIDO2 key with no serial number is reset only while it
+  is the only key plugged in; otherwise keyroost names the keys to unplug
+  before anything is wiped. Only manufacturer-intended resets are used, and
+  each step reports its own outcome rather than being folded into one
+  "done".
 - **Friendly device names** — name a key to target it with `--device NAME`
   when several are connected, instead of by a reshuffling `/dev/hidrawN` path.
   Keep the name on this computer (`keys.json`, which stores a salted
@@ -164,9 +169,9 @@ a short, vendor-neutral tour of what FIDO2, OATH, OpenPGP, and PIV actually do.
 | **Token2 PIN+ Series** | FIDO2 (+ bio), OTP (incl. import), OpenPGP, PIV | FIDO2 with fingerprint/bio enrollment and FIDO Metadata Service (MDS) display, plus on-device OTP (TOTP/HOTP) over CCID / NFC / USB-HID, validated on PIN+ hardware. Over USB-HID keyroost sends the OTP commands through the CTAPHID vendor command Token2 documented ([#155](https://github.com/framefilter/keyroost/issues/155)), verified on a PIN+ Series FIDO + PGP key (release R3.4); keys that don't answer it get the earlier report-framed channel. Importing an authenticator export into OTP storage follows Token2's published OTP specification (see [Importing codes](#importing-codes)). HID/keyboard HOTP applies to the models that carry it — recent releases (R3.2+/R3.3+) have no HID-HOTP and ship with the HID channel disabled by design; CCID is the intended path there. Keys running the R3.4+ OTP applet can put codes behind an OTP PIN; keys without it answer the capability probe with "no such command" and are unaffected. Contributed by [@token2](https://github.com/token2). PIV management was exercised on Token2 hardware by [@episource](https://github.com/episource) ([#128](https://github.com/framefilter/keyroost/pull/128)), and keyroost decodes the BCD-coded serial Token2's PIV and OpenPGP applets report; `piv info` and `openpgp info` show the key's full serial, read from its OTP applet. The OATH / OpenPGP smart-card applets are handled by the standard byte layers but **not yet exercised on PIN+ hardware by this project** (experimental). |
 | **YubiKey** (5 series) | FIDO2, OATH (incl. import), OpenPGP, PIV | Built and verified against a YubiKey 5.7, including PIV key import from a `.p12` / `.pfx` file (RSA-2048/4096, ECC P-256/P-384, Ed25519, X25519, with PIN and touch policies). |
 | **SoloKeys Solo 2** | FIDO2, OATH (incl. import) | Trussed firmware; no OpenPGP applet. **HOTP caveat:** the last-shipped Solo 2 firmware (2.964) computes HOTP over a 4-byte counter where RFC 4226 specifies 8, so its HOTP codes won't verify against standards-compliant servers (hardware-verified; fixed in the current upstream Trussed secrets app, but Solo 2 no longer receives firmware updates). TOTP is unaffected — its 8-byte time challenge comes from the host. |
-| **Nitrokey 3** | FIDO2, OATH (incl. import), PIV; OpenPGP detected | Built around the same Trussed firmware core as Solo 2, but the final firmware is different — e.g. Nitrokey 3 has PIV support, while Solo 2 does not. PIV verified on a Nitrokey 3A NFC (firmware 1.8.3), contributed by [@episource](https://github.com/episource); keyroost reads the serial and firmware version from the Nitrokey admin application. Importing an RSA-2048 key and certificate from a `.p12` / `.pfx` file into slot 9A verified on firmware 1.9.1. OATH verified on firmware 1.9.0: adding, listing, TOTP and HOTP codes, and touch-required accounts, which also need a touch to save or delete. This firmware has no CALCULATE ALL, so the Authenticator tab reads codes one at a time. Importing codes into its OATH storage follows Nitrokey's published secrets-app source (see [Importing codes](#importing-codes)). The OpenPGP applet is detected but not yet exercised by this project. |
+| **Nitrokey 3** | FIDO2, OATH (incl. import), PIV; OpenPGP detected | Built around the same Trussed firmware core as Solo 2, but the final firmware is different — e.g. Nitrokey 3 has PIV support, while Solo 2 does not. PIV verified on a Nitrokey 3A NFC (firmware 1.8.3), contributed by [@episource](https://github.com/episource); keyroost reads the serial and firmware version from the Nitrokey admin application. Importing an RSA-2048 key and certificate from a `.p12` / `.pfx` file into slot 9A verified on firmware 1.9.1. OATH verified on firmware 1.9.0: adding, listing, TOTP and HOTP codes, and touch-required accounts, which also need a touch to save; deleting any account, or resetting the Authenticator, also needs a touch. This firmware has no CALCULATE ALL, so the Authenticator tab reads codes one at a time. Importing codes into its OATH storage follows Nitrokey's published secrets-app source (see [Importing codes](#importing-codes)). The OpenPGP applet is detected but not yet exercised by this project. |
 | **Swissbit iShield Key 2 Pro** (and iShield Key 1) | PIV (partial) | Key generation and certificate handling verified by [@episource](https://github.com/episource) on their own iShield Key 2 Pro. keyroost doesn't use the slot key type and PIN/touch policy this card reports in GET METADATA ([#113](https://github.com/framefilter/keyroost/issues/113)), so a slot without a certificate reads "no certificate (a key may be present)". Answers the Yubico version extension with four bytes instead of three; keyroost keeps the reply as sent. On the iShield Key 1 and 2, keyroost reads the serial and device name from Swissbit's own management applications (and, on the Key 1, the firmware version) for `piv info` and the GUI, contributed by [@episource](https://github.com/episource) ([#163](https://github.com/framefilter/keyroost/pull/163)). Other applets not yet exercised by this project. |
-| **Any standards-compliant FIDO2 key** (e.g. Thales, Feitian, Titan) | FIDO2 / CTAP2; OATH / OpenPGP / PIV only if the key carries those applets | keyroost implements the published specs, not vendor-specific behavior, so the `fido` commands — getInfo, passkey management, PIN, reset — work on any CTAP2 authenticator, including ones not listed here. Optional features (fingerprint, largeBlob, authenticatorConfig) surface only when the key advertises them in getInfo. The smart-card applets apply only to keys that expose an OATH / OpenPGP / PIV applet over PC/SC. Older U2F-only (CTAP1) keys are detected by `list` but don't support the CTAP2 management commands. |
+| **Any standards-compliant FIDO2 key** (e.g. Thales, Feitian, Titan) | FIDO2 / CTAP2; OATH / OpenPGP / PIV only if the key carries those applets | keyroost implements the published specs, not vendor-specific behavior, so the `fido` commands — getInfo, passkey management, PIN, reset — work on any CTAP2 authenticator, including ones not listed here. Optional features (fingerprint, largeBlob, authenticatorConfig) surface only when the key advertises them in getInfo. The smart-card applets apply only to keys that expose an OATH / OpenPGP / PIV applet over PC/SC. Older U2F-only (CTAP1) keys show as U2F in `list` and the app and don't support the CTAP2 management commands. |
 
 Each listed row notes what's actually been verified on that device; the final,
 generic row describes the standards-based behavior expected on untested but
@@ -599,7 +604,8 @@ setup. The CLI has no build script.)
 > FIDO key (via readable HID metadata, without opening the protected
 > interface) and shows an "Administrator rights needed" card with a button to
 > relaunch elevated or open Windows' own security-key settings.
-> `keyroostctl list` and `doctor` say the same.
+> `keyroostctl list`, `doctor` and the `fido` commands (including `--reader`)
+> say the same.
 
 > **Prebuilt binaries:** the Linux release tarball and the AppImage are built on
 > Ubuntu 22.04 and need glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36
@@ -980,6 +986,10 @@ a script, use `--json` where a command has it.
 Breaking changes are tracked per release on the site's
 [migration notes](https://framefilter.github.io/keyroost/migration.html)
 page, with the exact before → after for scripts and library consumers.
+**v0.15.0** has no command or flag changes; `piv --json info` now reports
+`"applet_fingerprint": "Trussed::Nitrokey"` (was `Trussed::NitroKey`), and
+`fido --json info`'s `firmware` is the vendor's own string (a Solo 2's
+`2.964`, a Token2's `R3.4`) or `null`. Library users: see the migration page.
 **v0.14.0** changes `openpgp key import --generate`: it now needs
 `--backup FILE` and `--name`, fills all three slots, and no longer takes
 `--slot`. Library users: `usb_bus` / `usb_address` on `HidDevice`,
