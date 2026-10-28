@@ -64,7 +64,7 @@ Being worked on right now — check with whoever holds it before starting.
   hardware-checked). Find one approach that gives the same result on every
   key family, for example checking the account list first and saying "no
   account named …" before sending anything, and apply it to every command
-  that names an existing account (`oath delete`, `oath rename`, `oath code`)
+  that names an existing account (`oath delete`, `oath code`)
   in the CLI and the app. Check how other OATH applets (Nitrokey, Token2)
   answer before settling it. (S–M)
 
