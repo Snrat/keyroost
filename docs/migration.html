@@ -61,6 +61,66 @@
 
 <main class="kr-wrap">
 
+  <section class="kr-section" id="v0-15-0">
+    <h2>v0.15.0</h2>
+    <p>No command or flag changes. One JSON value changes: Nitrokey is now
+      spelled with a lowercase k. Library consumers: several public structs
+      gain fields, <code>keyroost-piv</code> renames one enum variant to
+      match, and <code>keyroost-ctap</code> drops an error variant (see the
+      table at the end).</p>
+    <h3>JSON output</h3>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Before</th><th>Now</th></tr>
+      <tr><td><code>piv --json info</code>:
+          <code>"applet_fingerprint": "Trussed::NitroKey"</code></td>
+        <td><code>"applet_fingerprint": "Trussed::Nitrokey"</code></td></tr>
+    </table>
+    </div>
+    <h3>Library (crates.io) API changes</h3>
+    <div class="kr-table-wrap">
+    <table class="kr-table">
+      <tr><th>Crate</th><th>Change</th></tr>
+      <tr><td><code>keyroost-piv</code></td>
+        <td><code>TrussedVariant::NitroKey</code> is renamed
+          <code>TrussedVariant::Nitrokey</code>. New: key import
+          (<code>import_key</code>, <code>import_key_chained</code>,
+          <code>import_key_body</code>, <code>ImportKey</code>) and the
+          per-applet checks <code>import_layout</code> /
+          <code>import_slot_allowed</code>.</td></tr>
+      <tr><td><code>keyroost-ctap</code></td>
+        <td><code>HidTransportError::NonceMismatch</code> is removed. A
+          CTAPHID INIT answer carrying another program's nonce is now
+          skipped, and the wait ends with the usual timeout if no answer
+          for this one arrives.</td></tr>
+      <tr><td><code>keyroost-oath</code></td>
+        <td><code>Listing</code> gains <code>touch_required:
+          Vec&lt;String&gt;</code> (filled by the new
+          <code>parse_list_with_properties</code>), <code>SelectInfo</code>
+          gains <code>serial: Option&lt;Vec&lt;u8&gt;&gt;</code>, and
+          <code>Tag</code> gains <code>SerialNumber</code>. New:
+          <code>parse_calculate_all</code> (all codes in one read) and
+          <code>get_response</code>.</td></tr>
+      <tr><td><code>keyroost-resolve</code></td>
+        <td><code>Device</code> gains <code>smart_card_unlisted</code> and
+          <code>EnumerateOptions</code> gains
+          <code>skip_protocol_asks</code> (both <code>bool</code>; struct
+          literals need the new field or
+          <code>..Default::default()</code>). New: the
+          <code>firmware</code> module (<code>key_firmware</code>, each key's
+          firmware the way its vendor states it).</td></tr>
+      <tr><td><code>keyroost-transport</code></td>
+        <td><code>ReaderProbe</code> gains
+          <code>fido_ctap2_confirmed: bool</code>. New: the
+          <code>piv_import</code> module (PIV key import from a .p12/.pfx
+          file).</td></tr>
+      <tr><td>New crates</td>
+        <td><code>keyroost-p12</code> (PKCS#12 .p12/.pfx reader, used by PIV
+          key import).</td></tr>
+    </table>
+    </div>
+  </section>
+
   <section class="kr-section" id="v0-14-0">
     <h2>v0.14.0</h2>
     <p>One command changes: <code>openpgp key import --generate</code> now
