@@ -5711,15 +5711,14 @@ impl App {
         error: Box<dyn std::error::Error + Send + Sync>,
         mut pin: zeroize::Zeroizing<String>,
     ) {
-        // CTAP 2.1 §7.4.2: forcePINChange requires a PIN change *before* either
+        // CTAP 2.1: with forcePINChange set, the PIN must change before either
         // getPinToken variant. Usually getInfo lets open_and_unlock stop before
-        // asking for a token; the token-request fallback covers authenticators
-        // that only report the requirement when the request itself is attempted.
+        // asking for a token; keyroost-ctap maps the token request's 0x37 to
+        // PinChangeRequired for authenticators that only report it then.
         let pin_change_required = error.downcast_ref::<ForcedPinChange>().is_some()
             || matches!(
                 error.downcast_ref::<keyroost_ctap::CtapError>(),
                 Some(keyroost_ctap::CtapError::PinChangeRequired)
-                    | Some(keyroost_ctap::CtapError::StatusCode(0x37))
             );
         if pin_change_required {
             if let Some(info) = self.security_keys.info.as_mut() {
@@ -28364,26 +28363,20 @@ mod tests {
 
     /// A forced-PIN-change rejection during unlock must open the change-PIN
     /// form with the current PIN preserved, not report a misleading new-PIN
-    /// complexity failure and leave the user at the same unlock prompt. Cover
-    /// both the shared typed error and the raw status used by the GUI fallback.
+    /// complexity failure and leave the user at the same unlock prompt.
     #[test]
     fn pin_policy_violation_during_unlock_requests_pin_change() {
-        for error in [
-            keyroost_ctap::CtapError::PinChangeRequired,
-            keyroost_ctap::CtapError::StatusCode(0x37),
-        ] {
-            let mut app = App::default();
-            app.fail_unlock(
-                Box::new(error),
-                zeroize::Zeroizing::new("current-pin".into()),
-            );
+        let mut app = App::default();
+        app.fail_unlock(
+            Box::new(keyroost_ctap::CtapError::PinChangeRequired),
+            zeroize::Zeroizing::new("current-pin".into()),
+        );
 
-            assert!(app.security_keys.change_pin.open);
-            assert_eq!(app.security_keys.change_pin.old, "current-pin");
-            assert!(app.security_keys.change_pin.new.is_empty());
-            assert!(app.security_keys.change_pin.confirm.is_empty());
-            assert_eq!(app.security_keys.error, None);
-        }
+        assert!(app.security_keys.change_pin.open);
+        assert_eq!(app.security_keys.change_pin.old, "current-pin");
+        assert!(app.security_keys.change_pin.new.is_empty());
+        assert!(app.security_keys.change_pin.confirm.is_empty());
+        assert_eq!(app.security_keys.error, None);
     }
 
     /// The getInfo-driven early exit reaches the same form and updates the

@@ -15409,7 +15409,7 @@ fn main() -> ExitCode {
         .stack_size(16 * 1024 * 1024)
         .spawn(|| match answer_completion_request() {
             Some(code) => Ok(Some(code)),
-            None => run().map(|()| None).map_err(|e| e.to_string()),
+            None => run().map(|()| None).map_err(|e| error_text(e.as_ref())),
         })
         .expect("spawn worker thread");
 
@@ -15424,6 +15424,17 @@ fn main() -> ExitCode {
             eprintln!("error: worker thread panicked");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// The text `main` prints for an error: its message, plus the next step for
+/// an error the command that hit it can't name itself.
+fn error_text(e: &(dyn std::error::Error + 'static)) -> String {
+    match e.downcast_ref::<keyroost_ctap::CtapError>() {
+        Some(keyroost_ctap::CtapError::PinChangeRequired) => {
+            format!("{e}; change it first with: keyroostctl fido pin change")
+        }
+        _ => e.to_string(),
     }
 }
 
@@ -15644,6 +15655,18 @@ mod otp_capability_tests {
 mod cli_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn a_required_pin_change_names_the_command_that_makes_it() {
+        let text = error_text(&keyroost_ctap::CtapError::PinChangeRequired);
+        assert_eq!(
+            text,
+            "the key requires a PIN change before this operation; \
+             change it first with: keyroostctl fido pin change"
+        );
+        let other = error_text(&keyroost_ctap::CtapError::StatusCode(0x31));
+        assert!(!other.contains("fido pin change"));
+    }
 
     const IRREVERSIBLE: &str = "Irreversible: asks first (`--yes` to skip)";
     const IRREVERSIBLE_TYPED: &str =
