@@ -246,6 +246,19 @@ pub fn get_pin_token(dev: &mut impl CtapTransport, pin: &str) -> Result<PinUvAut
     token_legacy(dev, pin, chosen)
 }
 
+/// A token request can also report forcePINChange as 0x37 when GetInfo did not
+/// advertise it. Only token requests get this mapping: setPIN and changePIN use
+/// the same status for a genuinely rejected new PIN.
+fn dispatch_token_request(
+    dev: &mut impl CtapTransport,
+    req: &[u8],
+) -> Result<PinResponse, CtapError> {
+    dispatch(dev, req).map_err(|error| match error {
+        CtapError::StatusCode(0x37) => CtapError::PinChangeRequired,
+        other => other,
+    })
+}
+
 /// `getPinToken` (0x05) with the protocol already negotiated.
 fn token_legacy(
     dev: &mut impl CtapTransport,
@@ -264,7 +277,7 @@ fn token_legacy(
         (Value::UInt(KEY_PIN_HASH_ENC), Value::Bytes(pin_hash_enc)),
     ];
     let req = build_request_extra(chosen.version(), SUB_GET_PIN_TOKEN, &extra);
-    let resp = dispatch(dev, &req)?;
+    let resp = dispatch_token_request(dev, &req)?;
     let enc_token = resp
         .pin_token_enc
         .ok_or(CtapError::InvalidResponseShape("missing pinToken"))?;
@@ -320,6 +333,11 @@ pub fn get_pin_uv_auth_token(
     info: &AuthenticatorInfo,
     permissions: u32,
 ) -> Result<PinUvAuthToken, CtapError> {
+    // CTAP 2.1 requires the PIN change before either token command. Stop here
+    // so callers do not mistake the resulting 0x37 for a new-PIN policy error.
+    if info.force_pin_change == Some(true) {
+        return Err(CtapError::PinChangeRequired);
+    }
     // We already hold `getInfo`, so negotiate the protocol straight from it
     // rather than paying for another round-trip in the helpers below.
     let chosen = select_pin_protocol(&info.pin_uv_auth_protocols);
@@ -365,7 +383,7 @@ fn token_with_permissions(
         SUB_GET_PIN_UV_AUTH_TOKEN_USING_PIN,
         &extra,
     );
-    let resp = dispatch(dev, &req)?;
+    let resp = dispatch_token_request(dev, &req)?;
     let enc_token = resp
         .pin_token_enc
         .ok_or(CtapError::InvalidResponseShape("missing pinUvAuthToken"))?;
@@ -579,6 +597,76 @@ pub fn parse_pin_response(v: &Value) -> Result<PinResponse, CtapError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RecordingTransport {
+        response: Vec<u8>,
+        calls: usize,
+    }
+
+    impl CtapTransport for RecordingTransport {
+        fn transact(&mut self, _cmd: u8, _payload: &[u8]) -> Result<Vec<u8>, CtapError> {
+            self.calls += 1;
+            Ok(self.response.clone())
+        }
+    }
+
+    #[test]
+    fn forced_pin_change_skips_all_token_transport_io() {
+        // Exercise both the legacy and permission-based branches. GetInfo has
+        // already answered, so neither branch needs to touch the key again.
+        for pin_uv_auth_token in [false, true] {
+            let info = AuthenticatorInfo {
+                force_pin_change: Some(true),
+                options: if pin_uv_auth_token {
+                    vec![("pinUvAuthToken".into(), true)]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            };
+            let mut dev = RecordingTransport {
+                response: Vec::new(),
+                calls: 0,
+            };
+            let error = match get_pin_uv_auth_token(
+                &mut dev,
+                "test-pin",
+                &info,
+                permissions::CREDENTIAL_MANAGEMENT,
+            ) {
+                Ok(_) => panic!("a forced PIN change must reject the token request"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, CtapError::PinChangeRequired));
+            assert_eq!(dev.calls, 0);
+        }
+    }
+
+    #[test]
+    fn token_request_pin_policy_violation_means_pin_change_required() {
+        let mut dev = RecordingTransport {
+            response: vec![0x37],
+            calls: 0,
+        };
+        let error = dispatch_token_request(&mut dev, &[]).unwrap_err();
+        assert!(matches!(&error, CtapError::PinChangeRequired));
+        assert_eq!(
+            error.to_string(),
+            "the key requires a PIN change before this operation"
+        );
+        assert_eq!(dev.calls, 1);
+    }
+
+    #[test]
+    fn token_request_preserves_wrong_pin_error() {
+        let mut dev = RecordingTransport {
+            response: vec![0x31],
+            calls: 0,
+        };
+        let error = dispatch_token_request(&mut dev, &[]).unwrap_err();
+        assert!(matches!(error, CtapError::StatusCode(0x31)));
+        assert_eq!(dev.calls, 1);
+    }
 
     #[test]
     fn request_carries_protocol_and_subcommand() {
