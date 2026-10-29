@@ -42,18 +42,6 @@ Being worked on right now — check with whoever holds it before starting.
   `docs/DEVICE-RESEARCH.md` ("Identity matching across interfaces"). (S, then
   close #51 if the test passes)
 
-- **Same answer on every key when an account doesn't exist.** Deleting an
-  Authenticator account that isn't on the key gets different answers from
-  different firmware: a YubiKey refuses with `SW=6984`, which keyroost shows
-  as a bare status word, while a Solo 2 answers success, so keyroost reports
-  `Deleted OATH credential "…"` for a name that was never there (both
-  hardware-checked). Find one approach that gives the same result on every
-  key family, for example checking the account list first and saying "no
-  account named …" before sending anything, and apply it to every command
-  that names an existing account (`oath delete`, `oath code`)
-  in the CLI and the app. Check how other OATH applets (Nitrokey, Token2)
-  answer before settling it. (S–M)
-
 - **UI liveness — make "busy" visibly different from "frozen".** Card I/O stalls
   the visible UI for seconds (touch-required sign/decrypt/authenticate, on-card
   RSA keygen, the ~30s reset re-insert window, PC/SC enumeration) and a static
@@ -62,11 +50,6 @@ Being worked on right now — check with whoever holds it before starting.
   indicator while the device worker is busy, per-action busy/disabled button
   states, a cue on long ops. Keep it tasteful — over-animation reads as cheap.
   Research what feels alive vs. annoying before building.
-
-- **Firmware version has three JSON names.** `firmware` (`fido info`, the
-  vendor-stated string since 0.15), `ctap2.firmware_version` (`fido info`, the
-  raw CTAP2 number) and `version_firmware` (`piv info`); pick one name with
-  retired aliases. A decision for later. (S)
 
 - **Research: restoring missing OpenPGP fingerprints** from the user's public
   key file. Investigate only; may be a hornet's nest (key-generation times,

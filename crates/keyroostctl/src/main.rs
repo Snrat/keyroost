@@ -8195,6 +8195,16 @@ fn reset_one_card_applet(
     }
 }
 
+/// The refusal for an account that isn't on the key; `nothing_was` names
+/// what didn't happen ("deleted"), for a command that changes something.
+fn oath_missing_error(name: &str, nothing_was: Option<&str>) -> String {
+    let mut msg = format!("no OATH credential named {name:?} on this key");
+    if let Some(what) = nothing_was {
+        msg.push_str(&format!("; nothing was {what}"));
+    }
+    msg
+}
+
 /// Whether the account `name` needs a touch to compute: the listing says so
 /// (Nitrokey's secrets app lists the property), or the card's CALCULATE ALL
 /// left it out for a touch (YubiKey).
@@ -8264,6 +8274,9 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             // Dispatch on the stored credential type: HOTP uses the card's own
             // counter (empty challenge), TOTP a time counter.
             let listing = session.list()?;
+            if listing.lacks(name) {
+                return Err(oath_missing_error(name, None).into());
+            }
             let is_hotp = listing
                 .credentials
                 .iter()
@@ -8274,14 +8287,21 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
                 .duration_since(UNIX_EPOCH)
                 .map_err(|e| e.to_string())?
                 .as_secs();
+            // An applet that keeps its unlock for one command only (a
+            // password-protected Solo 2) needs it again before each command
+            // after the listing; without a password this sends nothing.
             // CALCULATE ALL never computes an HOTP code, so it can't advance
             // the counter; here it only says whether the account needs a touch.
-            let all = (!is_hotp)
-                .then(|| session.calculate_all(now).ok())
-                .flatten();
+            let all = if is_hotp {
+                None
+            } else {
+                session.reauthenticate()?;
+                session.calculate_all(now).ok()
+            };
             if oath_needs_touch(&listing, all.as_ref(), name) {
                 crate::prompt::touch(crate::prompt::TOUCH_SIGNAL_PROMPT);
             }
+            session.reauthenticate()?;
             let code = if is_hotp {
                 session.calculate_hotp(name)?
             } else {
@@ -8384,17 +8404,22 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             crate::prompt::reverify_if_asked(&dev, asked || sec.prompted())?;
             let mut session =
                 open_oath_unlocked(&reader, password.as_deref().map(String::as_str), debug)?;
-            // A Nitrokey 3 asks for a touch to delete any account; other keys
-            // may for a touch account. Only a hint: a listing that fails
-            // doesn't stop the delete.
+            // A name the key doesn't hold is refused before anything is
+            // sent. A Nitrokey 3 asks for a touch to delete any account;
+            // other keys may for a touch account. A listing that fails
+            // stops neither: the key then answers for itself.
+            let listing = session.list().ok();
+            if listing.as_ref().is_some_and(|l| l.lacks(name)) {
+                return Err(oath_missing_error(name, Some("deleted")).into());
+            }
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let needs_touch = session.asks_touch_to_delete()
-                || session.list().ok().is_some_and(|listing| {
+                || listing.as_ref().is_some_and(|listing| {
                     let all = session.calculate_all(now).ok();
-                    oath_needs_touch(&listing, all.as_ref(), name)
+                    oath_needs_touch(listing, all.as_ref(), name)
                 });
             if needs_touch {
                 crate::prompt::touch("Deleting \u{2014} touch the key if it blinks\u{2026}");
@@ -9881,6 +9906,10 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                     let retired = read_retired_slots(session);
 
                     if json_output() {
+                        let firmware = status
+                            .version_firmware
+                            .as_deref()
+                            .map(keyroost_piv::format_version_bytes);
                         emit_json(&json_out::PivStatusJson {
                             version: status
                                 .version
@@ -9912,10 +9941,8 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                                 .collect(),
                             applet_fingerprint: status.applet_fingerprint.to_string(),
                             applet_name: status.applet_name.clone(),
-                            version_firmware: status
-                                .version_firmware
-                                .as_deref()
-                                .map(keyroost_piv::format_version_bytes),
+                            version_firmware: firmware.clone(),
+                            firmware,
                         })?;
                         return Ok(());
                     }
@@ -16582,6 +16609,20 @@ mod cli_tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(args)
+    }
+
+    /// The refusal names the account, and what didn't happen when the
+    /// command would have changed something.
+    #[test]
+    fn oath_missing_error_names_the_account() {
+        assert_eq!(
+            oath_missing_error("GitHub:bob", Some("deleted")),
+            "no OATH credential named \"GitHub:bob\" on this key; nothing was deleted"
+        );
+        assert_eq!(
+            oath_missing_error("GitHub:bob", None),
+            "no OATH credential named \"GitHub:bob\" on this key"
+        );
     }
 
     #[test]
@@ -23940,6 +23981,7 @@ mod cli_tests {
             }],
             applet_fingerprint: "YubiKey".into(),
             applet_name: "YubiKey".into(),
+            firmware: Some("3.35.0".into()),
             version_firmware: Some("3.35.0".into()),
         };
         assert_json_has_keys(
@@ -23953,6 +23995,7 @@ mod cli_tests {
                 "slots",
                 "applet_fingerprint",
                 "applet_name",
+                "firmware",
                 "version_firmware",
             ],
         );
