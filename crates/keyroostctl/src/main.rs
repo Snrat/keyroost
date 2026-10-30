@@ -779,6 +779,10 @@ struct InlineKeyGen {
     /// session — just a spare copy to keep or hand to other tools.
     #[arg(long, value_name = "FILE", requires = "generate_key")]
     pubkey_out: Option<std::path::PathBuf>,
+    /// With `--generate-key`: run even if keyroost's list marks this key as
+    /// not supporting the chosen key type, PIN policy or touch policy.
+    #[arg(long, requires = "generate_key")]
+    force: bool,
 }
 
 /// Subcommands for the PIV smart-card applet. Secret material (PINs, PUK,
@@ -842,7 +846,7 @@ enum PivCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, short = 's', value_enum)]
+        #[arg(long, short = 's', value_enum, ignore_case = true)]
         slot: CliPivSlot,
         /// The PIN: env:NAME reads that environment variable, stdin reads one
         /// line (hidden when typed at a terminal). Optional and never asked
@@ -1069,7 +1073,7 @@ enum PivKeyCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, short = 's', value_enum)]
+        #[arg(long, short = 's', value_enum, ignore_case = true)]
         slot: CliPivSlot,
         /// Key type to generate (OpenPGP's `nistp256` is `eccp256` here).
         #[arg(long, value_enum, default_value = "eccp256")]
@@ -1130,7 +1134,7 @@ enum PivKeyCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, short = 's', value_enum)]
+        #[arg(long, short = 's', value_enum, ignore_case = true)]
         slot: CliPivSlot,
         /// The PKCS#12 file to import (`.p12` or `.pfx`).
         #[arg(long = "in", short = 'i', value_name = "FILE")]
@@ -1195,7 +1199,7 @@ enum PivKeyCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, short = 's', value_enum)]
+        #[arg(long, short = 's', value_enum, ignore_case = true)]
         slot: CliPivSlot,
         /// The management key (hex): env:NAME reads that environment variable,
         /// stdin reads one line (hidden when typed at a terminal), default uses
@@ -1224,10 +1228,10 @@ enum PivKeyCmd {
     /// with no entry gets a warning.
     Move {
         /// Source slot (9a/9c/9d/9e/82–95).
-        #[arg(long)]
+        #[arg(long, ignore_case = true)]
         from: CliPivSlot,
         /// Destination slot.
-        #[arg(long)]
+        #[arg(long, ignore_case = true)]
         to: CliPivSlot,
         #[arg(long, value_name = "SUBSTR", help = READER_HELP)]
         reader: Option<String>,
@@ -1266,7 +1270,7 @@ enum PivCertCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, short = 's', value_enum)]
+        #[arg(long, short = 's', value_enum, ignore_case = true)]
         slot: CliPivSlot,
         /// Certificate file to import (`.der` or `.pem`).
         #[arg(long = "in", short = 'i', value_name = "FILE")]
@@ -1289,7 +1293,7 @@ enum PivCertCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, short = 's', value_enum)]
+        #[arg(long, short = 's', value_enum, ignore_case = true)]
         slot: CliPivSlot,
         /// Write the certificate to this file instead of stdout.
         #[arg(long, short = 'o', value_name = "FILE")]
@@ -1308,7 +1312,7 @@ enum PivCertCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, short = 's', value_enum)]
+        #[arg(long, short = 's', value_enum, ignore_case = true)]
         slot: CliPivSlot,
         /// Subject distinguished name, e.g. "CN=Alice,O=Example,C=US"
         /// (supported attributes: CN, O, OU, C, L, ST).
@@ -1362,7 +1366,7 @@ enum PivCertCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, short = 's', value_enum)]
+        #[arg(long, short = 's', value_enum, ignore_case = true)]
         slot: CliPivSlot,
         /// Subject distinguished name, e.g. "CN=Alice,O=Example,C=US"
         /// (supported attributes: CN, O, OU, C, L, ST).
@@ -1430,7 +1434,7 @@ enum PivCertCmd {
         reader: Option<String>,
         /// PIV key slot: 9a authentication, 9c signature, 9d key management, 9e
         /// card authentication, 82-95 retired key management.
-        #[arg(long, short = 's', value_enum)]
+        #[arg(long, short = 's', value_enum, ignore_case = true)]
         slot: CliPivSlot,
         /// The management key (hex): env:NAME reads that environment variable,
         /// stdin reads one line (hidden when typed at a terminal), default uses
@@ -9515,7 +9519,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
                 };
                 emit_json(&json_out::OpenpgpStatusJson {
                     aid: hex_encode(&status.aid),
-                    serial: status.full_serial().map(|s| s.to_string()),
+                    serial: status.serial_text(),
                     sig_algo: status.algorithm_label(keyroost_openpgp::KeyCrt::Sign),
                     dec_algo: status.algorithm_label(keyroost_openpgp::KeyCrt::Decrypt),
                     aut_algo: status.algorithm_label(keyroost_openpgp::KeyCrt::Auth),
@@ -9534,10 +9538,9 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             }
 
             println!("AID:            {}", hex_encode(&status.aid));
-            // AID serial: shown in decimal and hex (Yubico prints it in hex;
-            // it equals the YubiKey's CCID/mgmt serial used for friendly
-            // names). A Token2 key's full serial from its OTP applet is shown
-            // as printed on the key.
+            // The serial as GnuPG shows it (a YubiKey's equals its serial
+            // elsewhere); a Token2 key's full serial from its OTP applet is
+            // shown as printed on the key.
             if let Some(serial) = status.serial_text() {
                 println!("Serial:         {serial}");
             }
@@ -9616,7 +9619,7 @@ fn run_openpgp(cmd: &OpenpgpCmd, debug: bool) -> Result<(), Box<dyn std::error::
             let name = crate::target::reader_of(&dev)?;
             let mut session = open_openpgp_at(&name, debug)?;
             let status = session.status()?;
-            let ident = match status.full_serial() {
+            let ident = match status.serial_text() {
                 Some(serial) => format!("serial {}", serial),
                 None => format!("AID {}", hex_encode(&status.aid)),
             };
@@ -10345,47 +10348,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
                     let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
-                    // Unlike PIN/touch policy, every algorithm choice is gated —
-                    // there's no "default" that's exempt: even the SP 800-73-4
-                    // standardized algorithms (RSA-1024/2048, ECC P-256/P-384) aren't
-                    // universally implemented, and RSA-3072/4096/Ed25519/X25519 are
-                    // vendor extensions with no standard obligation at all. See
-                    // `keyroost_piv::compat::PivExtension::SlotKeyAlgorithm`.
-                    guard_piv_feature(
-                        s,
-                        keyroost_piv::compat::PivExtension::SlotKeyAlgorithm(alg),
-                        *force,
-                    )?;
-                    if !matches!(pin_policy, CliPinPolicy::Default) {
-                        guard_piv_feature(
-                            s,
-                            keyroost_piv::compat::PivExtension::SlotPinPolicy,
-                            *force,
-                        )?;
-                    }
-                    if !matches!(touch_policy, CliTouchPolicy::Default) {
-                        guard_piv_feature(
-                            s,
-                            keyroost_piv::compat::PivExtension::SlotTouchPolicy,
-                            *force,
-                        )?;
-                    }
-                    // Narrower than the two gates above: a device can support the
-                    // extension in general yet reject one specific value.
-                    guard_piv_policy_value(
-                        s,
-                        keyroost_piv::compat::PivQuirk::SlotPinPolicyOnceNotSupported,
-                        matches!(pin_policy, CliPinPolicy::Once),
-                        "PIN policy \"once\"",
-                        *force,
-                    )?;
-                    guard_piv_policy_value(
-                        s,
-                        keyroost_piv::compat::PivQuirk::SlotTouchPolicyCachedNotSupported,
-                        matches!(touch_policy, CliTouchPolicy::Cached),
-                        "Touch policy \"cached\"",
-                        *force,
-                    )?;
+                    guard_piv_keygen(s, alg, *pin_policy, *touch_policy, *force)?;
                     authenticate_piv(s, &mgmt)?;
                     crate::prompt::touch(&format!(
                         "Generating {} in {} (touch the key if it blinks)\u{2026}",
@@ -10750,6 +10713,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 |s| -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(mgmt) = &mgmt {
                         let mgmt = mgmt_key_bytes(mgmt, &PIV_MGMT_KEY, s)?;
+                        // Before the management key goes to the card, as
+                        // `piv key generate` does.
+                        guard_inline_keygen(s, keygen)?;
                         authenticate_piv(s, &mgmt)?;
                         inline_generate_key(s, slot.to_slot(), keygen, pub_mode)?;
                     } else if let Some(path) = pubkey_in {
@@ -10863,6 +10829,11 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
                     let mgmt = mgmt_key_bytes(&mgmt, &PIV_MGMT_KEY, s)?;
+                    if keygen.generate_key {
+                        // Before the management key goes to the card, as
+                        // `piv key generate` does.
+                        guard_inline_keygen(s, keygen)?;
+                    }
                     authenticate_piv(s, &mgmt)?;
                     if keygen.generate_key {
                         inline_generate_key(s, slot.to_slot(), keygen, pub_mode)?;
@@ -11971,6 +11942,71 @@ fn guard_signable_alg(alg: keyroost_piv::KeyAlg) -> Result<(), Box<dyn std::erro
             )
             .into()
         })
+}
+
+/// The support checks before generating a key: the key type, and the PIN
+/// and touch policy when not `default`, against keyroost's list for this
+/// card. Shared by `piv key generate` and `--generate-key`, so both refuse
+/// the same things (and both take `--force`).
+fn guard_piv_keygen(
+    s: &mut keyroost_transport::PivSession<'_>,
+    alg: keyroost_piv::KeyAlg,
+    pin_policy: CliPinPolicy,
+    touch_policy: CliTouchPolicy,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Unlike PIN/touch policy, every algorithm choice is gated —
+    // there's no "default" that's exempt: even the SP 800-73-4
+    // standardized algorithms (RSA-1024/2048, ECC P-256/P-384) aren't
+    // universally implemented, and RSA-3072/4096/Ed25519/X25519 are
+    // vendor extensions with no standard obligation at all. See
+    // `keyroost_piv::compat::PivExtension::SlotKeyAlgorithm`.
+    guard_piv_feature(
+        s,
+        keyroost_piv::compat::PivExtension::SlotKeyAlgorithm(alg),
+        force,
+    )?;
+    if !matches!(pin_policy, CliPinPolicy::Default) {
+        guard_piv_feature(s, keyroost_piv::compat::PivExtension::SlotPinPolicy, force)?;
+    }
+    if !matches!(touch_policy, CliTouchPolicy::Default) {
+        guard_piv_feature(
+            s,
+            keyroost_piv::compat::PivExtension::SlotTouchPolicy,
+            force,
+        )?;
+    }
+    // Narrower than the two gates above: a device can support the
+    // extension in general yet reject one specific value.
+    guard_piv_policy_value(
+        s,
+        keyroost_piv::compat::PivQuirk::SlotPinPolicyOnceNotSupported,
+        matches!(pin_policy, CliPinPolicy::Once),
+        "PIN policy \"once\"",
+        force,
+    )?;
+    guard_piv_policy_value(
+        s,
+        keyroost_piv::compat::PivQuirk::SlotTouchPolicyCachedNotSupported,
+        matches!(touch_policy, CliTouchPolicy::Cached),
+        "Touch policy \"cached\"",
+        force,
+    )
+}
+
+/// [`guard_piv_keygen`] for `--generate-key`'s choices. Callers run it
+/// before management-key authentication, as `piv key generate` does.
+fn guard_inline_keygen(
+    s: &mut keyroost_transport::PivSession<'_>,
+    keygen: &InlineKeyGen,
+) -> Result<(), Box<dyn std::error::Error>> {
+    guard_piv_keygen(
+        s,
+        keygen.algorithm.to_alg(),
+        keygen.pin_policy,
+        keygen.touch_policy,
+        keygen.force,
+    )
 }
 
 /// The `--generate-key` convenience shared by `piv cert request` / `piv
@@ -14933,13 +14969,34 @@ fn run_fido_reset_reader(exact_reader: &str) -> Result<(), Box<dyn std::error::E
 fn run_fido_pin_retries(path: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
     let path = crate::target::fido_path(path)?;
     let (mut dev, _) = open_ctap_hid(&path)?;
-    let n = keyroost_ctap::client_pin::get_pin_retries(&mut dev)?;
     if json_output() {
+        let n = keyroost_ctap::client_pin::get_pin_retries(&mut dev)?;
         emit_json(&json_out::FidoPinRetriesJson { pin_retries: n })?;
         return Ok(());
     }
-    println!("{} PIN attempt(s) remaining", n);
+    // getInfo's clientPin option says whether a PIN is set (the app's "No PIN
+    // configured"). Without one, some keys still answer the retry count,
+    // which reads as if a PIN were set, and others refuse it
+    // (CTAP2_ERR_PIN_NOT_SET), failing a read-only status.
+    let pin_set = keyroost_ctap::cmd::get_info(&mut dev)
+        .ok()
+        .and_then(|info| info.option("clientPin"));
+    if pin_set == Some(false) {
+        println!("{}", pin_status_line(pin_set, 0));
+        return Ok(());
+    }
+    let n = keyroost_ctap::client_pin::get_pin_retries(&mut dev)?;
+    println!("{}", pin_status_line(pin_set, n));
     Ok(())
+}
+
+/// `fido pin status`'s line: the retry count when a PIN is set (or when the
+/// key doesn't say), else that none is set.
+fn pin_status_line(pin_set: Option<bool>, retries: u32) -> String {
+    match pin_set {
+        Some(false) => "No FIDO2 PIN is set. Set one with `keyroostctl fido pin set`.".into(),
+        _ => format!("{retries} PIN attempt(s) remaining"),
+    }
 }
 
 fn run_fido_pin_set(
@@ -16601,6 +16658,59 @@ mod cli_tests {
             json_out::piv_slot_token(keyroost_piv::Slot::retired(20).unwrap()),
             "95"
         );
+    }
+
+    /// `fido pin status` on a key with no PIN says so rather than a retry
+    /// count that reads as if one were set.
+    #[test]
+    fn fido_pin_status_says_when_no_pin_is_set() {
+        assert_eq!(
+            pin_status_line(Some(false), 8),
+            "No FIDO2 PIN is set. Set one with `keyroostctl fido pin set`."
+        );
+        assert_eq!(pin_status_line(Some(true), 7), "7 PIN attempt(s) remaining");
+        assert_eq!(pin_status_line(None, 8), "8 PIN attempt(s) remaining");
+    }
+
+    /// `piv info` prints slots in capitals ("retired key 9 (8A)"); a slot
+    /// copied from there is accepted as typed.
+    #[test]
+    fn a_piv_slot_is_accepted_in_capitals() {
+        for slot in ["8A", "8a", "9C"] {
+            let cli = Cli::try_parse_from(["keyroostctl", "piv", "test", "--slot", slot]);
+            assert!(cli.is_ok(), "--slot {slot}");
+        }
+        let moved = Cli::try_parse_from([
+            "keyroostctl",
+            "piv",
+            "key",
+            "move",
+            "--from",
+            "8A",
+            "--to",
+            "9C",
+        ]);
+        assert!(moved.is_ok(), "key move takes capitals too");
+    }
+
+    /// `--force` belongs to `--generate-key`'s support checks.
+    #[test]
+    fn generate_key_force_needs_generate_key() {
+        let base = [
+            "keyroostctl",
+            "piv",
+            "cert",
+            "generate",
+            "-s",
+            "9a",
+            "--subject",
+            "CN=x",
+        ];
+        let with = |extra: &[&'static str]| {
+            Cli::try_parse_from(base.iter().copied().chain(extra.iter().copied()))
+        };
+        assert!(with(&["--force"]).is_err());
+        assert!(with(&["--generate-key", "--force"]).is_ok());
     }
 
     #[test]
