@@ -832,13 +832,18 @@ enum PivCmd {
         cmd: PivChuidCmd,
     },
     /// Test a slot's private key end to end against the slot certificate's
-    /// public key. Read-only — nothing on the card changes.
+    /// public key, or the key the card reports when there is no certificate.
+    /// Read-only — nothing on the card changes.
     ///
     /// For every operation the key's algorithm supports (decrypt for RSA,
     /// key-agree for ECDH curves, sign for RSA / ECDSA / Ed25519), run a fixed
     /// challenge on the card and verify the result against the slot
-    /// certificate's public key. Reports each operation's pass / fail /
-    /// skipped. `--pin` is always optional: it's your
+    /// certificate's public key. A slot with no certificate (an X25519 key
+    /// never has a self-signed one) is tested against the public key the card
+    /// reports for it, where it reports one (GET METADATA, e.g. a YubiKey 5.3
+    /// or later); the
+    /// output says so, and `--json` sets `cert_tested` to false. Reports each
+    /// operation's pass / fail / skipped. `--pin` is always optional: it's your
     /// call whether to test with or without a PIN. Depending on device state
     /// and PIN policy, omitting it may fail.
     Test {
@@ -10901,19 +10906,43 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                 &name,
                 debug,
                 |s| -> Result<(), Box<dyn std::error::Error>> {
-                    // The self-test verifies against the slot CERTIFICATE's public
-                    // key on purpose: the cert is what other PIV software consumes,
-                    // so a pass proves the cert matches the slot's key material. The
-                    // cert object may hold it gzip-compressed (the writing tool's
-                    // choice); read_certificate inflates it (#147/#148), so reading
-                    // it back here works.
-                    let cert = s.read_certificate(piv_slot)?.ok_or_else(|| {
-                        format!("{} has no certificate to test against", piv_slot.label())
-                    })?;
-                    let (alg, pubkey) = keyroost_piv::x509_parse::parse_certificate_public_key(
-                        &cert,
-                    )
-                    .map_err(|e| format!("could not read the slot certificate's key: {e}"))?;
+                    // With a certificate, the self-test verifies against its
+                    // public key on purpose: the cert is what other PIV software
+                    // consumes, so a pass proves the cert matches the slot's key
+                    // material. The cert object may hold it gzip-compressed (the
+                    // writing tool's choice); read_certificate inflates it
+                    // (#147/#148), so reading it back here works.
+                    // A slot with no certificate (an X25519 key never has a
+                    // self-signed one) is tested against the public key the
+                    // card reports for it, and the output says so.
+                    let (alg, pubkey, cert_tested) = match s.read_certificate(piv_slot)? {
+                        Some(cert) => {
+                            let (alg, pubkey) =
+                                keyroost_piv::x509_parse::parse_certificate_public_key(&cert)
+                                    .map_err(|e| {
+                                        format!("could not read the slot certificate's key: {e}")
+                                    })?;
+                            (alg, pubkey, true)
+                        }
+                        None => match s.reported_slot_key(piv_slot) {
+                            Some((alg, pubkey)) => (alg, pubkey, false),
+                            // The card said the slot is empty: say that, not
+                            // that a certificate is missing.
+                            None if s.slot_key_presence(piv_slot)
+                                == keyroost_transport::SlotKeyPresence::NoKey =>
+                            {
+                                return Err(format!("{} has no key", piv_slot.label()).into());
+                            }
+                            None => {
+                                return Err(format!(
+                                    "{} has no certificate to test against, and the card \
+                                     doesn't report the slot's public key",
+                                    piv_slot.label()
+                                )
+                                .into());
+                            }
+                        },
+                    };
 
                     if !keyroost_pivtest::SelfTest::all()
                         .into_iter()
@@ -10946,6 +10975,7 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                             slot: json_out::piv_slot_token(piv_slot),
                             slot_name: piv_slot.label(),
                             algorithm: alg.label().to_string(),
+                            cert_tested,
                             ok: all_ok,
                             operations: results
                                 .iter()
@@ -10965,6 +10995,9 @@ fn run_piv(cmd: &PivCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>> 
                                 .collect(),
                         })?;
                     } else {
+                        if !cert_tested {
+                            println!("{}", keyroost_pivtest::CARD_KEY_NOTE);
+                        }
                         println!("{}", keyroost_pivtest::format_report(&results));
                     }
                     if !all_ok {

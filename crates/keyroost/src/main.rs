@@ -12637,7 +12637,8 @@ impl App {
 
     /// Run every self-test the selected slot's key algorithm supports
     /// (decrypt, then key-agree, then sign): build a fixed challenge from the
-    /// slot certificate's public key ([`keyroost_pivtest`]), run the
+    /// slot certificate's public key, or with no certificate the key the card
+    /// reports ([`keyroost_pivtest`]), run the
     /// private-key op on the card, and verify the reply against that public
     /// key. Read-only on the card — no write, no management key. The PIN
     /// field is always optional — it's the user's call whether to test with
@@ -12668,14 +12669,21 @@ impl App {
                 wipe(&mut app.piv.sign_pin);
                 let (all_ok, text) = match &outcome {
                     // Skipped ops don't count as failures.
-                    Ok((results, _)) => (
-                        !results.iter().any(|(_, r)| r.is_failure()),
-                        keyroost_pivtest::format_report(results),
-                    ),
+                    Ok(run) => {
+                        let report = keyroost_pivtest::format_report(&run.results);
+                        (
+                            !run.results.iter().any(|(_, r)| r.is_failure()),
+                            if run.cert_tested {
+                                report
+                            } else {
+                                format!("{}\n{report}", keyroost_pivtest::CARD_KEY_NOTE)
+                            },
+                        )
+                    }
                     Err(e) => (false, e.clone()),
                 };
-                if let Ok((_, state)) = outcome {
-                    app.store_piv_session_state(for_device, state);
+                if let Ok(run) = outcome {
+                    app.store_piv_session_state(for_device, run.state);
                 }
                 if all_ok {
                     app.log(
@@ -14181,13 +14189,7 @@ fn run_piv_self_test(
     slot: keyroost_piv::Slot,
     pin: &[u8],
     cached: keyroost_transport::PivSessionState,
-) -> Result<
-    (
-        Vec<(keyroost_pivtest::SelfTest, keyroost_pivtest::Outcome)>,
-        keyroost_transport::PivSessionState,
-    ),
-    String,
-> {
+) -> Result<PivSelfTestRun, String> {
     // The session itself can only report `TransportError` (from
     // `with_cached_transaction`'s own connect/SELECT machinery) — flattened
     // to `String` right at the end, via the outer `map_err`/`and_then`
@@ -14196,16 +14198,33 @@ fn run_piv_self_test(
     // exactly as before, one level in, via `inner`.
     keyroost_transport::PivSession::with_cached_transaction(reader, cached, |s| {
         let inner = (|| -> Result<_, String> {
-            // Verify against the slot CERTIFICATE's public key on purpose: the
-            // cert is what other PIV software consumes, so a pass proves the
-            // cert matches the slot's key material. A compressed cert is
+            // With a certificate, verify against its public key on purpose:
+            // the cert is what other PIV software consumes, so a pass proves
+            // the cert matches the slot's key material. A compressed cert is
             // inflated on read (#147/#148).
-            let cert = s
-                .read_certificate(slot)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("{} has no certificate to test against", slot.label()))?;
-            let (alg, pubkey) = keyroost_piv::x509_parse::parse_certificate_public_key(&cert)
-                .map_err(|e| format!("could not read the slot certificate's key: {e}"))?;
+            // A slot with no certificate (an X25519 key never has a
+            // self-signed one) is tested against the public key the card
+            // reports for it; the result says so.
+            let (alg, pubkey, cert_tested) =
+                match s.read_certificate(slot).map_err(|e| e.to_string())? {
+                    Some(cert) => {
+                        let (alg, pubkey) = keyroost_piv::x509_parse::parse_certificate_public_key(
+                            &cert,
+                        )
+                        .map_err(|e| format!("could not read the slot certificate's key: {e}"))?;
+                        (alg, pubkey, true)
+                    }
+                    None => {
+                        let (alg, pubkey) = s.reported_slot_key(slot).ok_or_else(|| {
+                            format!(
+                                "{} has no certificate to test against, and the card doesn't \
+                                 report the slot's public key",
+                                slot.label()
+                            )
+                        })?;
+                        (alg, pubkey, false)
+                    }
+                };
 
             if !keyroost_pivtest::SelfTest::all()
                 .into_iter()
@@ -14219,12 +14238,26 @@ fn run_piv_self_test(
             let results = s
                 .self_test(slot, alg, &pubkey, (!pin.is_empty()).then_some(pin))
                 .map_err(|e| e.to_string())?;
-            Ok((results, s.state()))
+            Ok(PivSelfTestRun {
+                results,
+                state: s.state(),
+                cert_tested,
+            })
         })();
         Ok::<_, TransportError>(inner)
     })
     .map_err(|e| e.to_string())
     .and_then(|inner| inner)
+}
+
+/// What [`run_piv_self_test`] hands back: each operation's outcome, the
+/// session state to keep, and whether the slot's certificate was part of
+/// the test (`false`: no certificate, tested against the key the card
+/// reports).
+struct PivSelfTestRun {
+    results: Vec<(keyroost_pivtest::SelfTest, keyroost_pivtest::Outcome)>,
+    state: keyroost_transport::PivSessionState,
+    cert_tested: bool,
 }
 
 /// Slots a key may be moved to: every standard + retired slot that is empty
@@ -14328,17 +14361,22 @@ fn piv_cert_stays_note(occupancy: PivOccupancy, slot_has_cert: bool, slot: &str)
 }
 
 /// Why the Test button is dimmed, or `None` when it can run: the slot needs
-/// a certificate, a key (the card didn't say there is none), and a key type
-/// keyroost knows.
+/// a key (the card didn't say there is none), a certificate or a key known to
+/// be present, and a key type keyroost knows. Without a certificate the test
+/// runs against the key the card reports; a key known only from this session
+/// (generated here on a card without GET METADATA) or from HID Crescendo's
+/// properties leaves the button live, and the test then says the card
+/// doesn't report the key.
 fn piv_test_blocked(
     alg: Option<keyroost_piv::KeyAlg>,
     has_cert: bool,
     key: keyroost_transport::SlotKeyPresence,
 ) -> Option<&'static str> {
-    if !has_cert {
-        Some("Needs a certificate in this slot.")
-    } else if key == keyroost_transport::SlotKeyPresence::NoKey {
+    use keyroost_transport::SlotKeyPresence;
+    if key == SlotKeyPresence::NoKey {
         Some("This slot has no key.")
+    } else if !has_cert && key != SlotKeyPresence::Present {
+        Some("Needs a certificate in this slot.")
     } else if alg.is_none() {
         Some("The slot's key type is unknown.")
     } else {
@@ -22449,7 +22487,8 @@ impl App {
                                 p,
                                 "Runs every self-test the slot's key supports (decrypt / \
                                  key-agree / sign) and verifies each result against the \
-                                 certificate's public key. Nothing on the card changes.",
+                                 certificate's public key, or, with no certificate, the \
+                                 key the card reports. Nothing on the card changes.",
                             );
                         }
                         PivCredKind::SetRetries => {
@@ -25986,8 +26025,9 @@ impl App {
                 // --- Test: one button that runs every self-test the selected
                 // slot's key supports (decrypt / key-agree / sign, in that order)
                 // and reports each result. Read-only — the card operates but
-                // nothing is written. Live only when the slot holds a certificate
-                // with a key type keyroost can test. Placed last in the card,
+                // nothing is written. Live when the slot holds a certificate, or
+                // a key the card reports (tested against that key), of a type
+                // keyroost can test. Placed last in the card,
                 // below the other slot actions, since it's a diagnostic rather
                 // than a slot-management action.
                 ui.add_space(12.0);
@@ -30898,9 +30938,15 @@ mod tests {
             piv_test_blocked(p256, true, K::NoKey),
             Some("This slot has no key.")
         );
+        // No certificate, but the card reports the key: tested against it.
+        assert_eq!(piv_test_blocked(p256, false, K::Present), None);
         assert_eq!(
-            piv_test_blocked(p256, false, K::Present),
+            piv_test_blocked(p256, false, K::Unknown),
             Some("Needs a certificate in this slot.")
+        );
+        assert_eq!(
+            piv_test_blocked(p256, false, K::NoKey),
+            Some("This slot has no key.")
         );
         assert_eq!(
             piv_test_blocked(None, true, K::Present),

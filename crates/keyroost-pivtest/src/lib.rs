@@ -201,7 +201,8 @@ enum EcCurve {
 }
 
 /// Build the challenge for `op` against a slot holding `(alg, pubkey)`, where
-/// `pubkey` is the slot certificate's public key.
+/// `pubkey` is the slot certificate's public key, or the key the card
+/// reports for a slot with no certificate.
 ///
 /// # Errors
 /// [`TestError::Unsupported`] if `op` is not defined for `alg`;
@@ -537,7 +538,8 @@ impl Outcome {
 }
 
 /// Run every [`SelfTest`] against a slot holding `(alg, pubkey)` — `pubkey`
-/// being the slot certificate's public key — in `Decrypt` → `KeyAgree` →
+/// being the slot certificate's public key, or the key the card reports for
+/// a slot with no certificate — in `Decrypt` → `KeyAgree` →
 /// `Sign` order.
 ///
 /// For each *applicable* operation, [`prepare`] builds the GENERAL
@@ -575,6 +577,12 @@ where
         })
         .collect()
 }
+
+/// The line front ends show above a report when the slot had no
+/// certificate and the test ran against the public key the card reports for
+/// it: the key works, but no certificate was part of the test.
+pub const CARD_KEY_NOTE: &str = "No certificate in this slot: tested against the \
+public key the card reports for it, so no certificate was part of the test.";
 
 /// One human-readable line per operation:
 /// `<op>: passed`, `<op>: FAILED \u{2014} <reason>`, or
