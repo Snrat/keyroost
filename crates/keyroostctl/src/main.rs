@@ -8168,11 +8168,14 @@ fn reset_one_card_applet(
         match step {
             ResetStep::Oath => {
                 let mut s = keyroost_transport::OathSession::open_traced(&reader()?, debug)?;
-                // Some keys (Nitrokey 3) ask for a touch to reset, as `oath reset` says.
-                crate::prompt::touch(&format!(
-                    "{}  touch the key if it blinks\u{2026}",
-                    step.label()
-                ));
+                // A Nitrokey 3 asks for a touch to reset, as `oath reset` says;
+                // a YubiKey doesn't.
+                if s.asks_touch_to_reset() {
+                    crate::prompt::touch(&format!(
+                        "{}  touch the key if it blinks\u{2026}",
+                        step.label()
+                    ));
+                }
                 s.factory_reset()?;
             }
             ResetStep::OpenPgp => {
@@ -8464,8 +8467,10 @@ fn run_oath(cmd: &OathCmd, debug: bool) -> Result<(), Box<dyn std::error::Error>
             // entire purpose — so no unlock is attempted.
             let name = crate::target::reader_of(&dev)?;
             let mut session = keyroost_transport::OathSession::open_traced(&name, debug)?;
-            // Some keys (Nitrokey 3) ask for a touch to reset.
-            crate::prompt::touch("Resetting \u{2014} touch the key if it blinks\u{2026}");
+            // A Nitrokey 3 asks for a touch to reset; a YubiKey doesn't.
+            if session.asks_touch_to_reset() {
+                crate::prompt::touch("Resetting \u{2014} touch the key if it blinks\u{2026}");
+            }
             session.factory_reset()?;
             println!("OATH applet reset: all credentials wiped, access password cleared.");
         }

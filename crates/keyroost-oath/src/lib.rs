@@ -587,6 +587,18 @@ impl SelectInfo {
     pub fn asks_touch_to_delete(&self) -> bool {
         self.serial.is_some()
     }
+
+    /// True when the applet asks for a touch to reset: Nitrokey's secrets
+    /// app ("Reset: always confirm with touch button", `fn reset` in
+    /// Nitrokey/trussed-secrets-app; seen on a Nitrokey 3). A YubiKey resets
+    /// without one (seen on a 5.7). The original oath-authenticator a Solo 2
+    /// 2.x runs has no presence check in its `reset`, and SoloKeys' current
+    /// firmware source builds in the secrets app instead; neither Solo 2
+    /// case is tested on hardware.
+    #[must_use]
+    pub fn asks_touch_to_reset(&self) -> bool {
+        self.serial.is_some()
+    }
 }
 
 /// Parse the SELECT response TLV bag into [`SelectInfo`].
@@ -1747,6 +1759,7 @@ mod tests {
         assert_eq!(info.more_data(), MoreData::SendRemaining);
         assert!(!info.lists_properties());
         assert!(!info.asks_touch_to_delete());
+        assert!(!info.asks_touch_to_reset());
 
         // Nitrokey 3 answer (firmware 1.9.0, salt shortened): SERIAL NUMBER
         // (0x8F) present, so ISO GET RESPONSE.
@@ -1759,6 +1772,7 @@ mod tests {
         assert_eq!(info.more_data(), MoreData::GetResponse);
         assert!(info.lists_properties());
         assert!(info.asks_touch_to_delete());
+        assert!(info.asks_touch_to_reset());
     }
 
     #[test]

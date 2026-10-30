@@ -442,6 +442,25 @@ impl std::fmt::Display for SessionOpError {
     }
 }
 
+/// What a key's own info said, remembered per key ([`App::key_details`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct KeyDetails {
+    model: Option<String>,
+    firmware: Option<String>,
+}
+
+impl KeyDetails {
+    /// Take what `newer` says, keeping what it leaves unsaid.
+    fn merge(&mut self, newer: &KeyDetails) {
+        if newer.model.is_some() {
+            self.model.clone_from(&newer.model);
+        }
+        if newer.firmware.is_some() {
+            self.firmware.clone_from(&newer.firmware);
+        }
+    }
+}
+
 #[derive(Default)]
 struct SecurityKeysState {
     /// CTAP info for the selected device, fetched lazily after selection.
@@ -455,8 +474,10 @@ struct SecurityKeysState {
     u2f_only: bool,
     /// User-facing error from the last enumeration / open / GetInfo call.
     error: Option<String>,
-    /// Live PIN entry field (cleared after submit).
-    pin_input: String,
+    /// Live PIN entry field (cleared after submit). Wipes itself when the
+    /// pane's state is replaced: the pane has no `Drop` (its tests build it
+    /// with struct update, which a `Drop` forbids).
+    pin_input: zeroize::Zeroizing<String>,
     /// Active unlocked session: token + cached resident credentials.
     session: Option<UnlockedSession>,
     /// The device `session` was unlocked on. Follow-on operations (reload,
@@ -868,7 +889,7 @@ impl Drop for ChangePinDialog {
 
 impl TypedSecrets for SecurityKeysState {
     fn secrets_mut(&mut self) -> Vec<&mut String> {
-        let mut out = vec![&mut self.pin_input];
+        let mut out = vec![&mut *self.pin_input];
         out.extend(self.change_pin.secrets_mut());
         if let Some(d) = self.advanced.as_mut() {
             out.extend(d.secrets_mut());
@@ -2696,7 +2717,16 @@ fn run_card_reset_step(
                 let name = reader.ok_or("no PC/SC reader for the OATH applet")?;
                 let mut s =
                     keyroost_transport::OathSession::open(name).map_err(|e| e.to_string())?;
-                s.factory_reset().map_err(|e| e.to_string())?;
+                // A Nitrokey 3 asks for a touch here; raise the banner then,
+                // and lower it after, whatever the outcome: the sweep's later
+                // steps (OpenPGP, PIV) run in the same job and need none.
+                KEY_WANTS_TOUCH.store(
+                    s.asks_touch_to_reset(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                let reset = s.factory_reset();
+                KEY_WANTS_TOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
+                reset.map_err(|e| e.to_string())?;
             }
             ResetStep::OpenPgp => {
                 let name = reader.ok_or("no PC/SC reader for the OpenPGP applet")?;
@@ -2752,12 +2782,12 @@ fn run_card_reset_step(
 }
 
 /// The status line while the factory reset's card sweep runs. The OTP erase
-/// waits for a touch on the key, and some keys (Nitrokey 3) ask for one to
-/// reset OATH; the sweep is one job with one label, so the label asks for the
-/// touch up front, as the OATH reset's does.
+/// always waits for a touch on the key, so the label asks for it up front. The
+/// OATH step asks for one only on some keys (Nitrokey 3); that step raises the
+/// touch banner itself once it knows.
 fn factory_reset_busy_label(card_steps: &[keyroost_resolve::ResetStep]) -> &'static str {
     use keyroost_resolve::ResetStep;
-    if card_steps.contains(&ResetStep::Token2Otp) || card_steps.contains(&ResetStep::Oath) {
+    if card_steps.contains(&ResetStep::Token2Otp) {
         "Factory-resetting key \u{2014} touch the key if it blinks\u{2026}"
     } else {
         "Factory-resetting key\u{2026}"
@@ -4704,6 +4734,12 @@ struct App {
     /// wherever a device disappears, so an unplugged key's cached identity
     /// doesn't linger indefinitely.
     piv_session_state: std::collections::HashMap<DeviceId, keyroost_transport::PivSessionState>,
+    /// What each key's own info said once it was read (the model its AAGUID
+    /// names, the firmware as its vendor states it), kept until the key is
+    /// unplugged: every scan rebuilds the rows from the USB names, and a key
+    /// read once keeps its official name rather than switching back when
+    /// another key is selected. Pruned like `piv_session_state`.
+    key_details: std::collections::HashMap<DeviceId, KeyDetails>,
     /// Keys the user chose to "ignore the compatibility table" for, this app
     /// run only (never persisted): features the table lists as unsupported
     /// become unverified — usable, with a warning — except RESET. Applied to
@@ -5615,16 +5651,27 @@ impl App {
             Some(d) => format!("{}: {}", d.title(), text.into()),
             None => text.into(),
         };
-        let text = without_home(&text);
-        // Against the newest line of the same severity, so the automatic
-        // trace line a traced refresh adds in between doesn't defeat it.
+        self.log_global_bg_once(severity, text);
+    }
+
+    /// [`Self::log_bg_once`] without the selected-key prefix, for fleet-level
+    /// lines such as the device-scan count, which every refresh repeats.
+    fn log_global_bg_once(&mut self, severity: Severity, text: impl Into<String>) {
+        let text = without_home(&text.into());
+        // A line that would carry this job's APDU trace is never dropped:
+        // the traffic is new even when the words aren't, and dropping the
+        // line would only leave the trace to the job's automatic line.
+        let traced = self.pending_trace.as_ref().is_some_and(|t| !t.is_empty());
+        // Against the newest line of the same severity, so a user action of
+        // another severity in between doesn't defeat it.
         let same = std::mem::discriminant(&severity);
-        if self
-            .log
-            .iter()
-            .rev()
-            .find(|l| std::mem::discriminant(&l.severity) == same)
-            .is_some_and(|l| l.text == text && matches!(l.kind, LogKind::Background))
+        if !traced
+            && self
+                .log
+                .iter()
+                .rev()
+                .find(|l| std::mem::discriminant(&l.severity) == same)
+                .is_some_and(|l| l.text == text && matches!(l.kind, LogKind::Background))
         {
             return;
         }
@@ -6173,26 +6220,60 @@ impl App {
         });
     }
 
-    /// Put what the selected key's info says on its row: the firmware as its
-    /// vendor states it ("fw 5.7.4", [`key_firmware`]) and the model its AAGUID names
-    /// ("YubiKey" -> "YubiKey 5 Series with NFC"). Called when the info is
-    /// read and after every scan, which rebuilds the rows from scratch.
+    /// Drop what is remembered per key for keys no longer in `devices`: an
+    /// unplugged key's cached PIV identity, and its read name and firmware
+    /// (a key that comes back starts from its USB name until read again).
+    fn forget_unplugged_keys(&mut self) {
+        let present = |id: &DeviceId| self.devices.iter().any(|d| &d.id == id);
+        self.piv_session_state.retain(|id, _| present(id));
+        self.key_details.retain(|id, _| present(id));
+    }
+
+    /// Remember what the selected key's info says (the firmware as its
+    /// vendor states it, "fw 5.7.4", [`key_firmware`]; the model its AAGUID
+    /// names, "YubiKey" -> "YubiKey 5 Series with NFC") and put every
+    /// remembered key's details on its row. Called when the info is read and
+    /// after every scan, which rebuilds the rows from scratch, so a key read
+    /// once keeps its name and firmware until it is unplugged.
     fn apply_key_details(&mut self) {
-        let Some(id) = self.selected_device.clone() else {
-            return;
-        };
-        let fw = self.security_keys.firmware.clone();
-        let model = self
-            .security_keys
-            .info
-            .as_ref()
-            .and_then(|info| ui::aaguid::model_for_aaguid(&info.aaguid));
-        if let Some(dev) = self.devices.iter_mut().find(|d| d.id == id) {
-            if let Some(fw) = fw {
-                dev.firmware = fw;
+        // The selected key's details as just read: always shown on its row.
+        let live = self.selected_device.clone().map(|id| {
+            let details = KeyDetails {
+                firmware: self.security_keys.firmware.clone(),
+                model: self
+                    .security_keys
+                    .info
+                    .as_ref()
+                    .and_then(|info| ui::aaguid::model_for_aaguid(&info.aaguid))
+                    .map(str::to_string),
+            };
+            (id, details)
+        });
+        // Remembered past this selection only under a serial id: a path-based
+        // id ("hid:…", "reader:…") can come back on a different key after a
+        // swap, and would carry this key's name onto it.
+        if let Some((id, details)) = &live {
+            let said = details.model.is_some() || details.firmware.is_some();
+            // `serial:X#2` names a duplicate serial by scan order: not one key.
+            if said && id.starts_with("serial:") && !id.contains('#') {
+                let kept = self.key_details.entry(id.clone()).or_default();
+                kept.merge(details);
             }
-            if let Some(model) = model {
-                dev.model = model.to_string();
+        }
+        for dev in &mut self.devices {
+            let selected = live.as_ref().filter(|(id, _)| *id == dev.id);
+            for details in self
+                .key_details
+                .get(&dev.id)
+                .into_iter()
+                .chain(selected.map(|(_, d)| d))
+            {
+                if let Some(fw) = &details.firmware {
+                    dev.firmware = fw.clone();
+                }
+                if let Some(model) = &details.model {
+                    dev.model = model.clone();
+                }
             }
         }
     }
@@ -6209,7 +6290,7 @@ impl App {
         let Some(target) = self.selected_fido_target() else {
             return;
         };
-        let pin = zeroize::Zeroizing::new(std::mem::take(&mut self.security_keys.pin_input));
+        let pin = std::mem::take(&mut self.security_keys.pin_input);
         if pin.is_empty() {
             self.security_keys.error = Some("PIN is empty".into());
             return;
@@ -7777,7 +7858,9 @@ impl App {
                         if matches!(e, TransportError::OathPasswordRejected) {
                             app.oath.unlocked_password = None;
                             app.oath.locked = true;
-                            app.oath.error = Some("wrong OATH password".into());
+                            // With no password sent, the locked box says it all.
+                            app.oath.error =
+                                (!password.is_empty()).then(|| "wrong OATH password".into());
                         } else {
                             app.oath.error = Some(e.to_string());
                         }
@@ -7808,7 +7891,11 @@ impl App {
         match &result {
             Ok(_) if modal_busy => app.oath.add.result = Some(Ok(())),
             Err(TransportError::OathPasswordRejected) if modal_busy => {
-                app.oath.add.result = Some(Err("wrong OATH password".into()));
+                app.oath.add.result = Some(Err(if password.is_empty() {
+                    "This key's Authenticator is password-protected: unlock it first".into()
+                } else {
+                    "wrong OATH password".into()
+                }));
             }
             Err(e) if modal_busy => app.oath.add.result = Some(Err(e.to_string())),
             _ => {}
@@ -7853,9 +7940,11 @@ impl App {
                 app.oath.unlocked_password = None;
                 app.oath.locked = true;
                 // The add modal already shows this; don't double-report when it
-                // is the one that failed.
+                // is the one that failed. A listing sent without a password
+                // (opening the tab on a protected key) was never "wrong": the
+                // locked box says the key wants one.
                 if !modal_busy {
-                    app.oath.error = Some("wrong OATH password".into());
+                    app.oath.error = (!password.is_empty()).then(|| "wrong OATH password".into());
                 }
             }
             Err(e) => {
@@ -8354,11 +8443,16 @@ impl App {
             return;
         };
         let for_device = self.selected_device.clone();
-        // Some keys (Nitrokey 3) ask for a touch to reset.
-        let label = "Resetting OATH applet \u{2014} touch the key if it blinks\u{2026}";
+        // A Nitrokey 3 asks for a touch to reset; the job raises the touch
+        // banner on such a key only, once the open says which it is.
+        let label = "Resetting OATH applet\u{2026}";
         self.spawn_job(label, move || {
             let result = (|| -> Result<(), TransportError> {
                 let mut session = keyroost_transport::OathSession::open(&reader)?;
+                KEY_WANTS_TOUCH.store(
+                    session.asks_touch_to_reset(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 session.factory_reset()
             })();
             Box::new(move |app: &mut App| {
@@ -10856,9 +10950,9 @@ impl App {
                     for w in keyroost_resolve::take_scan_warnings() {
                         app.log_global(Severity::Warn, LogKind::User, w);
                     }
-                    app.log_global(
+                    // Every refresh scans; the same count again isn't news.
+                    app.log_global_bg_once(
                         Severity::Info,
-                        LogKind::Background,
                         format!(
                             "device scan: {} device{} found",
                             devices.len(),
@@ -10872,8 +10966,8 @@ impl App {
                     );
                     app.devices = devices;
                     // A device that's genuinely gone shouldn't leave its
-                    // cached PIV identity/pubkey data sitting in memory
-                    // indefinitely. Prune here, against an actual fresh scan
+                    // cached PIV identity/pubkey data, or its read name and
+                    // firmware, sitting in memory indefinitely. Prune here, against an actual fresh scan
                     // result, rather than on every selection change (nothing
                     // about switching *which* still-present device is
                     // selected implies any device disappeared) or on a
@@ -10881,8 +10975,7 @@ impl App {
                     // actually went away, and wiping every entry over one
                     // pcscd hiccup would force a full re-fingerprint of
                     // everything on the next successful scan for no reason).
-                    app.piv_session_state
-                        .retain(|id, _| app.devices.iter().any(|d| &d.id == id));
+                    app.forget_unplugged_keys();
                     // A different selection reads its tabs afresh anyway.
                     let reread = std::mem::take(&mut app.reread_after_scan);
                     if changed {
@@ -19216,7 +19309,7 @@ impl App {
                 ui.horizontal(|ui| {
                     let resp = ui.add_sized(
                         [220.0, 32.0],
-                        egui::TextEdit::singleline(&mut self.security_keys.pin_input)
+                        egui::TextEdit::singleline(&mut *self.security_keys.pin_input)
                             .vertical_align(egui::Align::Center)
                             .password(true)
                             .hint_text("Enter PIN to unlock this key"),
@@ -23816,7 +23909,12 @@ impl App {
                     if submit
                         || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                     {
-                        self.load_oath_creds();
+                        // As the FIDO2 unlock card does: nothing to send.
+                        if self.oath.password_input.is_empty() {
+                            self.oath.error = Some("Password is empty".into());
+                        } else {
+                            self.load_oath_creds();
+                        }
                     }
                 });
             });
@@ -27873,8 +27971,9 @@ mod tests {
                 .contains("touch the key")
         );
         assert!(!factory_reset_busy_label(&[ResetStep::OpenPgp, ResetStep::Piv]).contains("touch"));
-        // Some keys (Nitrokey 3) ask for a touch to reset OATH.
-        assert!(factory_reset_busy_label(&[ResetStep::Oath]).contains("touch the key"));
+        // OATH asks for a touch only on some keys; that step raises the
+        // banner itself rather than every key's label asking.
+        assert!(!factory_reset_busy_label(&[ResetStep::Oath]).contains("touch"));
     }
 
     #[test]
@@ -31452,6 +31551,35 @@ mod tests {
         );
     }
 
+    /// Every refresh scans for devices: the same count twice in a row is one
+    /// line; a new count, or the same count after another line, is logged.
+    #[test]
+    fn a_repeated_device_scan_count_is_logged_once() {
+        let mut app = App::default();
+        app.log_global_bg_once(Severity::Info, "device scan: 3 devices found");
+        app.log_global_bg_once(Severity::Info, "device scan: 3 devices found");
+        app.log_global_bg_once(Severity::Info, "device scan: 2 devices found");
+        app.log(Severity::Info, "a: something the user did");
+        app.log_global_bg_once(Severity::Info, "device scan: 2 devices found");
+        let lines: Vec<&str> = app.log.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "device scan: 3 devices found",
+                "device scan: 2 devices found",
+                "a: something the user did",
+                "device scan: 2 devices found"
+            ]
+        );
+        // With APDU trace on, each scan's line carries its traffic: kept.
+        app.pending_trace = Some(vec!["> select".into()]);
+        app.log_global_bg_once(Severity::Info, "device scan: 2 devices found");
+        let last = app.log.last().expect("logged");
+        assert_eq!(last.text, "device scan: 2 devices found");
+        assert!(last.trace.is_some());
+        assert_eq!(app.log.len(), 5);
+    }
+
     /// A FIDO2 reset run on its own (not a factory reset's last step) writes
     /// a line, success or failure.
     #[test]
@@ -31571,22 +31699,50 @@ mod tests {
         App::apply_oath_rows(
             &mut app,
             Err(TransportError::OathPasswordRejected),
-            zeroize::Zeroizing::new(String::new()),
+            zeroize::Zeroizing::new("typed".to_string()),
         );
         assert!(!app.oath.add.busy);
         assert_eq!(app.oath.add.result, Some(Err("wrong OATH password".into())));
         assert!(app.oath.error.is_none());
 
-        // No modal open: the pane-level error path still works (unlock/refresh).
+        // An add on a locked key sent no password: it asks for an unlock.
+        let mut app = App::default();
+        app.oath.add = OathAddDialog::opened();
+        app.oath.add.busy = true;
+        App::apply_oath_rows(
+            &mut app,
+            Err(TransportError::OathPasswordRejected),
+            zeroize::Zeroizing::new(String::new()),
+        );
+        assert_eq!(
+            app.oath.add.result,
+            Some(Err(
+                "This key's Authenticator is password-protected: unlock it first".into()
+            ))
+        );
+
+        // No modal open: a typed password the key refused is reported in the
+        // pane (unlock/refresh).
+        let mut app = App::default();
+        App::apply_oath_rows(
+            &mut app,
+            Err(TransportError::OathPasswordRejected),
+            zeroize::Zeroizing::new("typed".to_string()),
+        );
+        assert!(!app.oath.add.open);
+        assert!(app.oath.locked);
+        assert_eq!(app.oath.error.as_deref(), Some("wrong OATH password"));
+
+        // Opening the tab on a protected key lists without a password: the
+        // key's refusal locks the pane but is no "wrong password".
         let mut app = App::default();
         App::apply_oath_rows(
             &mut app,
             Err(TransportError::OathPasswordRejected),
             zeroize::Zeroizing::new(String::new()),
         );
-        assert!(!app.oath.add.open);
         assert!(app.oath.locked);
-        assert_eq!(app.oath.error.as_deref(), Some("wrong OATH password"));
+        assert!(app.oath.error.is_none());
     }
 
     /// With "Use default management key" ticked, `piv_current_mgmt_key` ignores
@@ -33189,7 +33345,7 @@ mod tests {
     #[test]
     fn idle_lock_wipes_typed_secrets_in_every_pane() {
         let mut app = App::default();
-        app.security_keys.pin_input = "fido-pin".into();
+        app.security_keys.pin_input = zeroize::Zeroizing::new("fido-pin".into());
         app.oath.password_input = "oath-password".into();
         app.otp.pin_input = "otp-pin".into();
         app.openpgp.passphrase = "backup-passphrase".into();
@@ -33589,6 +33745,64 @@ mod tests {
         app.devices = vec![sel_key("serial:37806840", "37806840", None)];
         app.apply_key_details();
         check(&app);
+    }
+
+    /// A key whose info was read keeps its official name and firmware when
+    /// another key is selected and the rows are rebuilt; its details go
+    /// once it is unplugged.
+    #[test]
+    fn key_details_stay_with_their_key_until_it_is_unplugged() {
+        let yk = || sel_key("serial:37806840", "37806840", None);
+        let other = || sel_key("serial:B", "B", None);
+        let mut app = App {
+            selected_device: Some("serial:37806840".into()),
+            devices: vec![yk(), other()],
+            ..Default::default()
+        };
+        app.security_keys.firmware = Some("5.7.4".into());
+        app.security_keys.info = Some(AuthenticatorInfo {
+            aaguid: [
+                0xfa, 0x2b, 0x99, 0xdc, 0x9e, 0x39, 0x42, 0x57, 0x8f, 0x92, 0x4a, 0x30, 0xd2, 0x3c,
+                0x41, 0x18,
+            ],
+            ..Default::default()
+        });
+        app.apply_key_details();
+        // Another key is selected (its info not read yet) and a scan rebuilds
+        // every row from the USB names.
+        app.selected_device = Some("serial:B".into());
+        app.security_keys = SecurityKeysState::default();
+        app.devices = vec![yk(), other()];
+        app.apply_key_details();
+        assert_eq!(app.devices[0].model, "YubiKey 5 Series with NFC");
+        assert_eq!(app.devices[0].firmware, "5.7.4");
+        assert_eq!(app.devices[1].model, other().model, "B keeps its own");
+        // Unplugged: the next scan prunes it, so a key that comes back
+        // starts from its USB name again until it is read.
+        app.devices = vec![other()];
+        app.forget_unplugged_keys();
+        assert!(app.key_details.is_empty());
+    }
+
+    /// A key known only by its USB path shows what was read while it is
+    /// selected, but isn't remembered: the path can return on another key.
+    #[test]
+    fn a_path_named_key_shows_its_details_but_isnt_remembered() {
+        let by_path = || sel_key("hid:/dev/hidraw9", "", None);
+        let mut app = App {
+            selected_device: Some("hid:/dev/hidraw9".into()),
+            devices: vec![by_path()],
+            ..Default::default()
+        };
+        app.security_keys.firmware = Some("2.964".into());
+        app.apply_key_details();
+        assert_eq!(app.devices[0].firmware, "2.964", "shown while selected");
+        assert!(app.key_details.is_empty(), "not remembered");
+        app.selected_device = None;
+        app.security_keys = SecurityKeysState::default();
+        app.devices = vec![by_path()];
+        app.apply_key_details();
+        assert_eq!(app.devices[0].firmware, "");
     }
 
     /// The selected key is unplugged: selection falls back to another key,

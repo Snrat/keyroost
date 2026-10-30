@@ -149,6 +149,12 @@ pub trait IdentityReader: Sync {
     /// answered without one; that answer is kept for the plug-in.
     fn read_hid(&self, h: &HidDevice, debug: bool) -> KeyAnswer<CanonicalId>;
     fn read_ccid(&self, p: &ReaderProbe, debug: bool) -> Option<CanonicalId>;
+    /// Whether to ask a HID node with no USB serial even when no reader could
+    /// pair with it: its answer is then the row's only serial. Off by
+    /// default; the reads exist for pairing, and each adds FIDO-side traffic.
+    fn names_unpaired_hid(&self) -> bool {
+        false
+    }
 }
 
 pub const SOLO2_VID: u16 = 0x1209;
@@ -163,6 +169,12 @@ pub struct YubicoIdentity;
 impl IdentityReader for YubicoIdentity {
     fn vendor(&self) -> &'static str {
         "Yubico"
+    }
+    /// A YubiKey's USB FIDO interface reports no serial: with its smart-card
+    /// side off (or a FIDO-only model), the READ CONFIG answer is the only
+    /// serial its row can show, and names are kept by serial.
+    fn names_unpaired_hid(&self) -> bool {
+        true
     }
     fn claims_hid(&self, h: &HidDevice) -> bool {
         // Not a NEO: one answered READ CONFIG with ERR_INVALID_CMD on every
@@ -230,6 +242,12 @@ pub struct Token2Identity;
 impl IdentityReader for Token2Identity {
     fn vendor(&self) -> &'static str {
         "Token2"
+    }
+    /// A Token2 key's USB interface reports no serial, so where nothing pairs
+    /// with it (on Linux, a PIN+ whose card side has no reader) the §6.10
+    /// answer is the only serial its row can show.
+    fn names_unpaired_hid(&self) -> bool {
+        true
     }
     fn claims_hid(&self, h: &HidDevice) -> bool {
         h.vendor_id == keyroost_proto::USB_VID
@@ -333,7 +351,8 @@ pub fn plan_identity_reads(
             .filter(|p| r.claims_reader(p))
             .collect();
         for h in &hs {
-            if ps.iter().any(|p| eligible(h, p))
+            let unpaired_row = r.names_unpaired_hid() && h.serial_number.is_none();
+            if (ps.iter().any(|p| eligible(h, p)) || unpaired_row)
                 && !plan.hid.iter().any(|(pv, x)| *pv == v && x == &h.path)
             {
                 plan.hid.push((v, h.path.clone()));
@@ -406,7 +425,20 @@ fn unique_per_plug_in(h: &HidDevice) -> bool {
 /// leave a key unmatched. An identity is kept only where
 /// [`unique_per_plug_in`]. Only the key's own answers are kept, never a
 /// failure to reach it, so a key that was briefly busy is asked again.
-type HidIdCache = Vec<((PlugIn, usize), Option<CanonicalId>)>;
+type HidIdCache = Vec<((PlugIn, usize), Cached)>;
+
+/// One cached HID identity outcome.
+#[derive(Clone, Debug)]
+enum Cached {
+    /// The key's answer, kept for the plug-in: not asked again.
+    Answer(Option<CanonicalId>),
+    /// The last identity a plug-in that isn't unique per plug-in (a Windows
+    /// device node) gave: it is asked again every scan, but a scan where it
+    /// doesn't answer (busy with a browser's sign-in, say) keeps this one,
+    /// so the key's row keeps its serial and id and the app's selection
+    /// doesn't jump away from it. Dropped with the plug-in.
+    Fallback(CanonicalId),
+}
 static HID_ID_CACHE: std::sync::Mutex<HidIdCache> = std::sync::Mutex::new(Vec::new());
 
 /// [`read_identities`], asking each HID interface at most once per plug-in
@@ -495,17 +527,27 @@ fn hid_identities_from(
             continue;
         };
         let key = (PlugIn::of(h), *v);
-        let id = match cache.iter().find(|(k, _)| *k == key) {
-            Some((_, id)) => id.clone(),
-            None => {
-                let id = match ask(*v, h) {
-                    KeyAnswer::Reply(id) => Some(id),
-                    KeyAnswer::Declined => None,
-                    KeyAnswer::NoAnswer => continue,
+        let entry = cache.iter().position(|(k, _)| *k == key);
+        let id = match entry.map(|i| cache[i].1.clone()) {
+            Some(Cached::Answer(id)) => id,
+            earlier => {
+                let fallback = match earlier {
+                    Some(Cached::Fallback(id)) => Some(id),
+                    _ => None,
                 };
-                if id.is_none() || unique_per_plug_in(h) {
-                    cache.push((key, id.clone()));
-                }
+                let (id, keep) = match ask(*v, h) {
+                    KeyAnswer::Reply(id) if unique_per_plug_in(h) => {
+                        (Some(id.clone()), Cached::Answer(Some(id)))
+                    }
+                    KeyAnswer::Reply(id) => (Some(id.clone()), Cached::Fallback(id)),
+                    KeyAnswer::Declined => (None, Cached::Answer(None)),
+                    KeyAnswer::NoAnswer => match fallback {
+                        Some(id) => (Some(id.clone()), Cached::Fallback(id)),
+                        None => continue,
+                    },
+                };
+                cache.retain(|(k, _)| *k != key);
+                cache.push((key, keep));
                 id
             }
         };
@@ -711,9 +753,11 @@ mod tests {
     }
 
     #[test]
-    fn reported_topology_on_both_sides_is_never_planned() {
+    fn reported_topology_on_both_sides_is_never_planned_for_pairing() {
         // A FIDO-only YubiKey next to another key's reader: both report
-        // bus/address and differ, which is already proof they are two keys.
+        // bus/address and differ, which is already proof they are two keys,
+        // so that reader is never asked. The YubiKey itself is asked once,
+        // for its own row's serial (nothing else can give one).
         let hids = [hid(
             0x1050,
             0x0402,
@@ -723,10 +767,9 @@ mod tests {
             Some(60),
         )];
         let probes = [reader(YK0, Some("11111111"), Some(9), Some(53))];
-        assert_eq!(
-            plan_identity_reads(&hids, &probes, IDENTITY_READERS),
-            IdentityPlan::default()
-        );
+        let plan = plan_identity_reads(&hids, &probes, IDENTITY_READERS);
+        assert_eq!(plan.hid, vec![(0, "/dev/hidraw20".into())]);
+        assert!(plan.ccid.is_empty(), "the other key's reader isn't asked");
     }
 
     #[test]
@@ -746,6 +789,34 @@ mod tests {
             vec![(0, "/dev/hidraw17".into()), (0, "/dev/hidraw18".into())]
         );
         assert_eq!(plan.ccid, vec![(0, YK0.to_string()), (0, YK1.to_string())]);
+    }
+
+    /// A Token2 or YubiKey USB side has no serial: with no reader to pair
+    /// (a PIN+ on Linux, a YubiKey with its smart-card side off), it is
+    /// still asked, so its row shows the serial. A Solo 2 in the same spot is
+    /// not: its answer isn't a row serial.
+    #[test]
+    fn an_unpaired_token2_or_yubikey_is_asked_for_its_serial() {
+        let hids = [
+            hid(0x349E, 0x0024, "/dev/hidraw13", None, Some(9), Some(70)),
+            hid(0x1050, 0x0402, "/dev/hidraw20", None, Some(9), Some(60)),
+            hid(0x1209, 0xBEEE, "/dev/hidraw14", None, Some(9), Some(15)),
+        ];
+        let plan = plan_identity_reads(&hids, &[], IDENTITY_READERS);
+        assert_eq!(
+            plan.hid,
+            vec![(0, "/dev/hidraw20".into()), (2, "/dev/hidraw13".into())]
+        );
+        assert!(plan.ccid.is_empty());
+        // One that reports a USB serial needs no read.
+        let hids = [
+            hid(0x349E, 0x0024, "/dev/hidraw13", Some("1"), None, None),
+            hid(0x1050, 0x0402, "/dev/hidraw20", Some("2"), None, None),
+        ];
+        assert_eq!(
+            plan_identity_reads(&hids, &[], IDENTITY_READERS),
+            IdentityPlan::default()
+        );
     }
 
     #[test]
@@ -785,16 +856,16 @@ mod tests {
     }
 
     #[test]
-    fn no_counterpart_no_read_and_molto_or_prog_never() {
+    fn no_counterpart_only_the_row_read_and_molto_or_prog_never() {
         let hids = [hid(0x1050, 0x0407, "/dev/hidraw17", None, None, None)];
         let mut prog = reader("Generic NFC 00 00", None, None, None);
         prog.is_prog = true;
         prog.has_oath = false;
         let probes = [reader("TOKEN2 Molto2 00 00", None, None, None), prog];
-        assert_eq!(
-            plan_identity_reads(&hids, &probes, IDENTITY_READERS),
-            IdentityPlan::default()
-        );
+        let plan = plan_identity_reads(&hids, &probes, IDENTITY_READERS);
+        // No reader is ever asked; the YubiKey is asked for its row's serial.
+        assert!(plan.ccid.is_empty());
+        assert_eq!(plan.hid, vec![(0, "/dev/hidraw17".into())]);
     }
 
     #[test]
@@ -957,6 +1028,43 @@ mod tests {
             }
             assert_eq!(asked, vec![0, 1, 0], "{}", h.path.display());
         }
+    }
+
+    /// A Windows device node is asked every scan, but a scan where the key
+    /// doesn't answer keeps its last identity, so its row keeps its serial
+    /// and id; the identity goes with the plug-in.
+    #[test]
+    fn a_port_based_plug_in_keeps_its_last_identity_through_a_missed_answer() {
+        let mut win = hid(
+            0x1050,
+            0x0407,
+            r"\\?\HID#VID_1050&PID_0407&MI_01#7&1A2B3C4D&0&0000#{4d1e55b2}",
+            None,
+            None,
+            None,
+        );
+        win.usb_device = Some(UsbDeviceKey::win_node(r"USB\VID_1050&PID_0407\5&ABC&0&3"));
+        let hids = [win.clone()];
+        let plan = hid_plan(&[(0, win.path.to_str().unwrap())]);
+        let mut cache = HidIdCache::new();
+        let five = || yubico_from_serial_str("5").unwrap();
+        let mut asked = 0;
+        let mut scan = |cache: &mut HidIdCache, answer: KeyAnswer<CanonicalId>| {
+            asked += 1;
+            hid_identities_from(cache, &plan, &hids, |_, _| answer.clone())
+        };
+        assert_eq!(scan(&mut cache, KeyAnswer::Reply(five())).len(), 1);
+        let missed = scan(&mut cache, KeyAnswer::NoAnswer);
+        assert_eq!(missed.get(&win.path), Some(&five()), "kept through a miss");
+        assert_eq!(scan(&mut cache, KeyAnswer::Reply(five())).len(), 1);
+        assert_eq!(asked, 3, "asked every scan");
+        // Unplugged: the fallback goes with it.
+        hid_identities_from(&mut cache, &IdentityPlan::default(), &[], |_, _| {
+            panic!("nothing to ask")
+        });
+        assert!(cache.is_empty());
+        let after = hid_identities_from(&mut cache, &plan, &hids, |_, _| KeyAnswer::NoAnswer);
+        assert!(after.is_empty(), "a fresh plug-in has no fallback");
     }
 
     /// The key's own serial is part of its plug-in: a different key showing
