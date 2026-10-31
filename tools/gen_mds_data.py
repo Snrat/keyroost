@@ -62,7 +62,19 @@ def is_hardware_authenticator(stmt: dict) -> bool:
     (often also "secure_element"), while software/platform passkey providers
     list "software" only. Dropping the software-only entries keeps the bundle
     to physical authenticators without naming any vendor.
+
+    Some USB security keys (for example Nitrokey 3 AM) still declare
+    ``keyProtection: ["software"]``.  ``attachmentHint`` tells us they are
+    roaming authenticators, so keep those as well whatever the keyProtection
+    claim says.
     """
+    hint = stmt.get("attachmentHint")
+    if isinstance(hint, int) and hint & 0x02:  # external
+        return True
+    if isinstance(hint, str) and "external" in hint.lower():
+        return True
+    if isinstance(hint, (list, tuple)) and any(str(h).lower() == "external" for h in hint):
+        return True
     kp = stmt.get("keyProtection") or []
     if not kp:
         return True  # no claim either way: keep it
@@ -102,8 +114,11 @@ def _render_svg(svg_text: str, max_px: int) -> bytes:
     return bytes(out) if isinstance(out, list) else out
 
 
+PNG_SIG = b"\x89PNG\r\n\x1a\n"
+
+
 def process_icon(uri: str, max_px: int) -> bytes:
-    """Render SVG data-URIs to PNG and downscale anything larger than max_px."""
+    """Render SVG data-URIs to PNG, convert non-PNG payloads, downscale large icons."""
     import io
 
     from PIL import Image
@@ -122,11 +137,15 @@ def process_icon(uri: str, max_px: int) -> bytes:
         return out.getvalue()
     img = Image.open(io.BytesIO(raw))
     w, h = img.size
-    if max(w, h) <= max_px:
-        return raw  # already fits: keep the vendor bytes untouched
+    is_png = raw.startswith(PNG_SIG)
+    if is_png and max(w, h) <= max_px:
+        return raw  # already PNG and fits: keep the vendor bytes untouched
+    # Some entries carry JPEG bytes behind a data:image/png URI. Re-encode those
+    # so keyroost's PNG-only decoder can read every bundled icon.
     img = img.convert("RGBA")
-    scale = max_px / max(w, h)
-    img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+    scale = min(1.0, max_px / max(w, h))
+    if scale < 1.0:
+        img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
     out = io.BytesIO()
     img.save(out, "PNG", optimize=True)
     return out.getvalue()
