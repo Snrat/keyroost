@@ -18,6 +18,13 @@ Usage:
 
 Run it periodically (the FIDO Alliance suggests ~monthly).
 
+Icon normalisation (optional dependencies: Pillow always, resvg_py when the
+BLOB carries SVG icons): SVG data-URIs are rendered to PNG, and every icon is
+downscaled so its longest edge is at most --icon-max-px (default 88). The GUI
+draws the icon at 44x44 points, so 88 px covers a 200% display scaling exactly
+(44 x 2 = 88); icons that already fit are kept byte-for-byte. The GUI decodes
+PNG only, so without this step the SVG-only vendors would show no logo at all.
+
 The output (crates/keyroost/assets/mds_data.json) is embedded at build time, but
 the app ALSO loads a user-supplied copy at runtime if present, so distributed
 binaries (AppImage / .exe / .dmg) can be updated WITHOUT rebuilding. Drop the
@@ -31,6 +38,7 @@ regenerated file at one of:
 import argparse
 import base64
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -59,6 +67,69 @@ def is_hardware_authenticator(stmt: dict) -> bool:
     if not kp:
         return True  # no claim either way: keep it
     return "hardware" in kp or "software" not in kp
+
+
+# --- icon normalisation ------------------------------------------------------
+#
+# The MDS icons are a mix of PNG data-URIs and (for a few dozen vendors) SVG
+# data-URIs. The GUI decodes PNG only, so SVG entries currently show no icon at
+# all, and vendor PNGs can be far larger than the 20-24 px they are drawn at.
+# Same treatment as LibreKey Companion's bundler: render SVG to PNG, then cap the
+# longest edge. Icons that already fit are kept byte-for-byte.
+
+MAX_ICON_PX = 88
+
+
+def _render_svg(svg_text: str, max_px: int) -> bytes:
+    import resvg_py
+
+    svg_text = re.sub(r'(<svg\b[^>]*?)\s+width="[^"]*"', r"\1", svg_text, count=1)
+    svg_text = re.sub(r'(<svg\b[^>]*?)\s+height="[^"]*"', r"\1", svg_text, count=1)
+    m = re.search(r'viewBox\s*=\s*"([\d.\s+-]+)"', svg_text, re.I)
+    vw = vh = None
+    if m:
+        parts = m.group(1).split()
+        if len(parts) == 4:
+            vw, vh = float(parts[2]), float(parts[3])
+    if vw and vh:
+        s = max_px / max(vw, vh, 1)
+        svg_text = svg_text.replace(
+            "<svg",
+            '<svg width="%d" height="%d" ' % (max(1, round(vw * s)), max(1, round(vh * s))),
+            1,
+        )
+    out = resvg_py.svg_to_bytes(svg_string=svg_text)
+    return bytes(out) if isinstance(out, list) else out
+
+
+def process_icon(uri: str, max_px: int) -> bytes:
+    """Render SVG data-URIs to PNG and downscale anything larger than max_px."""
+    import io
+
+    from PIL import Image
+
+    payload = uri.split(",", 1)[1]
+    raw = base64.b64decode(payload + "=" * (-len(payload) % 4))
+    if uri.startswith("data:image/svg"):
+        raw = _render_svg(raw.decode("utf-8", "ignore"), max_px)
+        img = Image.open(io.BytesIO(raw))
+        w, h = img.size
+        scale = min(1.0, max_px / max(w, h))
+        if scale < 1.0:
+            img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+        out = io.BytesIO()
+        img.convert("RGBA").save(out, "PNG", optimize=True)
+        return out.getvalue()
+    img = Image.open(io.BytesIO(raw))
+    w, h = img.size
+    if max(w, h) <= max_px:
+        return raw  # already fits: keep the vendor bytes untouched
+    img = img.convert("RGBA")
+    scale = max_px / max(w, h)
+    img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+    out = io.BytesIO()
+    img.save(out, "PNG", optimize=True)
+    return out.getvalue()
 
 
 def b64url_decode(seg: str) -> bytes:
@@ -149,6 +220,8 @@ def main() -> int:
     ap.add_argument("--vendor-filter", action="store_true",
                     help="use the legacy TARGET_VENDORS description whitelist")
     ap.add_argument("--no-icons", action="store_true", help="omit icon data URIs")
+    ap.add_argument("--icon-max-px", type=int, default=MAX_ICON_PX,
+                    help=f"cap the icon's longest edge (default {MAX_ICON_PX}; 0 keeps icons as-is)")
     ap.add_argument("--blob", help="path to a local BLOB (.jwt) instead of downloading")
     ap.add_argument("--out", default=OUT)
     args = ap.parse_args()
@@ -168,6 +241,26 @@ def main() -> int:
     entries = payload.get("entries", [])
     print(f"BLOB has {len(entries)} entries", file=sys.stderr)
 
+    # Icon processing is the only part of this script that needs third-party
+    # packages, and they stay optional: without Pillow the icons are embedded as
+    # they are, without resvg_py the SVG-only ones are left alone (the GUI cannot
+    # render SVG, so those vendors keep showing no logo). One warning, no failure.
+    skip_svg = False
+    if not args.no_icons and args.icon_max_px > 0:
+        import importlib.util
+
+        if importlib.util.find_spec("PIL") is None:
+            print("warning: Pillow is not installed, icons are embedded as-is "
+                  "(pip install pillow)", file=sys.stderr)
+            args.icon_max_px = 0
+        elif importlib.util.find_spec("resvg_py") is None:
+            svg = sum(1 for e in entries
+                      if ((e.get("metadataStatement") or {}).get("icon") or "").startswith("data:image/svg"))
+            if svg:
+                print(f"warning: resvg_py is not installed, {svg} SVG icon(s) left as-is "
+                      f"(pip install resvg-py)", file=sys.stderr)
+                skip_svg = True
+
     out = []
     for e in entries:
         aaguid = e.get("aaguid")
@@ -185,10 +278,22 @@ def main() -> int:
                 continue
         st = latest_status(e)
         get_info = stmt.get("authenticatorGetInfo", {}) or {}
+        icon = None
+        if not args.no_icons:
+            icon = stmt.get("icon")
+            if icon and skip_svg and icon.startswith("data:image/svg"):
+                pass  # no SVG renderer available; keep the vendor bytes
+            elif icon and args.icon_max_px > 0:
+                try:
+                    png = process_icon(icon, args.icon_max_px)
+                    icon = "data:image/png;base64," + base64.b64encode(png).decode()
+                except Exception as ex:  # noqa: BLE001
+                    # Leave the vendor bytes untouched rather than dropping the icon.
+                    print(f"  ! icon kept as-is for {desc[:44]}: {ex}", file=sys.stderr)
         out.append({
             "aaguid": aaguid.lower(),
             "description": desc,
-            "icon": None if args.no_icons else stmt.get("icon"),
+            "icon": icon,
             "status": st.get("status"),
             "certificateNumber": st.get("certificateNumber"),
             "effectiveDate": st.get("effectiveDate"),
