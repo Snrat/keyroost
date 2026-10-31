@@ -8,8 +8,11 @@ and writes a slimmed projection: per AAGUID only description, icon, and the
 latest status report. That keeps the embedded asset small.
 
 Usage:
-    python3 tools/gen_mds_data.py                # target vendors only (default)
+    python3 tools/gen_mds_data.py                # hardware authenticators (default)
     python3 tools/gen_mds_data.py --all          # every FIDO2 entry
+    python3 tools/gen_mds_data.py --include-software  # keep software/platform ones
+    python3 tools/gen_mds_data.py --filter yubi token2  # extra name filter
+    python3 tools/gen_mds_data.py --vendor-filter    # legacy name whitelist
     python3 tools/gen_mds_data.py --no-icons     # omit icons (smaller file)
     python3 tools/gen_mds_data.py --blob file.jwt  # use a local BLOB instead
 
@@ -35,12 +38,27 @@ import urllib.request
 MDS_URL = "https://mds3.fidoalliance.org/"
 OUT = "crates/keyroost/assets/mds_data.json"
 
-# Substrings (case-insensitive) matched against the statement description to keep
-# the bundled file focused on the hardware keys keyroost targets. Edit freely.
+# Optional vendor whitelist (--vendor-filter). Kept for backwards compatibility;
+# the default selection is device-based (see is_hardware_authenticator) so that
+# any hardware key is included, not only the vendors listed here.
 TARGET_VENDORS = [
     "token2", "yubico", "yubikey", "feitian", "nitrokey",
     "solokey", "somu", "google titan", "onlykey",
 ]
+
+
+def is_hardware_authenticator(stmt: dict) -> bool:
+    """Match the device, not the vendor name.
+
+    MDS3 metadata carries ``keyProtection``: hardware keys list "hardware"
+    (often also "secure_element"), while software/platform passkey providers
+    list "software" only. Dropping the software-only entries keeps the bundle
+    to physical authenticators without naming any vendor.
+    """
+    kp = stmt.get("keyProtection") or []
+    if not kp:
+        return True  # no claim either way: keep it
+    return "hardware" in kp or "software" not in kp
 
 
 def b64url_decode(seg: str) -> bytes:
@@ -124,6 +142,12 @@ def latest_status(entry: dict):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--all", action="store_true", help="keep every FIDO2 entry")
+    ap.add_argument("--include-software", action="store_true",
+                    help="keep software/platform authenticators (default: dropped)")
+    ap.add_argument("--filter", nargs="*", default=None,
+                    help="only keep authenticators whose description contains any of these")
+    ap.add_argument("--vendor-filter", action="store_true",
+                    help="use the legacy TARGET_VENDORS description whitelist")
     ap.add_argument("--no-icons", action="store_true", help="omit icon data URIs")
     ap.add_argument("--blob", help="path to a local BLOB (.jwt) instead of downloading")
     ap.add_argument("--out", default=OUT)
@@ -152,7 +176,12 @@ def main() -> int:
         stmt = e.get("metadataStatement", {}) or {}
         desc = stmt.get("description", "") or ""
         if not args.all:
-            if not any(v in desc.lower() for v in TARGET_VENDORS):
+            desc_l = desc.lower()
+            if args.vendor_filter and not any(v in desc_l for v in TARGET_VENDORS):
+                continue
+            if args.filter and not any(f.lower() in desc_l for f in args.filter):
+                continue
+            if not args.include_software and not is_hardware_authenticator(stmt):
                 continue
         st = latest_status(e)
         get_info = stmt.get("authenticatorGetInfo", {}) or {}
